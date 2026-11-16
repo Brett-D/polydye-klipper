@@ -131,7 +131,6 @@ async function initKlippy() {
     state.message = info.state_message || '';
     if (info.state !== 'ready') {
       state.board = false;
-      render();
       if (info.state === 'startup') setTimeout(initKlippy, 1000);
       return;
     }
@@ -152,10 +151,18 @@ async function initKlippy() {
   } catch (e) {
     state.klippy = 'disconnected';
     state.message = e.message;
+  } finally {
+    // The firmware API works without Klipper, so this also runs when Klipper isn't ready.
+    render();
+    loadFirmwareInfo();
   }
-  render();
-  loadFirmwareInfo();
 }
+
+// USB presence (for the pill and Enable PolyDye) changes without any Klipper event, so poll it while the board
+// isn't in use.
+setInterval(() => {
+  if (state.online && !state.board && !state.fw.updating) loadFirmwareInfo();
+}, 5000);
 
 function text(id, value, cls) {
   const el = $(id);

@@ -124,13 +124,16 @@ class PolyDye:
         return path
 
     async def _handle_firmware_update(self, web_request):
+        # Everything that can fail without waiting comes first; the busy flag is then claimed before the only
+        # await, so a second request gets 409 rather than racing this one.
+        force = web_request.get_boolean("force", False)
+        rel = web_request.get_str("file", None)
         if self.updating:
             raise self.server.error("a firmware update is already running", 409)
         why = self._power_problem()
         if why:
             # A Pi 3 short of power loses USB data and can lock up during the transfer or the board's restart.
             raise self.server.error(f"{why}: fix its power supply first (a Pi 3 needs 5.1 V, 2.5 A)", 409)
-        rel = web_request.get_str("file", None)
         path = self._resolve_upload(rel) if rel else self.bundled_path
         if not os.path.isfile(path):
             raise self.server.error("this add-on has no bundled firmware", 404)
@@ -142,16 +145,19 @@ class PolyDye:
         if len(ports) != 1:
             raise self.server.error("PolyDye board not found on USB" if not ports
                                     else "more than one PolyDye board is plugged in", 400)
-        klippy_apis = self.server.lookup_component("klippy_apis")
+        self.updating = True
         try:
-            status = await klippy_apis.query_objects({"print_stats": ["state"]})
+            status = await self.server.lookup_component("klippy_apis").query_objects({"print_stats": ["state"]})
             if status.get("print_stats", {}).get("state") in ("printing", "paused"):
                 raise self.server.error("not during a print", 409)
         except self.server.error as e:
             if e.status_code == 409:
+                self.updating = False
                 raise
-        self.updating = True
-        force = web_request.get_boolean("force", False)
+            # Klipper not ready (e.g. shut down): nothing is printing, so the update may go ahead.
+        except BaseException:
+            self.updating = False
+            raise
         self.server.get_event_loop().create_task(self._run_update(ports[0], path, force))
         return {"started": True, "version": info["version"]}
 
@@ -160,6 +166,14 @@ class PolyDye:
                                {"state": state, "message": message, "progress": progress})
 
     async def _run_update(self, port: str, path: str, force: bool) -> None:
+        # self.updating stays set until the final notification, so no second update can start while Klipper is
+        # still reconnecting to the board.
+        try:
+            await self._run_update_steps(port, path, force)
+        finally:
+            self.updating = False
+
+    async def _run_update_steps(self, port: str, path: str, force: bool) -> None:
         ok, rebooted, last = False, False, ""
         try:
             self._notify("running", "starting the update", 0)
@@ -184,8 +198,6 @@ class PolyDye:
         except Exception as e:
             last = f"error: {e}"
             logging.exception("polydye: firmware update failed")
-        finally:
-            self.updating = False
         if rebooted:
             # Klipper lost the board while it rebooted: reconnect.
             try:

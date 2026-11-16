@@ -28,6 +28,7 @@ import argparse
 import glob
 import hashlib
 import json
+import math
 import os
 import struct
 import sys
@@ -58,7 +59,10 @@ class DataPort:
         self.seq = 0
 
     def close(self):
-        self.ser.close()
+        try:
+            self.ser.close()
+        except OSError:
+            pass  # the board may already have dropped off USB (after REBOOT)
 
     def request(self, ftype, payload=b"", retries=0, log=None):
         """Sends one request and returns the reply's JSON. On a timeout, resends it up to `retries` times; only
@@ -183,6 +187,8 @@ def port_present(port):
 
 def update_firmware(port, blob, force=False, log=print, confirm=True, rate=FW_RATE):
     """Writes `blob` to the board, reboots into it and confirms it. Returns the new version."""
+    if not (isinstance(rate, (int, float)) and math.isfinite(rate) and rate > 0):
+        raise ValueError("the transfer rate must be a positive number of bytes per second")
     info = image_info(blob)
     board = DataPort(port)
     try:
@@ -223,10 +229,10 @@ def update_firmware(port, blob, force=False, log=print, confirm=True, rate=FW_RA
         say(log, "written to %s and checked; rebooting the board" % target["partition"])
         try:
             board.request(T_REBOOT)
-        except BoardError as e:
-            if "timed out" not in str(e):
+        except (BoardError, OSError) as e:  # pyserial's SerialException is an OSError
+            if isinstance(e, BoardError) and "timed out" not in str(e):
                 raise
-            # The reply can be lost if the board restarts first; carry on and see whether it comes back.
+            # The board can restart (and drop off USB) before its reply is read; see whether it comes back.
     finally:
         board.close()
 
@@ -316,9 +322,9 @@ def main():
             return 1
         return 0
     if args.cmd == "firmware":
-        with open(args.file, "rb") as f:
-            blob = f.read()
         try:
+            with open(args.file, "rb") as f:
+                blob = f.read()
             update_firmware(args.port or default_port(), blob, args.force, log=lambda s: print(s, flush=True),
                             confirm=not args.no_confirm, rate=args.rate * 1024.)
         except (BoardError, ValueError, OSError) as e:

@@ -37,5 +37,13 @@ class ImageInfo(unittest.TestCase):
                 polydye_upload.image_info(blob)
 
 
+class UpdateFirmware(unittest.TestCase):
+    def test_bad_rate_refused_before_touching_the_board(self):
+        # The port doesn't exist: reaching it would raise OSError instead.
+        for rate in (0, -1., float("nan"), float("inf")):
+            with self.assertRaisesRegex(ValueError, "transfer rate"):
+                polydye_upload.update_firmware("/nonexistent/port", fake_image(), rate=rate, log=None)
+
+
 if __name__ == "__main__":
     unittest.main()
