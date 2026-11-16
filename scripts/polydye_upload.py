@@ -90,20 +90,26 @@ class DataPort:
         return data
 
     def _reply(self):
-        prev = b""
+        # A reply for an earlier request (e.g. the late original after a resend) is stale: skip it, within the
+        # usual timeout.
+        deadline = time.time() + (self.ser.timeout or 10.)
         while True:
-            c = self._read(1)
-            if prev == b"P" and c == b"D":
+            if time.time() > deadline:
+                raise BoardError("timed out waiting for the board")
+            prev = b""
+            while True:
+                c = self._read(1)
+                if prev == b"P" and c == b"D":
+                    break
+                prev = c
+            head = self._read(6)
+            ftype, seq, length = struct.unpack("<BBI", head)
+            payload = self._read(length)
+            (crc,) = struct.unpack("<I", self._read(4))
+            if zlib.crc32(payload, zlib.crc32(head)) != crc:
+                raise BoardError("reply CRC mismatch")
+            if seq == self.seq:
                 break
-            prev = c
-        head = self._read(6)
-        ftype, seq, length = struct.unpack("<BBI", head)
-        payload = self._read(length)
-        (crc,) = struct.unpack("<I", self._read(4))
-        if zlib.crc32(payload, zlib.crc32(head)) != crc:
-            raise BoardError("reply CRC mismatch")
-        if seq != self.seq:
-            raise BoardError("reply for request %d, expected %d" % (seq, self.seq))
         body = json.loads(payload.decode() or "{}")
         if ftype == T_ERR:
             raise BoardError(body.get("error", "error"))

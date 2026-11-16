@@ -7,6 +7,7 @@ import os
 import struct
 import sys
 import unittest
+import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 import polydye_upload  # noqa: E402
@@ -43,6 +44,31 @@ class UpdateFirmware(unittest.TestCase):
         for rate in (0, -1., float("nan"), float("inf")):
             with self.assertRaisesRegex(ValueError, "transfer rate"):
                 polydye_upload.update_firmware("/nonexistent/port", fake_image(), rate=rate, log=None)
+
+
+def frame(ftype, seq, body):
+    payload = body.encode()
+    head = struct.pack("<BBI", ftype, seq, len(payload))
+    return b"PD" + head + payload + struct.pack("<I", zlib.crc32(payload, zlib.crc32(head)))
+
+
+class FakeSerial:
+    timeout = 1.
+
+    def __init__(self, data):
+        self.data = data
+
+    def read(self, n):
+        out, self.data = self.data[:n], self.data[n:]
+        return out
+
+
+class Replies(unittest.TestCase):
+    def test_stale_reply_after_a_resend_is_skipped(self):
+        port = polydye_upload.DataPort.__new__(polydye_upload.DataPort)
+        port.seq = 7
+        port.ser = FakeSerial(frame(polydye_upload.T_OK, 6, '{"old":1}') + frame(polydye_upload.T_OK, 7, '{"new":1}'))
+        self.assertEqual(port._reply(), {"new": 1})
 
 
 if __name__ == "__main__":
