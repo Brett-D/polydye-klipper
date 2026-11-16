@@ -203,8 +203,9 @@ function render() {
   text('s-late', known ? `${pd.late_max_us.toFixed(1)} µs` : '–');
   text('s-store', known ? pd.store_count : '–');
   text('s-free', known ? `${Math.round(pd.store_free / 1024)} kB` : '–');
+  // Idle-only controls also wait for a firmware update: the dry run uses the same data port. Off stays available.
   document.querySelectorAll('.needs-board').forEach((b) => {
-    b.disabled = !state.board || (b.classList.contains('needs-idle') && printing);
+    b.disabled = !state.board || (b.classList.contains('needs-idle') && (printing || state.fw.updating));
   });
   renderFirmware(printing);
   setConn();
