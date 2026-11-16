@@ -23,7 +23,7 @@ import os
 import re
 import sys
 
-from ..common import RequestType, TransportType
+from ..common import KlippyState, RequestType, TransportType
 
 # Raspberry Pi firmware's throttle flags (same bits as `vcgencmd get_throttled`); absent on other boards.
 THROTTLED_PATH = "/sys/devices/platform/soc/soc:firmware/get_throttled"
@@ -77,6 +77,8 @@ class PolyDye:
         self.uploader = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.uploader)
         self.bundled_path = os.path.join(repo_dir, "firmware", "polydye.bin")
+        # The service that carries the plug-in toggle hook (install.sh's KLIPPER_SERVICE).
+        self.klipper_service = config.get("klipper_service", "klipper")
         self.updating = False
         self.server.register_notification("polydye:polydye_firmware")
         self.server.register_endpoint("/server/polydye/firmware", RequestType.GET, self._handle_firmware_info)
@@ -112,7 +114,8 @@ class PolyDye:
             except ValueError as e:
                 logging.warning(f"polydye: bundled firmware unusable: {e}")
         return {"bundled": bundled, "updating": self.updating, "power_problem": self._power_problem(),
-                "board_on_usb": bool(glob.glob("/dev/serial/by-id/*PolyDye*-if00"))}
+                "board_on_usb": bool(glob.glob("/dev/serial/by-id/*PolyDye*-if00")),
+                "klipper_service": self.klipper_service}
 
     def _resolve_upload(self, rel: str) -> str:
         config_dir = self.server.lookup_component("file_manager").get_directory("config")
@@ -147,14 +150,17 @@ class PolyDye:
                                     else "more than one PolyDye board is plugged in", 400)
         self.updating = True
         try:
-            status = await self.server.lookup_component("klippy_apis").query_objects({"print_stats": ["state"]})
-            if status.get("print_stats", {}).get("state") in ("printing", "paused"):
-                raise self.server.error("not during a print", 409)
-        except self.server.error as e:
-            if e.status_code == 409:
-                self.updating = False
+            if self.server.lookup_component("klippy_connection").state == KlippyState.READY:
+                status = await self.server.lookup_component("klippy_apis").query_objects(
+                    {"print_stats": ["state"]})
+                if status.get("print_stats", {}).get("state") in ("printing", "paused"):
+                    raise self.server.error("not during a print", 409)
+            # Klipper not ready (shut down, error, starting): it can't be printing, so the update may go ahead.
+        except Exception as e:
+            self.updating = False
+            if isinstance(e, self.server.error) and e.status_code == 409:
                 raise
-            # Klipper not ready (e.g. shut down): nothing is printing, so the update may go ahead.
+            raise self.server.error(f"couldn't check whether the printer is printing: {e}", 503)
         except BaseException:
             self.updating = False
             raise

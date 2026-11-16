@@ -93,8 +93,10 @@ python3 ~/polydye-klipper/scripts/polydye_upload.py firmware ~/polydye-klipper/f
   and locked up at full speed.
 - The new firmware must be confirmed by the Pi within two minutes. If it doesn't come up working, the board goes
   back to the previous firmware by itself.
-- Updates are refused during a print, while PolyDye is on, and while the Pi reports under-voltage. A Pi 3 needs a
-  5.1 V, 2.5 A supply; phone chargers often sag.
+- The page refuses updates during a print, while PolyDye is on, and while the Pi reports under-voltage. The board
+  itself refuses while Klipper has passes queued or the boost or live output on. The command-line updater skips
+  the page's checks: run it only with the printer idle and the Pi on a good supply. A Pi 3 needs 5.1 V, 2.5 A;
+  phone chargers often sag.
 - The first firmware with USB updates has to be flashed once with the FT232, bootloader included (see
   polydye-firmware's README); after that, updates go over USB.
 

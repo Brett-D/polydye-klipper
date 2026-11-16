@@ -131,6 +131,7 @@ async function initKlippy() {
     state.message = info.state_message || '';
     if (info.state !== 'ready') {
       state.board = false;
+      state.printer = {};  // stale while Klipper isn't ready (e.g. "printing" from before a shutdown)
       if (info.state === 'startup') setTimeout(initKlippy, 1000);
       return;
     }
@@ -174,7 +175,7 @@ function render() {
   const banner = $('banner');
   const bannerText = $('banner-text');
   const p = state.printer;
-  const printing = ['printing', 'paused'].includes((p.print_stats || {}).state);
+  const printing = state.klippy === 'ready' && ['printing', 'paused'].includes((p.print_stats || {}).state);
   $('fw-restart-btn').classList.toggle('hidden', !['shutdown', 'error'].includes(state.klippy));
   if (state.klippy !== 'ready') {
     banner.className = 'banner bad';
@@ -239,6 +240,7 @@ async function loadFirmwareInfo() {
     state.fw.updating = info.updating;
     state.fw.power = info.power_problem;
     state.fw.boardOnUsb = info.board_on_usb;
+    state.fw.klipperService = info.klipper_service || 'klipper';
   } catch (e) {
     log(`! firmware info: ${e.message}`);
   }
@@ -420,7 +422,7 @@ $('enable-btn').addEventListener('click', async () => {
   $('enable-btn').classList.add('hidden');
   log('> restart the Klipper service to enable PolyDye');
   try {
-    await rpc('machine.services.restart', { service: 'klipper' });
+    await rpc('machine.services.restart', { service: state.fw.klipperService || 'klipper' });
   } catch (e) {
     log(`! ${e.message}`);
   }

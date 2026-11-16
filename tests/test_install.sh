@@ -47,6 +47,7 @@ check '[ "$(grep -c "^\[include polydye-active\*\.cfg\]$" "$T/config/printer.cfg
 check 'awk "/include polydye-active/{i=NR} /SAVE_CONFIG/{s=NR} END{exit !(i && i < s)}" "$T/config/printer.cfg"' \
     "include is above SAVE_CONFIG"
 check '[ "$(grep -c "^\[polydye\]$" "$T/config/moonraker.conf")" = 1 ]' "[polydye] added to moonraker.conf once"
+check 'grep -qx "klipper_service: klipper" "$T/config/moonraker.conf"' "[polydye] names the Klipper service for Enable PolyDye"
 check 'grep -q "ExecStartPre=-$REPO/scripts/polydye-toggle.sh $T/config" "$T/systemd/klipper.service.d/polydye.conf"' \
     "toggle hook installed"
 check 'python3 -c "import json,sys; e=json.load(open(sys.argv[1])); t=[x[\"title\"] for x in e]; \

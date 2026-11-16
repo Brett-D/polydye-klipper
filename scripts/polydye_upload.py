@@ -209,12 +209,13 @@ def update_firmware(port, blob, force=False, log=print, confirm=True, rate=FW_RA
         board.ser.timeout = 5.  # more than the board's 3 s frame timeout, so a resend finds it ready
         try:
             last = -1
-            start = time.time()
+            due = time.time()
             for off in range(0, len(blob), FW_CHUNK):
+                if due > time.time():
+                    time.sleep(due - time.time())
+                # Blocks start at least one slot apart; time lost to a resend is not made up with a burst.
+                due = max(due, time.time()) + FW_CHUNK / float(rate)
                 board.request(T_FW_DATA, struct.pack("<I", off) + blob[off:off + FW_CHUNK], retries=3, log=log)
-                ahead = (off + FW_CHUNK) / float(rate) - (time.time() - start)
-                if ahead > 0:
-                    time.sleep(ahead)
                 pct = (off + FW_CHUNK) * 100 // len(blob)
                 if pct // 5 != last // 5:
                     say(log, "progress: %d%%" % min(pct, 100))
