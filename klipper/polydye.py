@@ -15,9 +15,13 @@ import mcu as mcu_mod
 PASS_INFO = "polydye_pass_info oid=%c layer=%hu pass=%hu present=%c columns=%hu cart=%c"
 STATUS = ("polydye_status oid=%c flags=%c queued=%c passes=%u late_max=%u"
           " faults=%u store_count=%hu store_free=%u")
+TEMPLATE = "polydye_template oid=%c template=%c"
+# Cartridge waveform templates (Sprite_tm's), in polydye_set_template numbering.
+TEMPLATES = ('color_a', 'color_b', 'black_a', 'black_b')
 FLAG_BOOST, FLAG_LIVE, FLAG_RUNNING = 1, 2, 4
 TIMING_TOLERANCE = 0.0005  # s: planned pass duration must match the model
 STATUS_INTERVAL = 2.  # s between background status queries
+MAX_NUDGE = 5.  # mm per POLYDYE_NUDGE value; more is almost certainly a typo
 NOZDATA_SIZE = 42
 DATA_HELLO, DATA_PUT, DATA_ERR = 0x01, 0x10, 0xFF
 
@@ -102,20 +106,33 @@ def period_to_ticks(start_clock, end_clock, spans):
     return whole, frac
 
 
-def pass_geometry(axis, bed_x, bed_y, direction, columns, pitch, run_up, offset, base):
+def pass_geometry(axis, bed_x, bed_y, direction, columns, pitch, run_up, offset, base, trim=0.):
     """Toolhead XY positions for a pass.
 
     (bed_x, bed_y) is where the first column lands on the bed (the pass-axis coordinate of the first column and
     the cross-axis coordinate of the nozzle-row centre). `offset` is the cartridge's (x, y) offset from the hotend
-    nozzle and `base` the G-code base position. Returns (start, first, end): the toolhead XY at the start of the
+    nozzle and `base` the G-code base position. `trim` moves the ink of reverse (direction -1) passes along the pass
+    axis, to line them up with forward passes. Returns (start, first, end): the toolhead XY at the start of the
     run-up, when the first column fires, and at the end of the run-out.
     """
     a = 0 if axis == 'x' else 1
     first = [bed_x - offset[0] + base[0], bed_y - offset[1] + base[1]]
+    if direction < 0:
+        first[a] += trim
     start, end = list(first), list(first)
     start[a] = first[a] - direction * run_up
     end[a] = first[a] + direction * ((columns - 1) * pitch + run_up)
     return start, first, end
+
+
+def nudge_offsets(offset_x, offset_y, trim, dx, dy, dtrim):
+    """New (offset_x, offset_y, direction_trim) after moving the ink by (dx, dy) on the bed and reverse passes by
+    dtrim along the pass axis.
+
+    Ink lands at target - configured offset + true offset, so moving the ink by d means subtracting d from the
+    configured offset. Direction trim is already an ink movement. Rounded to 0.1 um so repeated nudges stay tidy.
+    """
+    return round(offset_x - dx, 4), round(offset_y - dy, 4), round(trim + dtrim, 4)
 
 
 class PolyDye:
@@ -135,6 +152,15 @@ class PolyDye:
         self.pass_axis = config.getchoice('pass_axis', {'x': 'x', 'y': 'y'})
         self.offset_x = config.getfloat('offset_x')
         self.offset_y = config.getfloat('offset_y')
+        # Moves the ink of reverse (DIR=-1) passes along the pass axis, to line them up with forward passes.
+        self.direction_trim = config.getfloat('direction_trim', 0.)
+        # Waveform template for the board to use; unset leaves the board's own choice (color_b unless changed on
+        # its console). Needs board firmware with polydye_set_template.
+        self.cartridge_template = config.get('cartridge_template', None)
+        if self.cartridge_template is not None:
+            self.cartridge_template = self.cartridge_template.strip().lower()
+            if self.cartridge_template not in TEMPLATES:
+                raise config.error("[polydye] cartridge_template must be one of: %s" % (", ".join(TEMPLATES),))
         self.dpi = config.getfloat('dpi', 600., above=0.)
         self.pass_speed = config.getfloat('pass_speed', 50., above=0.)
         self.travel_speed = config.getfloat('travel_speed', 150., above=0.)
@@ -143,6 +169,7 @@ class PolyDye:
         self.min_lead_time = config.getfloat('min_lead_time', 0.025, minval=0.005)
         self.query_pass_cmd = self.query_cmd = None
         self.schedule_cmd = self.mode_cmd = self.cancel_cmd = None
+        self.set_template_cmd = self.query_template_cmd = None
         self.last_status = {}
         self.last_pass = None
         self.querying = False
@@ -155,6 +182,10 @@ class PolyDye:
         gcode.register_command('POLYDYE_DISABLE', self.cmd_POLYDYE_DISABLE, desc=self.cmd_POLYDYE_DISABLE_help)
         gcode.register_command('POLYDYE_CANCEL', self.cmd_POLYDYE_CANCEL, desc=self.cmd_POLYDYE_CANCEL_help)
         gcode.register_command('POLYDYE_STATUS', self.cmd_POLYDYE_STATUS, desc=self.cmd_POLYDYE_STATUS_help)
+        gcode.register_command('POLYDYE_OFFSET', self.cmd_POLYDYE_OFFSET, desc=self.cmd_POLYDYE_OFFSET_help)
+        gcode.register_command('POLYDYE_NUDGE', self.cmd_POLYDYE_NUDGE, desc=self.cmd_POLYDYE_NUDGE_help)
+        gcode.register_command('POLYDYE_CARTRIDGE', self.cmd_POLYDYE_CARTRIDGE,
+                               desc=self.cmd_POLYDYE_CARTRIDGE_help)
         gcode.register_command('POLYDYE_UPLOAD_TEST_PASS', self.cmd_POLYDYE_UPLOAD_TEST_PASS,
                                desc=self.cmd_POLYDYE_UPLOAD_TEST_PASS_help)
 
@@ -168,6 +199,20 @@ class PolyDye:
             "polydye_schedule oid=%c clock=%u period=%u frac=%hu layer=%hu pass=%hu", cq=cq)
         self.mode_cmd = self.mcu.lookup_command("polydye_set_mode oid=%c boost=%c live=%c", cq=cq)
         self.cancel_cmd = self.mcu.lookup_command("polydye_cancel oid=%c", cq=cq)
+        # Board firmware before the template commands still works, just without a template choice.
+        if self.mcu.try_lookup_command("polydye_set_template oid=%c template=%c") is None:
+            if self.cartridge_template is not None:
+                raise self.printer.config_error(
+                    "[polydye] cartridge_template needs newer PolyDye board firmware. Update it from the PolyDye "
+                    "page (Board firmware), or remove cartridge_template from polydye.cfg.")
+            return
+        self.set_template_cmd = self.mcu.lookup_command("polydye_set_template oid=%c template=%c", cq=cq)
+        self.query_template_cmd = self.mcu.lookup_query_command("polydye_query_template oid=%c", TEMPLATE,
+                                                                oid=self.oid, cq=cq)
+        if self.cartridge_template is not None:
+            # Sent on every connect: the board forgets the template when it restarts.
+            self.mcu.add_config_cmd("polydye_set_template oid=%d template=%d"
+                                    % (self.oid, TEMPLATES.index(self.cartridge_template)), is_init=True)
 
     def _settle(self):
         if self.settle_time is not None:
@@ -197,6 +242,10 @@ class PolyDye:
         self.querying = True
         try:
             params = self.query_cmd.send([self.oid])
+            template = None
+            if self.query_template_cmd is not None:
+                t = self.query_template_cmd.send([self.oid])['template']
+                template = TEMPLATES[t] if t < len(TEMPLATES) else str(t)
         finally:
             self.querying = False
         flags = params['flags']
@@ -210,8 +259,16 @@ class PolyDye:
             'faults': params['faults'],
             'store_count': params['store_count'],
             'store_free': params['store_free'],
+            'cartridge_template': template,
         }
         return self.last_status
+
+    def _fresh_status(self):
+        """Board status queried now, after any background query in flight (whose answer may predate a command)."""
+        reactor = self.printer.get_reactor()
+        while self.querying:
+            reactor.pause(reactor.monotonic() + 0.05)
+        return self._query_status()
 
     cmd_POLYDYE_PASS_help = "Print one ink pass along pass_axis (the pass data must already be uploaded)"
 
@@ -251,7 +308,8 @@ class PolyDye:
 
         # Bed coordinates of the ink -> toolhead coordinates of the hotend.
         start, first, end = pass_geometry(self.pass_axis, bed_x, bed_y, direction, columns, pitch, run_up,
-                                          (self.offset_x, self.offset_y), gcode_move.base_position)
+                                          (self.offset_x, self.offset_y), gcode_move.base_position,
+                                          self.direction_trim)
         axis = 0 if self.pass_axis == 'x' else 1
 
         # Position (through any bed mesh transform), then stop, so the pass starts from rest at a known time.
@@ -313,10 +371,60 @@ class PolyDye:
         st = self._query_status()
         gcmd.respond_info(
             "PolyDye: boost=%d live=%d running=%d queued=%d passes=%d late_max=%.1fus faults=%d"
-            " stored_passes=%d store_free=%dkB\npass_axis=%s offset_x=%.3f offset_y=%.3f dpi=%.0f pass_speed=%.1f"
+            " stored_passes=%d store_free=%dkB cartridge_template=%s\npass_axis=%s offset_x=%.3f offset_y=%.3f"
+            " direction_trim=%.3f dpi=%.0f pass_speed=%.1f"
             % (st['boost'], st['live'], st['running'], st['queued'], st['passes'], st['late_max_us'],
-               st['faults'], st['store_count'], st['store_free'] // 1024, self.pass_axis, self.offset_x,
-               self.offset_y, self.dpi, self.pass_speed))
+               st['faults'], st['store_count'], st['store_free'] // 1024,
+               st.get('cartridge_template') or 'unknown (board firmware too old)', self.pass_axis, self.offset_x,
+               self.offset_y, self.direction_trim, self.dpi, self.pass_speed))
+
+    def _respond_offsets(self, gcmd):
+        gcmd.respond_info("PolyDye: offset_x=%.3f offset_y=%.3f direction_trim=%.3f (until the next restart: Store "
+                          "on the PolyDye page or edit polydye.cfg to keep them)"
+                          % (self.offset_x, self.offset_y, self.direction_trim))
+
+    cmd_POLYDYE_OFFSET_help = "Set the cartridge offset (X, Y) and direction trim (TRIM) in mm from the next pass on"
+
+    def cmd_POLYDYE_OFFSET(self, gcmd):
+        self.offset_x = gcmd.get_float('X', self.offset_x)
+        self.offset_y = gcmd.get_float('Y', self.offset_y)
+        self.direction_trim = gcmd.get_float('TRIM', self.direction_trim)
+        self._respond_offsets(gcmd)
+
+    cmd_POLYDYE_NUDGE_help = ("Move where the ink lands by X, Y mm on the bed, and reverse passes by TRIM mm along the"
+                              " pass axis, from the next pass on")
+
+    def cmd_POLYDYE_NUDGE(self, gcmd):
+        dx = gcmd.get_float('X', 0., minval=-MAX_NUDGE, maxval=MAX_NUDGE)
+        dy = gcmd.get_float('Y', 0., minval=-MAX_NUDGE, maxval=MAX_NUDGE)
+        dtrim = gcmd.get_float('TRIM', 0., minval=-MAX_NUDGE, maxval=MAX_NUDGE)
+        self.offset_x, self.offset_y, self.direction_trim = nudge_offsets(
+            self.offset_x, self.offset_y, self.direction_trim, dx, dy, dtrim)
+        self._respond_offsets(gcmd)
+
+    cmd_POLYDYE_CARTRIDGE_help = ("Choose the cartridge waveform template (TEMPLATE=color_a|color_b|black_a|black_b)"
+                                  " until the next restart; PolyDye must be off and idle")
+
+    def cmd_POLYDYE_CARTRIDGE(self, gcmd):
+        if self.set_template_cmd is None:
+            raise gcmd.error("POLYDYE_CARTRIDGE: the PolyDye board firmware is too old; update it from the PolyDye "
+                             "page (Board firmware)")
+        name = gcmd.get('TEMPLATE', None)
+        if name is not None:
+            name = name.lower()
+            if name not in TEMPLATES:
+                raise gcmd.error("POLYDYE_CARTRIDGE: TEMPLATE must be one of %s" % (", ".join(TEMPLATES),))
+            # The board refuses a change while powered or busy by shutting down; check first for a plain error.
+            self.printer.lookup_object('toolhead').wait_moves()
+            st = self._fresh_status()
+            if st['cartridge_template'] != name:
+                if st['boost'] or st['live'] or st['running'] or st['queued']:
+                    raise gcmd.error("POLYDYE_CARTRIDGE: turn PolyDye off (POLYDYE_DISABLE) and let queued passes "
+                                     "finish before changing the template")
+                self.set_template_cmd.send([self.oid, TEMPLATES.index(name)])
+        st = self._fresh_status()
+        gcmd.respond_info("PolyDye cartridge template: %s (set cartridge_template in polydye.cfg to keep a choice "
+                          "after a restart)" % (st['cartridge_template'],))
 
     cmd_POLYDYE_UPLOAD_TEST_PASS_help = "Upload a test pattern pass to the PolyDye board (for dry runs; not during a print)"
 
@@ -348,7 +456,7 @@ class PolyDye:
 
     def get_status(self, eventtime):
         return dict(self.last_status, last_pass=self.last_pass, pass_axis=self.pass_axis, offset_x=self.offset_x,
-                    offset_y=self.offset_y)
+                    offset_y=self.offset_y, direction_trim=self.direction_trim)
 
 
 def load_config(config):

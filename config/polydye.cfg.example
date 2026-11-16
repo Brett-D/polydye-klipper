@@ -7,6 +7,12 @@
 pass_axis: y
 offset_x: 62.6
 offset_y: -20.2
+# Moves the ink of reverse passes along the pass axis to line them up with forward passes (mm). The PolyDye page's
+# Ink position nudges set this and the offsets live; Store writes them here.
+#direction_trim: 0
+# Nozzle waveform: color_a or color_b for a colour cartridge, black_a or black_b for black. Unset keeps the board's
+# default (color_b). Needs current board firmware.
+#cartridge_template: color_b
 #dpi: 600
 #pass_speed: 50
 #travel_speed: 150

@@ -47,6 +47,29 @@ class PassGeometry(unittest.TestCase):
         self.assertAlmostEqual(end[0], first[0] - (10 * 0.5 + 2.0))
         self.assertAlmostEqual(end[1], first[1])
 
+    def test_direction_trim_moves_only_reverse_passes_along_the_pass_axis(self):
+        args = (600, 25.4 / 600, 3.0, (-0.2, -77.7), (0, 0, 0, 0))
+        fwd = polydye.pass_geometry('y', 100., 40., 1, *args, trim=0.3)
+        self.assertEqual(fwd, polydye.pass_geometry('y', 100., 40., 1, *args))
+        plain = polydye.pass_geometry('y', 100., 40., -1, *args)
+        rev = polydye.pass_geometry('y', 100., 40., -1, *args, trim=0.3)
+        for p, r in zip(plain, rev):
+            self.assertAlmostEqual(r[0], p[0])
+            self.assertAlmostEqual(r[1], p[1] + 0.3)
+
+
+class Nudge(unittest.TestCase):
+    def test_ink_moves_the_way_of_the_nudge(self):
+        # Ink lands at bed target - configured offset + true offset; the toolhead goes to target - offset.
+        x, y, trim = polydye.nudge_offsets(62.6, -20.2, 0., 0.1, -0.05, 0.)
+        _, first_before, _ = polydye.pass_geometry('y', 100., 40., 1, 10, 0.1, 3., (62.6, -20.2), (0, 0, 0, 0))
+        _, first_after, _ = polydye.pass_geometry('y', 100., 40., 1, 10, 0.1, 3., (x, y), (0, 0, 0, 0))
+        self.assertAlmostEqual(first_after[0] - first_before[0], 0.1)
+        self.assertAlmostEqual(first_after[1] - first_before[1], -0.05)
+
+    def test_trim_and_rounding(self):
+        self.assertEqual(polydye.nudge_offsets(0.1, 0.2, 0.1, -0.2, 0., 0.2), (0.3, 0.2, 0.3))
+
 
 class PeriodTicks(unittest.TestCase):
     def test_fraction(self):

@@ -65,12 +65,16 @@ does. It shows:
   turns the board's boost off. It works while a macro such as the dry run is running. **Firmware restart** then
   appears to bring Klipper back.
 - **Board status**, live: firmware, boost, dry run or live ink, passes queued and printed, faults, worst column
-  lateness, stored passes.
+  lateness, stored passes, cartridge template.
 - **Controls:** dry-run test, cartridge wipe, status, off, and enabling live ink (with a confirmation).
-- **Settings:** pass axis, offsets, resolution and pass speed, saved into the `[polydye]` section of `polydye.cfg`.
-  Klipper applies them after a restart.
-- **Calibration:** nozzle check, cartridge offset, direction alignment and pulse length. These need ink, so they're
-  listed but not enabled yet.
+- **Settings:** pass axis, offsets, direction trim, cartridge template, resolution and pass speed, saved into the
+  `[polydye]` section of `polydye.cfg`. Klipper applies them after a restart.
+- **Ink position:** live nudges for lining the ink up with the plastic. Pick a step (0.02–0.4 mm) and move the
+  ink ±X or ±Y, or move only the reverse passes along the pass axis (direction trim). Nudges apply from the next
+  pass, also during a print, with no restart. Values not yet in `polydye.cfg` show "not stored". **Store** writes
+  them into `polydye.cfg` and **Back to stored values** undoes the nudges.
+- **Calibration:** nozzle check, cartridge offset, direction alignment and pulse length. The printed patterns need
+  ink and are not enabled yet; the Ink position nudges already work.
 - **Board firmware:** the board's version and the one bundled with this add-on, with buttons to update to it or
   to a `.bin` you choose (see below).
 - The pill at the top right sums up the state: Moonraker offline, Klipper starting or shut down, PolyDye not
@@ -121,6 +125,8 @@ pass_axis: y          # x or y: the axis the cartridge moves along while printin
 offset_x: 62.6        # cartridge nozzle-row centre minus hotend nozzle, mm (bed coordinates)
 offset_y: -20.2
 # Optional:
+#direction_trim: 0    # mm: moves the ink of reverse (DIR=-1) passes along the pass axis to meet forward passes
+#cartridge_template:  # color_a, color_b, black_a or black_b; default: the board's own (color_b)
 #dpi: 600             # dots per inch along the pass
 #pass_speed: 50       # mm/s
 #travel_speed: 150    # mm/s, moves to the start of each pass
@@ -138,6 +144,11 @@ the cartridge's nozzles, negative Y if the cartridge is in front.
 
 On a bed-slinger such as the Ender 3, Y moves the bed, so Y passes shake it. Configure an `[input_shaper]` for
 the pass axis, and the run-up will include its settle time automatically.
+
+`cartridge_template` picks the nozzle waveform, from Sprite_tm's printercart templates: a and b are two variants
+for each cartridge type. Klipper sends it to the board on every connect. A black template makes the board expect
+pass data for a black cartridge. It needs board firmware with template support (this add-on's bundled firmware or
+newer); with older firmware Klipper refuses to start and asks you to update the board or remove the option.
 
 ## How a pass works
 
@@ -176,7 +187,10 @@ If anything would print a pass wrongly, Klipper stops with a readable reason, fo
 | `POLYDYE_DISABLE` | Waits for queued moves, then turns live output and the boost off |
 | `POLYDYE_PASS LAYER= PASS= X= Y= [DIR=1] [SPEED=]` | Prints one pass (above) |
 | `POLYDYE_CANCEL` | Drops passes that are scheduled but not started (for a cancel macro) |
-| `POLYDYE_STATUS` | Board status: boost, live, passes printed and queued, worst column lateness, faults, stored passes |
+| `POLYDYE_STATUS` | Board status: boost, live, passes printed and queued, worst column lateness, faults, stored passes, cartridge template; and the offsets and direction trim in use |
+| `POLYDYE_NUDGE [X=] [Y=] [TRIM=]` | Moves where the ink lands by `X`, `Y` mm on the bed, and the ink of reverse passes by `TRIM` mm along the pass axis (each at most ±5 mm), from the next pass on. Changes `offset_x`/`offset_y` (in the opposite direction: the offset is where the cartridge is) and `direction_trim` until the next restart |
+| `POLYDYE_OFFSET [X=] [Y=] [TRIM=]` | Sets `offset_x`, `offset_y` and `direction_trim` until the next restart; without arguments, shows them |
+| `POLYDYE_CARTRIDGE [TEMPLATE=color_a\|color_b\|black_a\|black_b]` | Switches the board's waveform template until the next restart (to compare a and b at the nozzle check); without `TEMPLATE`, shows it. Only with PolyDye off and no passes queued |
 | `POLYDYE_UPLOAD_TEST_PASS [LAYER=0] [PASS=0] [COLUMNS=600] [PATTERN=alternate\|all\|none]` | Uploads a test pass over the board's data port, for dry runs. Not during a print: it briefly blocks Klipper while it sends |
 
 Macros (Mainsail's Macros panel, while the board is plugged in):
@@ -198,8 +212,9 @@ variable_length: 20
 ```
 
 `printer.polydye` (macros, Mainsail, the PolyDye page) has the board status, refreshed every 2 s: `boost`, `live`,
-`running`, `queued`, `passes`, `late_max_us`, `faults`, `store_count`, `store_free`. It also has `last_pass`,
-`pass_axis`, `offset_x` and `offset_y`.
+`running`, `queued`, `passes`, `late_max_us`, `faults`, `store_count`, `store_free`, `cartridge_template` (`null`
+with older board firmware). It also has `last_pass`, `pass_axis`, `offset_x`, `offset_y` and `direction_trim`, the
+values in use including nudges.
 
 ## Uploading passes
 
