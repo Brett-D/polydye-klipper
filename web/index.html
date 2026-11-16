@@ -74,6 +74,26 @@
     </section>
 
     <section class="card">
+      <h2>Board firmware</h2>
+      <div class="grid">
+        <div><span class="k">On the board</span><span class="v" id="fw-board">&ndash;</span></div>
+        <div><span class="k">Bundled with this add-on</span><span class="v" id="fw-bundled">&ndash;</span></div>
+      </div>
+      <p class="hint">Updates go over the board's USB cable. Klipper loses the board for about half a minute while it
+        restarts, then reconnects by itself. If the new firmware doesn't start properly, the board goes back to the
+        previous one on its own. Not possible during a print.</p>
+      <div class="buttons">
+        <button id="fw-update-btn" class="primary fw-btn">Update to bundled firmware</button>
+        <button id="fw-file-btn" class="fw-btn">Update from file&hellip;</button>
+        <input type="file" id="fw-file" accept=".bin" class="hidden">
+      </div>
+      <div id="fw-progress" class="hidden">
+        <progress id="fw-bar" max="100" value="0"></progress>
+        <span id="fw-msg"></span>
+      </div>
+    </section>
+
+    <section class="card">
       <h2>Calibration</h2>
       <p class="hint">These steps print real ink, so they need a cartridge in a mounted holder. They will be enabled
         in a later version.</p>

@@ -45,6 +45,10 @@ input, select { background: #2c2c2c; color: var(--text); border: 1px solid var(-
 .banner.bad { border-color: var(--bad); color: #ffb4ab; background: #2a1616; }
 .hidden { display: none !important; }
 pre#log { margin: 0; max-height: 220px; overflow: auto; white-space: pre-wrap; color: var(--muted); font-size: 12px; }
+#fw-progress { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
+#fw-progress progress { flex: 0 0 240px; height: 10px; accent-color: var(--accent); }
+#fw-msg.bad { color: var(--bad); }
+#fw-msg.good { color: var(--ok); }
 .on { color: var(--warn); }
 .live { color: var(--bad); font-weight: 500; }
 .good { color: var(--ok); }

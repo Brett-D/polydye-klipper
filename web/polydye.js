@@ -3,7 +3,7 @@
 'use strict';
 
 const $ = (id) => document.getElementById(id);
-const state = { klippy: 'disconnected', message: '', board: false, printer: {} };
+const state = { klippy: 'disconnected', message: '', board: false, printer: {}, fw: { bundled: null, updating: false } };
 let ws = null;
 let nextId = 1;
 const pending = new Map();
@@ -47,6 +47,7 @@ function connect() {
     } catch (e) { /* older Moonraker: identification is optional */ }
     initKlippy();
     loadSettings();
+    loadFirmwareInfo();
   };
   ws.onclose = () => {
     setConn('disconnected', 'bad');
@@ -76,6 +77,9 @@ function connect() {
         if (/polydye|^!!/i.test(line)) log(line);
         break;
       }
+      case 'notify_polydye_firmware':
+        firmwareProgress(msg.params[0]);
+        break;
       case 'notify_klippy_ready':
       case 'notify_klippy_shutdown':
       case 'notify_klippy_disconnected':
@@ -169,7 +173,88 @@ function render() {
   document.querySelectorAll('.needs-board').forEach((b) => {
     b.disabled = !state.board || (b.classList.contains('needs-idle') && printing);
   });
+  renderFirmware(printing);
 }
+
+// ---- board firmware updates (moonraker/polydye.py runs them) --------------------------------------------------
+
+function boardVersion() {
+  return (state.printer['mcu polydye'] || {}).mcu_version || '';
+}
+
+function renderFirmware(printing) {
+  const bundled = state.fw.bundled;
+  const board = boardVersion();
+  text('fw-board', board || (state.fw.updating ? 'updating…' : '–'));
+  text('fw-bundled', bundled ? bundled.version : 'none');
+  const same = bundled && board && bundled.version === board;
+  $('fw-update-btn').textContent = same ? 'Reinstall bundled firmware' : 'Update to bundled firmware';
+  const offline = !ws || ws.readyState !== WebSocket.OPEN;
+  document.querySelectorAll('.fw-btn').forEach((b) => { b.disabled = offline || printing || state.fw.updating; });
+  if (!bundled) $('fw-update-btn').disabled = true;
+}
+
+async function loadFirmwareInfo() {
+  try {
+    const info = await rpc('server.polydye.firmware');
+    state.fw.bundled = info.bundled;
+    state.fw.updating = info.updating;
+  } catch (e) {
+    log(`! firmware info: ${e.message}`);
+  }
+  render();
+}
+
+function firmwareProgress(p) {
+  $('fw-progress').classList.remove('hidden');
+  if (p.progress !== null && p.progress !== undefined) $('fw-bar').value = p.progress;
+  const msg = $('fw-msg');
+  msg.textContent = p.message;
+  msg.className = p.state === 'error' ? 'bad' : (p.state === 'done' ? 'good' : '');
+  state.fw.updating = p.state === 'running';
+  if (p.state !== 'running' || p.progress === null || p.progress === undefined) log(`firmware: ${p.message}`);
+  render();
+}
+
+async function startFirmwareUpdate(params, label) {
+  const ok = window.confirm(`${label}?\n\nThe printer must be idle. Klipper loses the PolyDye board for about half `
+    + 'a minute while it restarts, then reconnects.');
+  if (!ok) return;
+  try {
+    const r = await rpc('server.polydye.firmware.update', params);
+    state.fw.updating = true;
+    log(`> firmware update to ${r.version}`);
+    firmwareProgress({ state: 'running', message: `updating to ${r.version}`, progress: 0 });
+  } catch (e) {
+    firmwareProgress({ state: 'error', message: e.message, progress: null });
+  }
+}
+
+$('fw-update-btn').addEventListener('click', () => {
+  const bundled = state.fw.bundled;
+  const same = bundled && bundled.version === boardVersion();
+  startFirmwareUpdate(same ? { force: true } : {}, `${same ? 'Reinstall' : 'Install'} firmware ${bundled.version}`);
+});
+
+$('fw-file-btn').addEventListener('click', () => $('fw-file').click());
+
+$('fw-file').addEventListener('change', async (ev) => {
+  const file = ev.target.files[0];
+  ev.target.value = '';
+  if (!file) return;
+  try {
+    const body = new FormData();
+    body.append('root', 'config');
+    body.append('path', 'polydye-fw');
+    body.append('file', file, file.name);
+    const r = await fetch('/server/files/upload', { method: 'POST', body });
+    if (!r.ok) throw new Error(`upload: HTTP ${r.status}`);
+  } catch (e) {
+    firmwareProgress({ state: 'error', message: e.message, progress: null });
+    return;
+  }
+  startFirmwareUpdate({ file: `polydye-fw/${file.name}`, force: true }, `Install ${file.name}`);
+});
 
 // ---- settings: edit the [polydye] section of polydye.cfg ------------------------------------------------------
 
