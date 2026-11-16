@@ -1,0 +1,88 @@
+<!doctype html>
+<!-- PolyDye page, served by the polydye Moonraker component at /server/polydye/ui.
+     This file is part of polydye-klipper (GPLv3). -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PolyDye</title>
+  <link rel="stylesheet" href="/server/polydye/polydye.css">
+</head>
+<body>
+  <header>
+    <a class="back" href="/" title="Back to Mainsail">&larr; Mainsail</a>
+    <h1>PolyDye</h1>
+    <span id="conn" class="pill">connecting&hellip;</span>
+  </header>
+
+  <main>
+    <section id="banner" class="banner hidden"></section>
+
+    <section class="card">
+      <h2>Board</h2>
+      <div class="grid" id="status">
+        <div><span class="k">Firmware</span><span class="v" id="s-fw">&ndash;</span></div>
+        <div><span class="k">Boost</span><span class="v" id="s-boost">&ndash;</span></div>
+        <div><span class="k">Output</span><span class="v" id="s-live">&ndash;</span></div>
+        <div><span class="k">Pass printing</span><span class="v" id="s-running">&ndash;</span></div>
+        <div><span class="k">Passes queued</span><span class="v" id="s-queued">&ndash;</span></div>
+        <div><span class="k">Passes printed</span><span class="v" id="s-passes">&ndash;</span></div>
+        <div><span class="k">Faults</span><span class="v" id="s-faults">&ndash;</span></div>
+        <div><span class="k">Worst column lateness</span><span class="v" id="s-late">&ndash;</span></div>
+        <div><span class="k">Stored passes</span><span class="v" id="s-store">&ndash;</span></div>
+        <div><span class="k">Free pass memory</span><span class="v" id="s-free">&ndash;</span></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Controls</h2>
+      <p class="hint">The dry run homes if needed, lifts the nozzle to 20 mm and prints two test passes without firing
+        any ink. The printer moves; keep the bed clear.</p>
+      <div class="buttons">
+        <button data-gcode="PD_DRY_RUN_TEST" class="primary needs-board needs-idle">Dry run test</button>
+        <button data-gcode="POLYDYE_STATUS" class="needs-board">Refresh status</button>
+        <button data-gcode="PD_OFF" class="needs-board">Off</button>
+        <button id="live-btn" class="danger needs-board needs-idle">Enable live ink&hellip;</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Settings <span class="sub">polydye.cfg</span></h2>
+      <form id="settings">
+        <label>Pass axis
+          <select name="pass_axis"><option value="y">Y (bed moves)</option><option value="x">X (toolhead moves)</option></select>
+        </label>
+        <label>Cartridge offset X (mm)<input name="offset_x" type="number" step="0.01" required></label>
+        <label>Cartridge offset Y (mm)<input name="offset_y" type="number" step="0.01" required></label>
+        <label>Resolution (dpi)<input name="dpi" type="number" step="1" min="1" placeholder="600"></label>
+        <label>Pass speed (mm/s)<input name="pass_speed" type="number" step="0.1" min="1" placeholder="50"></label>
+        <div class="buttons">
+          <button type="submit" class="primary">Save</button>
+          <button type="button" id="restart-btn" class="hidden">Restart Klipper to apply</button>
+        </div>
+        <p class="hint">Offsets are the cartridge nozzle-row centre minus the hotend nozzle, in bed coordinates.
+          Saving edits only the [polydye] section of polydye.cfg; Klipper applies it after a restart.</p>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>Calibration</h2>
+      <p class="hint">These steps print real ink, so they need a cartridge in a mounted holder. They will be enabled
+        in a later version.</p>
+      <ol class="steps">
+        <li><b>Nozzle check</b>: print every nozzle once to find blocked ones.</li>
+        <li><b>Cartridge offset</b>: print ink marks next to a plastic reference and measure the offset.</li>
+        <li><b>Direction alignment</b>: print in both directions and line the passes up.</li>
+        <li><b>Pulse length</b>: tune the fire pulse for even drops at this board's voltage.</li>
+      </ol>
+    </section>
+
+    <section class="card">
+      <h2>Messages</h2>
+      <pre id="log"></pre>
+    </section>
+  </main>
+
+  <script src="/server/polydye/polydye.js"></script>
+</body>
+</html>

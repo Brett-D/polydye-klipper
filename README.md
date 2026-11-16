@@ -1,0 +1,206 @@
+# PolyDye for Klipper
+
+Klipper, Moonraker and Mainsail support for **PolyDye**, a full-colour inkjet mod for 3D printers. An HP 63/302/123/803
+cartridge driven by an ESP32-S3 board prints ink between layers.
+
+The PolyDye board joins Klipper as a second MCU (`[mcu polydye]`) over USB, so Klipper's own clock synchronisation
+tells it exactly when each ink pass starts. No extra wiring to the printer's mainboard is needed.
+
+- **Plug-in toggle:** with the board plugged in, PolyDye is enabled. Without it, Klipper starts exactly as it did
+  before PolyDye was installed, so you can keep printing normally.
+- **PolyDye page** in Mainsail's sidebar: board status, a dry-run test, settings and, later, calibration.
+- **Updates** through Mainsail's update manager, next to Klipper.
+
+The board needs the PolyDye firmware with the Klipper link (phase 3 or later).
+
+Licence: GPLv3.
+
+## Install
+
+On the Raspberry Pi (Klipper, Moonraker and Mainsail, for example MainsailOS):
+
+```
+cd ~ && git clone https://github.com/Brett-D/polydye-klipper.git
+~/polydye-klipper/install.sh
+```
+
+Then reload Mainsail. **PolyDye** appears in the sidebar.
+
+`install.sh` is safe to run again. It:
+- links `klipper/polydye.py` into Klipper's extras and `moonraker/polydye.py` into Moonraker's components, and
+  hides both from their git status, so Klipper and Moonraker updates keep working;
+- creates `polydye.cfg` in your config folder from `config/polydye.cfg.example`, if you don't have one;
+- adds `[include polydye-active*.cfg]` to `printer.cfg`, above any `SAVE_CONFIG` block (a backup is saved first);
+- installs the plug-in toggle (below) as a hook on the Klipper service;
+- adds `[polydye]` and `[update_manager polydye]` to `moonraker.conf`;
+- adds a PolyDye entry to Mainsail's sidebar (`.theme/navi.json`, keeping any entries you already have);
+- restarts Moonraker and Klipper.
+
+**Uninstall:** `~/polydye-klipper/uninstall.sh` removes all of it and keeps your `polydye.cfg`; `--purge` deletes
+that too. Afterwards `printer.cfg` and `moonraker.conf` are byte-for-byte what they were before.
+
+### The plug-in toggle
+
+- `printer.cfg` permanently has `[include polydye-active*.cfg]`.
+- `scripts/polydye-toggle.sh` runs each time the Klipper service starts. If the board is on USB, it writes
+  `polydye-active.cfg` with `[mcu polydye]`, an include of your `polydye.cfg` and the PolyDye macros. Otherwise it
+  deletes that file.
+- A wildcard include that matches nothing is ignored, so without the board Klipper starts exactly as before.
+
+**To switch,** plug or unplug the board's J7 USB, then restart the **Klipper service**: Mainsail's power menu →
+Services → klipper, or `sudo systemctl restart klipper`. `RESTART` and `FIRMWARE_RESTART` don't re-run the script.
+
+### Hardware notes
+
+- Power the board from its own supply (J4). J7 carries data only: its 5 V pin isn't tied to the board's 5 V
+  rail, so a normal USB cable from J7 to the Pi is fine.
+- If the FT232 programmer stays wired to the board's J1 header, keep its USB plugged into the Pi. An unpowered
+  FT232 holds the board in its bootloader.
+
+## The PolyDye page
+
+Mainsail sidebar → **PolyDye**, or `http://<printer>/server/polydye/ui`. The page talks to Moonraker like Mainsail
+does. It shows:
+- **Board status**, live: firmware, boost, dry run or live ink, passes queued and printed, faults, worst column
+  lateness, stored passes.
+- **Controls:** dry-run test, status, off, and enabling live ink (with a confirmation).
+- **Settings:** pass axis, offsets, resolution and pass speed, saved into the `[polydye]` section of `polydye.cfg`.
+  Klipper applies them after a restart.
+- **Calibration:** nozzle check, cartridge offset, direction alignment and pulse length. These need ink, so they're
+  listed but not enabled yet.
+
+## Configuration
+
+`polydye-active.cfg` (generated; don't edit) contains:
+
+```
+[mcu polydye]
+serial: /dev/serial/by-id/usb-PolyDye_PolyDye_ink_controller_<MAC>-if00
+
+[include polydye.cfg]
+[include /home/<user>/polydye-klipper/config/polydye_macros.cfg]
+```
+
+Your `polydye.cfg`:
+
+```
+[polydye]
+# Required. They depend on how the cartridge is mounted; measure, then calibrate.
+pass_axis: y          # x or y: the axis the cartridge moves along while printing
+offset_x: -0.2        # cartridge nozzle-row centre minus hotend nozzle, mm (bed coordinates)
+offset_y: -77.7
+# Optional:
+#dpi: 600             # dots per inch along the pass
+#pass_speed: 50       # mm/s
+#travel_speed: 150    # mm/s, moves to the start of each pass
+#extra_run_up: 1.0    # mm added to the computed run-up
+#settle_time:         # s; default: the input shaper's impulse length for the pass axis
+#min_lead_time: 0.025 # s; a pass must be scheduled at least this far ahead
+#mcu: polydye
+#data_port:           # the board's data port; default: the [mcu polydye] serial path with -if02 instead of -if00
+```
+
+Mount layouts under design (2026-11-15). The offsets are nominal (±5 mm) until measured:
+
+| Layout | `pass_axis` | `offset_x` | `offset_y` |
+|---|---|---|---|
+| Cartridge in front of the nozzle | `y` | -0.2 | -77.7 |
+| Cartridge right of the nozzle, X passes | `x` | about 64 | about 0 |
+| Cartridge right and in front, Y passes | `y` | about 50 | about -17 |
+
+On a bed-slinger such as the Ender 3, Y moves the bed, so Y passes shake it. Configure an `[input_shaper]` for
+the pass axis, and the run-up will include its settle time automatically.
+
+## How a pass works
+
+Each ink pass is one G-code command:
+
+```
+POLYDYE_PASS LAYER=3 PASS=7 X=120.0 Y=40.0 DIR=1 [SPEED=50]
+```
+
+- `X`, `Y`: bed coordinates where the first column lands. On the pass axis that's the first column; on the other
+  axis it's the centre of the nozzle rows.
+- `DIR`: `1` or `-1`, the direction along the pass axis.
+- `SPEED`: pass speed in mm/s; defaults to `pass_speed`.
+
+The add-on:
+1. Asks the board whether the pass is uploaded and how many columns it has.
+2. Moves the hotend to the start of the run-up (through the bed mesh, if any), then stops.
+3. Plans the pass as one straight move from rest along the pass axis, at constant Z.
+4. Computes when the first column passes the cartridge, from Klipper's acceleration, the speed and the run-up. It
+   then checks the plan against the move Klipper actually queued; if they differ, no ink is scheduled.
+5. Sends the board the first column's time on the board's clock and the column period (`25.4 / dpi / speed`).
+
+The run-up is long enough to reach full speed, let the input shaper settle (its impulse length for the pass axis)
+and satisfy Klipper's `minimum_cruise_ratio`, plus `extra_run_up`. The same length is used after the last column.
+
+If anything would print a pass wrongly, Klipper stops with a readable reason, for example:
+- `polydye: pass data has not been uploaded`
+- `polydye: column period too short for the cartridge`
+- `Lost communication with MCU 'polydye'`
+
+## Commands
+
+| Command | Does |
+|---|---|
+| `POLYDYE_ENABLE [LIVE=1]` | Turns the board's boost on. `LIVE=1` (default) allows real ink; `LIVE=0` is a dry run: the bus runs with the fire lines held off |
+| `POLYDYE_DISABLE` | Waits for queued moves, then turns live output and the boost off |
+| `POLYDYE_PASS LAYER= PASS= X= Y= [DIR=1] [SPEED=]` | Prints one pass (above) |
+| `POLYDYE_CANCEL` | Drops passes that are scheduled but not started (for a cancel macro) |
+| `POLYDYE_STATUS` | Board status: boost, live, passes printed and queued, worst column lateness, faults, stored passes |
+| `POLYDYE_UPLOAD_TEST_PASS [LAYER=0] [PASS=0] [COLUMNS=600] [PATTERN=alternate\|all\|none]` | Uploads a test pass over the board's data port, for dry runs. Not during a print: it briefly blocks Klipper while it sends |
+
+Macros (Mainsail's Macros panel, while the board is plugged in):
+
+| Macro | Does |
+|---|---|
+| `PD_STATUS` | `POLYDYE_STATUS` |
+| `PD_DRY_RUN_TEST [X=100] [Y=40]` | Homes if needed, lifts Z to 20 mm, uploads a test pass and prints it in both directions without ink, then reports status. The printer moves; nothing fires |
+| `PD_OFF` | Drops queued passes, then turns live output and the boost off |
+
+`printer.polydye` (macros, Mainsail, the PolyDye page) has the board status, refreshed every 2 s: `boost`, `live`,
+`running`, `queued`, `passes`, `late_max_us`, `faults`, `store_count`, `store_free`. It also has `last_pass`,
+`pass_axis`, `offset_x` and `offset_y`.
+
+## Uploading passes
+
+Pass data goes over the board's second USB serial port (`-if02`), not through Klipper:
+
+```
+python3 ~/polydye-klipper/scripts/polydye_upload.py info
+python3 ~/polydye-klipper/scripts/polydye_upload.py put --layer 0 --pass 0 --columns 600 --pattern alternate
+python3 ~/polydye-klipper/scripts/polydye_upload.py job print.pdj
+python3 ~/polydye-klipper/scripts/polydye_upload.py list
+```
+
+It needs pyserial; use `~/klippy-env/bin/python` if the system Python lacks it. Generating `.pdj` jobs from a
+sliced model is the next step (the post-processor).
+
+### Data port
+
+Frames, in both directions (integers little-endian):
+
+```
+"PD" | type u8 | seq u8 | length u32 | payload[length] | crc32 u32
+```
+
+The CRC is zlib's CRC-32 over type, seq, length and payload. Every request gets one reply with the same `seq`:
+`0x80` (OK) or `0xFF` (error), both with a JSON payload.
+
+| Request | Payload | Reply |
+|---|---|---|
+| `0x01` HELLO | none | `{"protocol":1,"firmware":…,"nozdata_size":42,"cart":"color"\|"black","passes":N,"max_passes":N,"free":bytes}` |
+| `0x10` PUT | layer u16, pass u16, cart u8, flags u8 (1 = delete after printing), columns u16, then columns × 42 bytes | `{"stored":[layer,pass],"columns":N}` |
+| `0x11` DELETE | layer u16, pass u16 | `{}` |
+| `0x12` CLEAR | none | `{"deleted":N}` |
+| `0x13` LIST | none | `{"passes":[[layer,pass,columns,cart,flags],…]}` |
+
+Job files (`.pdj`, version 0): `b"PDJ0"`, a u32 pass count, then for each pass a u32 length and a PUT payload.
+
+## Development
+
+- `tests/` has unit tests for the pass timing and geometry, and a round trip of `install.sh` / `uninstall.sh` in
+  a fake Klipper/Moonraker tree. CI runs them on every push.
+- The end-to-end test (real klippy against a simulated PolyDye board) lives with the firmware, because it builds
+  the board's protocol code. It uses this repo's add-on and macros.
