@@ -37,9 +37,11 @@
     <section class="card">
       <h2>Controls</h2>
       <p class="hint">The dry run homes if needed, lifts the nozzle to 20 mm and prints two test passes without firing
-        any ink. The printer moves; keep the bed clear.</p>
+        any ink. Wipe moves the cartridge to the sponge at the right end of the X gantry, wipes it and comes back.
+        Both move the printer; keep the bed clear.</p>
       <div class="buttons">
         <button data-gcode="PD_DRY_RUN_TEST" class="primary needs-board needs-idle">Dry run test</button>
+        <button data-gcode="POLYDYE_WIPE" class="needs-board needs-idle">Wipe</button>
         <button data-gcode="POLYDYE_STATUS" class="needs-board">Refresh status</button>
         <button data-gcode="PD_OFF" class="needs-board">Off</button>
         <button id="live-btn" class="danger needs-board needs-idle">Enable live ink&hellip;</button>

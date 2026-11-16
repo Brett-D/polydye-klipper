@@ -2,11 +2,11 @@
 # Loaded only while the PolyDye board is plugged in (see README.md, "The plug-in toggle").
 
 [polydye]
-# Required; they depend on the cartridge mount. These are the nominal front-mount values (+/-5 mm) and are only
-# good enough for dry runs until the mount is measured.
+# Required; they depend on the cartridge mount. These are the nominal values (+/-5 mm) for the PolyDye mount with
+# the cartridge right of a Sprite extruder, printing along Y. Calibrate them before printing with ink.
 pass_axis: y
-offset_x: -0.2
-offset_y: -77.7
+offset_x: 62.6
+offset_y: -20.2
 #dpi: 600
 #pass_speed: 50
 #travel_speed: 150

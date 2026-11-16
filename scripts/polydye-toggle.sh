@@ -33,8 +33,8 @@ if [ -n "$port" ]; then
 [mcu polydye]
 serial: $port
 
-[include polydye.cfg]
 [include $REPO_DIR/config/polydye_macros.cfg]
+[include polydye.cfg]
 EOF
     mv "$OUT.tmp" "$OUT"
     echo "polydye: board found at $port, enabled"

@@ -63,7 +63,7 @@ Mainsail sidebar → **PolyDye**, or `http://<printer>/server/polydye/ui`. The p
 does. It shows:
 - **Board status**, live: firmware, boost, dry run or live ink, passes queued and printed, faults, worst column
   lateness, stored passes.
-- **Controls:** dry-run test, status, off, and enabling live ink (with a confirmation).
+- **Controls:** dry-run test, cartridge wipe, status, off, and enabling live ink (with a confirmation).
 - **Settings:** pass axis, offsets, resolution and pass speed, saved into the `[polydye]` section of `polydye.cfg`.
   Klipper applies them after a restart.
 - **Calibration:** nozzle check, cartridge offset, direction alignment and pulse length. These need ink, so they're
@@ -77,8 +77,8 @@ does. It shows:
 [mcu polydye]
 serial: /dev/serial/by-id/usb-PolyDye_PolyDye_ink_controller_<MAC>-if00
 
-[include polydye.cfg]
 [include /home/<user>/polydye-klipper/config/polydye_macros.cfg]
+[include polydye.cfg]
 ```
 
 Your `polydye.cfg`:
@@ -87,8 +87,8 @@ Your `polydye.cfg`:
 [polydye]
 # Required. They depend on how the cartridge is mounted; measure, then calibrate.
 pass_axis: y          # x or y: the axis the cartridge moves along while printing
-offset_x: -0.2        # cartridge nozzle-row centre minus hotend nozzle, mm (bed coordinates)
-offset_y: -77.7
+offset_x: 62.6        # cartridge nozzle-row centre minus hotend nozzle, mm (bed coordinates)
+offset_y: -20.2
 # Optional:
 #dpi: 600             # dots per inch along the pass
 #pass_speed: 50       # mm/s
@@ -100,13 +100,10 @@ offset_y: -77.7
 #data_port:           # the board's data port; default: the [mcu polydye] serial path with -if02 instead of -if00
 ```
 
-Mount layouts under design (2026-11-15). The offsets are nominal (±5 mm) until measured:
-
-| Layout | `pass_axis` | `offset_x` | `offset_y` |
-|---|---|---|---|
-| Cartridge in front of the nozzle | `y` | -0.2 | -77.7 |
-| Cartridge right of the nozzle, X passes | `x` | about 64 | about 0 |
-| Cartridge right and in front, Y passes | `y` | about 50 | about -17 |
+The template has the nominal values (±5 mm) for the PolyDye mount on an Ender 3 with a Sprite extruder: the
+cartridge sits right of the Sprite (BLTouch between them) and prints along Y. With these offsets the cartridge can
+ink bed X 63–220 and Y 0–215. Other mounts need their own values; measure from the hotend nozzle to the centre of
+the cartridge's nozzles, negative Y if the cartridge is in front.
 
 On a bed-slinger such as the Ender 3, Y moves the bed, so Y passes shake it. Configure an `[input_shaper]` for
 the pass axis, and the run-up will include its settle time automatically.
@@ -158,6 +155,16 @@ Macros (Mainsail's Macros panel, while the board is plugged in):
 | `PD_STATUS` | `POLYDYE_STATUS` |
 | `PD_DRY_RUN_TEST [X=100] [Y=40]` | Homes if needed, lifts Z to 20 mm, uploads a test pass and prints it in both directions without ink, then reports status. The printer moves; nothing fires |
 | `PD_OFF` | Drops queued passes, then turns live output and the boost off |
+| `POLYDYE_WIPE [X=] [LENGTH=25] [STROKES=3] [SPEED=50] [Z_HOP=1]` | Wipes the cartridge on a damp sponge at the right end of the X gantry: homes if needed, lifts Z by `Z_HOP`, moves to `X` (default: the X axis maximum), strokes `STROKES` times between `X` and `X - LENGTH` at `SPEED` mm/s, then returns |
+
+The macros are loaded before `polydye.cfg`, so you can change their defaults there instead of editing the add-on
+(which would stop Mainsail updating it):
+
+```
+[gcode_macro POLYDYE_WIPE]
+variable_strokes: 5
+variable_length: 20
+```
 
 `printer.polydye` (macros, Mainsail, the PolyDye page) has the board status, refreshed every 2 s: `boost`, `live`,
 `running`, `queued`, `passes`, `late_max_us`, `faults`, `store_count`, `store_free`. It also has `last_pass`,
