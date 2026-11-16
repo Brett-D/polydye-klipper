@@ -29,13 +29,14 @@ from ..common import RequestType, TransportType
 THROTTLED_PATH = "/sys/devices/platform/soc/soc:firmware/get_throttled"
 
 
-def power_problem(path: str = THROTTLED_PATH):
-    """Why a USB firmware transfer isn't safe on this Pi right now, or None."""
+def power_problem(path: str = THROTTLED_PATH, bits: int = 0):
+    """Why a USB firmware transfer isn't safe on this Pi right now, or None. `bits` adds throttle flags from
+    elsewhere (Moonraker's proc_stats), for kernels without the sysfs file."""
     try:
         with open(path) as f:
-            bits = int(f.read().strip(), 16)
+            bits |= int(f.read().strip(), 16)
     except (OSError, ValueError):
-        return None
+        pass
     if bits & 0x1:
         return "the Pi is under-volted right now"
     if bits & 0x10000:
@@ -97,6 +98,12 @@ class PolyDye:
         with open(path, "rb") as f:
             return self.uploader.image_info(f.read())
 
+    def _power_problem(self):
+        # proc_stats polls `vcgencmd get_throttled` and keeps every flag it has seen since Moonraker started.
+        stats = self.server.lookup_component("proc_stats", None)
+        seen = getattr(stats, "total_throttled", 0) | getattr(stats, "last_throttled", 0)
+        return power_problem(bits=seen if isinstance(seen, int) else 0)
+
     async def _handle_firmware_info(self, web_request):
         bundled = None
         if os.path.isfile(self.bundled_path):
@@ -104,7 +111,7 @@ class PolyDye:
                 bundled = self._image_info(self.bundled_path)
             except ValueError as e:
                 logging.warning(f"polydye: bundled firmware unusable: {e}")
-        return {"bundled": bundled, "updating": self.updating, "power_problem": power_problem(),
+        return {"bundled": bundled, "updating": self.updating, "power_problem": self._power_problem(),
                 "board_on_usb": bool(glob.glob("/dev/serial/by-id/*PolyDye*-if00"))}
 
     def _resolve_upload(self, rel: str) -> str:
@@ -119,7 +126,7 @@ class PolyDye:
     async def _handle_firmware_update(self, web_request):
         if self.updating:
             raise self.server.error("a firmware update is already running", 409)
-        why = power_problem()
+        why = self._power_problem()
         if why:
             # A Pi 3 short of power loses USB data and can lock up during the transfer or the board's restart.
             raise self.server.error(f"{why}: fix its power supply first (a Pi 3 needs 5.1 V, 2.5 A)", 409)
