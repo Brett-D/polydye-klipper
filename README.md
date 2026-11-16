@@ -71,6 +71,32 @@ does. It shows:
   Klipper applies them after a restart.
 - **Calibration:** nozzle check, cartridge offset, direction alignment and pulse length. These need ink, so they're
   listed but not enabled yet.
+- **Board firmware:** the board's version and the one bundled with this add-on, with buttons to update to it or
+  to a `.bin` you choose (see below).
+- The pill at the top right sums up the state: Moonraker offline, Klipper starting or shut down, PolyDye not
+  enabled, PolyDye ready, dry run, LIVE ink. If the board is plugged in but Klipper started without it, **Enable
+  PolyDye** restarts the Klipper service so the plug-in toggle picks it up.
+
+## Board firmware updates
+
+The board's firmware updates over its USB cable (J7), from the PolyDye page or the command line:
+
+```
+python3 ~/polydye-klipper/scripts/polydye_upload.py firmware ~/polydye-klipper/firmware/polydye.bin
+```
+
+`firmware/polydye.bin` is the firmware this version of the add-on was tested with, built from
+[polydye-firmware](https://github.com/Brett-D/polydye-firmware); add-on updates in Mainsail bring new builds.
+- The image goes into the board's spare firmware slot while the board keeps running, is checked, and the board
+  restarts into it. Klipper loses the board for about half a minute and reconnects (the page runs
+  `FIRMWARE_RESTART`). An update takes about 25 s: the transfer is paced, because a Raspberry Pi 3 lost USB data
+  and locked up at full speed.
+- The new firmware must be confirmed by the Pi within two minutes. If it doesn't come up working, the board goes
+  back to the previous firmware by itself.
+- Updates are refused during a print, while PolyDye is on, and while the Pi reports under-voltage. A Pi 3 needs a
+  5.1 V, 2.5 A supply; phone chargers often sag.
+- The first firmware with USB updates has to be flashed once with the FT232, bootloader included (see
+  polydye-firmware's README); after that, updates go over USB.
 
 ## Configuration
 
@@ -200,17 +226,25 @@ The CRC is zlib's CRC-32 over type, seq, length and payload. Every request gets 
 
 | Request | Payload | Reply |
 |---|---|---|
-| `0x01` HELLO | none | `{"protocol":1,"firmware":…,"nozdata_size":42,"cart":"color"\|"black","passes":N,"max_passes":N,"free":bytes}` |
+| `0x01` HELLO | none | `{"protocol":2,"firmware":…,"nozdata_size":42,"cart":"color"\|"black","passes":N,"max_passes":N,"free":bytes,"partition":"ota_0"\|"ota_1","app_state":"valid"\|"pending"\|"unknown","rolled_back":null\|version}` |
 | `0x10` PUT | layer u16, pass u16, cart u8, flags u8 (1 = delete after printing), columns u16, then columns × 42 bytes | `{"stored":[layer,pass],"columns":N}` |
 | `0x11` DELETE | layer u16, pass u16 | `{}` |
 | `0x12` CLEAR | none | `{"deleted":N}` |
 | `0x13` LIST | none | `{"passes":[[layer,pass,columns,cart,flags],…]}` |
+| `0x20` FW_BEGIN | image size u32, SHA-256 (32 bytes) | `{"partition":…}` |
+| `0x21` FW_DATA | offset u32, then up to 4096 image bytes, in order (a resent last block is accepted) | `{}` |
+| `0x22` FW_END | none | `{"version":…}`: checked and selected for the next boot |
+| `0x23` FW_ABORT | none | `{}` |
+| `0x24` FW_CONFIRM | none | `{"app_state":"valid"}`: keeps a new firmware that would otherwise roll back |
+| `0x25` REBOOT | none | `{}`, then the board unplugs from USB and restarts |
+
+The firmware requests are refused while Klipper is using the board.
 
 Job files (`.pdj`, version 0): `b"PDJ0"`, a u32 pass count, then for each pass a u32 length and a PUT payload.
 
 ## Development
 
-- `tests/` has unit tests for the pass timing and geometry, and a round trip of `install.sh` / `uninstall.sh` in
-  a fake Klipper/Moonraker tree. CI runs them on every push.
+- `tests/` has unit tests for the pass timing and geometry, the macros, the firmware image checks, and a round trip
+  of `install.sh` / `uninstall.sh` in a fake Klipper/Moonraker tree. CI runs them on every push.
 - The end-to-end test (real klippy against a simulated PolyDye board) lives with the firmware, because it builds
   the board's protocol code. It uses this repo's add-on and macros.

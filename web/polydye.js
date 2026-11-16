@@ -3,7 +3,10 @@
 'use strict';
 
 const $ = (id) => document.getElementById(id);
-const state = { klippy: 'disconnected', message: '', board: false, printer: {}, fw: { bundled: null, updating: false } };
+const state = {
+  online: false, klippy: 'disconnected', message: '', board: false, printer: {},
+  fw: { bundled: null, updating: false, power: null, boardOnUsb: false },
+};
 let ws = null;
 let nextId = 1;
 const pending = new Map();
@@ -39,7 +42,8 @@ function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/websocket`);
   ws.onopen = async () => {
-    setConn('connected', 'ok');
+    state.online = true;
+    render();
     try {
       await rpc('server.connection.identify', {
         client_name: 'PolyDye', version: '0.1', type: 'web', url: location.href,
@@ -49,7 +53,7 @@ function connect() {
     loadSettings();
   };
   ws.onclose = () => {
-    setConn('disconnected', 'bad');
+    state.online = false;
     for (const p of pending.values()) p.reject(new Error('connection closed'));
     pending.clear();
     state.klippy = 'unreachable';
@@ -90,11 +94,28 @@ function connect() {
   };
 }
 
-function setConn(text, cls) {
+// The header pill sums up the state that matters, most important first.
+function statusPill() {
+  const pd = state.printer.polydye || {};
+  if (!state.online) return ['Moonraker offline', 'bad'];
+  if (state.fw.updating) return ['updating board firmware', 'warn'];
+  if (state.klippy === 'startup') return ['Klipper starting', 'warn'];
+  if (state.klippy === 'shutdown') return ['Klipper shut down', 'bad'];
+  if (state.klippy !== 'ready') return [`Klipper ${state.klippy}`, 'bad'];
+  if (!state.board) return [state.fw.boardOnUsb ? 'PolyDye not enabled' : 'PolyDye board not plugged in', 'warn'];
+  if (pd.passes === undefined) return ['PolyDye connecting', 'warn'];
+  if (pd.live) return ['LIVE ink', 'bad'];
+  if (pd.running) return ['printing a pass (dry run)', 'ok'];
+  if (pd.boost) return ['PolyDye on, dry run', 'ok'];
+  return ['PolyDye ready', 'ok'];
+}
+
+function setConn() {
+  const [label, cls] = statusPill();
   const el = $('conn');
-  el.textContent = text;
+  el.textContent = label;
   el.className = `pill ${cls}`;
-  $('estop').disabled = cls !== 'ok';
+  $('estop').disabled = !state.online;
 }
 
 function merge(status) {
@@ -178,6 +199,7 @@ function render() {
     b.disabled = !state.board || (b.classList.contains('needs-idle') && printing);
   });
   renderFirmware(printing);
+  setConn();
 }
 
 // ---- board firmware updates (moonraker/polydye.py runs them) --------------------------------------------------
