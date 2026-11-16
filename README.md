@@ -61,6 +61,9 @@ Services → klipper, or `sudo systemctl restart klipper`. `RESTART` and `FIRMWA
 
 Mainsail sidebar → **PolyDye**, or `http://<printer>/server/polydye/ui`. The page talks to Moonraker like Mainsail
 does. It shows:
+- **Emergency stop**, always at the top: stops all motion at once and shuts Klipper down (like M112), which also
+  turns the board's boost off. It works while a macro such as the dry run is running. **Firmware restart** then
+  appears to bring Klipper back.
 - **Board status**, live: firmware, boost, dry run or live ink, passes queued and printed, faults, worst column
   lateness, stored passes.
 - **Controls:** dry-run test, cartridge wipe, status, off, and enabling live ink (with a confirmation).

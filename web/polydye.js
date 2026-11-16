@@ -52,6 +52,9 @@ function connect() {
     setConn('disconnected', 'bad');
     for (const p of pending.values()) p.reject(new Error('connection closed'));
     pending.clear();
+    state.klippy = 'unreachable';
+    state.message = 'Lost the connection to Moonraker; retrying.';
+    render();
     setTimeout(connect, 2000);
   };
   ws.onmessage = (ev) => {
@@ -88,6 +91,7 @@ function setConn(text, cls) {
   const el = $('conn');
   el.textContent = text;
   el.className = `pill ${cls}`;
+  $('estop').disabled = cls !== 'ok';
 }
 
 function merge(status) {
@@ -136,14 +140,16 @@ function text(id, value, cls) {
 
 function render() {
   const banner = $('banner');
+  const bannerText = $('banner-text');
   const p = state.printer;
   const printing = ['printing', 'paused'].includes((p.print_stats || {}).state);
+  $('fw-restart-btn').classList.toggle('hidden', !['shutdown', 'error'].includes(state.klippy));
   if (state.klippy !== 'ready') {
     banner.className = 'banner bad';
-    banner.textContent = `Klipper is ${state.klippy}. ${state.message}`;
+    bannerText.textContent = `Klipper is ${state.klippy}. ${state.message}`;
   } else if (!state.board) {
     banner.className = 'banner';
-    banner.textContent = 'The PolyDye board is not active. Plug its USB (J7) into the Pi, then restart the Klipper '
+    bannerText.textContent = 'The PolyDye board is not active. Plug its USB (J7) into the Pi, then restart the Klipper '
       + 'service (Mainsail power menu, Services, klipper). Without the board the printer works as normal.';
   } else {
     banner.className = 'banner hidden';
@@ -261,6 +267,27 @@ $('restart-btn').addEventListener('click', async () => {
 });
 
 // ---- controls -------------------------------------------------------------------------------------------------
+
+// Moonraker's emergency stop goes straight to Klipper, not through the G-code queue, so it also stops a running
+// macro. No confirmation, as in Mainsail.
+$('estop').addEventListener('click', async () => {
+  log('> EMERGENCY STOP');
+  try {
+    await rpc('printer.emergency_stop');
+  } catch (e) {
+    log(`! ${e.message}`);
+  }
+});
+
+$('fw-restart-btn').addEventListener('click', async () => {
+  $('fw-restart-btn').classList.add('hidden');
+  log('> FIRMWARE_RESTART');
+  try {
+    await rpc('printer.firmware_restart');
+  } catch (e) {
+    log(`! ${e.message}`);
+  }
+});
 
 document.querySelectorAll('button[data-gcode]').forEach((b) => {
   b.addEventListener('click', () => gcode(b.dataset.gcode));

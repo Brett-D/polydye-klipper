@@ -6,7 +6,7 @@
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 Roboto, "Segoe UI", sans-serif; }
 header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: var(--card);
-  border-bottom: 1px solid var(--line); }
+  border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 10; }
 header h1 { margin: 0; font-size: 20px; font-weight: 500; flex: 1; }
 a.back { color: var(--muted); text-decoration: none; }
 a.back:hover { color: var(--text); }
@@ -25,6 +25,8 @@ button:hover:not(:disabled) { border-color: var(--accent); }
 button:disabled { opacity: .4; cursor: not-allowed; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.danger { border-color: var(--bad); color: #ffb4ab; }
+button.estop { background: var(--bad); border-color: var(--bad); color: #fff; font-weight: 600; letter-spacing: .02em; }
+button.estop:hover:not(:disabled) { background: #d32f2f; border-color: #fff; }
 form { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
 form .buttons, form .hint { grid-column: 1 / -1; }
 label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12px; }
@@ -37,7 +39,9 @@ input, select { background: #2c2c2c; color: var(--text); border: 1px solid var(-
 .pill.ok { border-color: var(--ok); color: var(--ok); }
 .pill.warn { border-color: var(--warn); color: var(--warn); }
 .pill.bad { border-color: var(--bad); color: var(--bad); }
-.banner { padding: 12px 16px; border-radius: 6px; border: 1px solid var(--warn); color: var(--warn); background: #2a2116; }
+.banner { padding: 12px 16px; border-radius: 6px; border: 1px solid var(--warn); color: var(--warn); background: #2a2116;
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.banner span { flex: 1; }
 .banner.bad { border-color: var(--bad); color: #ffb4ab; background: #2a1616; }
 .hidden { display: none !important; }
 pre#log { margin: 0; max-height: 220px; overflow: auto; white-space: pre-wrap; color: var(--muted); font-size: 12px; }

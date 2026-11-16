@@ -12,11 +12,16 @@
   <header>
     <a class="back" href="/" title="Back to Mainsail">&larr; Mainsail</a>
     <h1>PolyDye</h1>
+    <button id="estop" class="estop" disabled
+            title="Stops all motion at once and shuts Klipper down, like M112. Firmware restart to recover.">Emergency stop</button>
     <span id="conn" class="pill">connecting&hellip;</span>
   </header>
 
   <main>
-    <section id="banner" class="banner hidden"></section>
+    <section id="banner" class="banner hidden">
+      <span id="banner-text"></span>
+      <button id="fw-restart-btn" class="hidden">Firmware restart</button>
+    </section>
 
     <section class="card">
       <h2>Board</h2>
@@ -38,7 +43,8 @@
       <h2>Controls</h2>
       <p class="hint">The dry run homes if needed, lifts the nozzle to 20 mm and prints two test passes without firing
         any ink. Wipe moves the cartridge to the sponge at the right end of the X gantry, wipes it and comes back.
-        Both move the printer; keep the bed clear.</p>
+        Both move the printer; keep the bed clear. To stop the printer at once, press Emergency stop at the top of
+        the page; Off only turns PolyDye off once the queued moves are done.</p>
       <div class="buttons">
         <button data-gcode="PD_DRY_RUN_TEST" class="primary needs-board needs-idle">Dry run test</button>
         <button data-gcode="POLYDYE_WIPE" class="needs-board needs-idle">Wipe</button>
