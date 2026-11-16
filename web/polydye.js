@@ -47,7 +47,6 @@ function connect() {
     } catch (e) { /* older Moonraker: identification is optional */ }
     initKlippy();
     loadSettings();
-    loadFirmwareInfo();
   };
   ws.onclose = () => {
     setConn('disconnected', 'bad');
@@ -134,6 +133,7 @@ async function initKlippy() {
     state.message = e.message;
   }
   render();
+  loadFirmwareInfo();
 }
 
 function text(id, value, cls) {
@@ -153,11 +153,15 @@ function render() {
     bannerText.textContent = `Klipper is ${state.klippy}. ${state.message}`;
   } else if (!state.board) {
     banner.className = 'banner';
-    bannerText.textContent = 'The PolyDye board is not active. Plug its USB (J7) into the Pi, then restart the Klipper '
-      + 'service (Mainsail power menu, Services, klipper). Without the board the printer works as normal.';
+    bannerText.textContent = state.fw.boardOnUsb
+      ? 'The PolyDye board is plugged in, but Klipper started without it. Enable PolyDye restarts the Klipper '
+        + 'service so it picks the board up (the printer must be idle).'
+      : 'The PolyDye board is not active. Plug its USB (J7) into the Pi, then restart the Klipper '
+        + 'service (Mainsail power menu, Services, klipper). Without the board the printer works as normal.';
   } else {
     banner.className = 'banner hidden';
   }
+  $('enable-btn').classList.toggle('hidden', !(state.klippy === 'ready' && !state.board && state.fw.boardOnUsb));
   const pd = p.polydye || {};
   const known = state.board && pd.passes !== undefined;
   text('s-fw', ((p['mcu polydye'] || {}).mcu_version) || '–');
@@ -205,6 +209,7 @@ async function loadFirmwareInfo() {
     state.fw.bundled = info.bundled;
     state.fw.updating = info.updating;
     state.fw.power = info.power_problem;
+    state.fw.boardOnUsb = info.board_on_usb;
   } catch (e) {
     log(`! firmware info: ${e.message}`);
   }
@@ -375,6 +380,18 @@ $('fw-restart-btn').addEventListener('click', async () => {
   log('> FIRMWARE_RESTART');
   try {
     await rpc('printer.firmware_restart');
+  } catch (e) {
+    log(`! ${e.message}`);
+  }
+});
+
+// The plug-in toggle (scripts/polydye-toggle.sh) only runs when the Klipper service starts.
+$('enable-btn').addEventListener('click', async () => {
+  if (['printing', 'paused'].includes((state.printer.print_stats || {}).state)) return;
+  $('enable-btn').classList.add('hidden');
+  log('> restart the Klipper service to enable PolyDye');
+  try {
+    await rpc('machine.services.restart', { service: 'klipper' });
   } catch (e) {
     log(`! ${e.message}`);
   }

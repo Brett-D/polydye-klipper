@@ -104,7 +104,8 @@ class PolyDye:
                 bundled = self._image_info(self.bundled_path)
             except ValueError as e:
                 logging.warning(f"polydye: bundled firmware unusable: {e}")
-        return {"bundled": bundled, "updating": self.updating, "power_problem": power_problem()}
+        return {"bundled": bundled, "updating": self.updating, "power_problem": power_problem(),
+                "board_on_usb": bool(glob.glob("/dev/serial/by-id/*PolyDye*-if00"))}
 
     def _resolve_upload(self, rel: str) -> str:
         config_dir = self.server.lookup_component("file_manager").get_directory("config")
