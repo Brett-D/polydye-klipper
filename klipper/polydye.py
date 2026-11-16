@@ -386,9 +386,11 @@ class PolyDye:
     cmd_POLYDYE_OFFSET_help = "Set the cartridge offset (X, Y) and direction trim (TRIM) in mm from the next pass on"
 
     def cmd_POLYDYE_OFFSET(self, gcmd):
-        self.offset_x = gcmd.get_float('X', self.offset_x)
-        self.offset_y = gcmd.get_float('Y', self.offset_y)
-        self.direction_trim = gcmd.get_float('TRIM', self.direction_trim)
+        # Parse everything before changing anything, so a bad value leaves the offsets alone.
+        x = gcmd.get_float('X', self.offset_x)
+        y = gcmd.get_float('Y', self.offset_y)
+        trim = gcmd.get_float('TRIM', self.direction_trim)
+        self.offset_x, self.offset_y, self.direction_trim = x, y, trim
         self._respond_offsets(gcmd)
 
     cmd_POLYDYE_NUDGE_help = ("Move where the ink lands by X, Y mm on the bed, and reverse passes by TRIM mm along the"
