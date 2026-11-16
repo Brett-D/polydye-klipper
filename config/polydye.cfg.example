@@ -11,3 +11,8 @@ offset_y: -20.2
 #pass_speed: 50
 #travel_speed: 150
 #extra_run_up: 1.0
+
+# Where POLYDYE_WIPE meets the sponge (X, G-code coordinates; must be below the X axis maximum). Uncomment to
+# change the default of 235:
+#[gcode_macro POLYDYE_WIPE]
+#variable_x: 235
