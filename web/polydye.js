@@ -192,6 +192,11 @@ function renderFirmware(printing) {
   const offline = !ws || ws.readyState !== WebSocket.OPEN;
   document.querySelectorAll('.fw-btn').forEach((b) => { b.disabled = offline || printing || state.fw.updating; });
   if (!bundled) $('fw-update-btn').disabled = true;
+  const power = state.fw.power;
+  $('fw-power').classList.toggle('hidden', !power);
+  $('fw-power').textContent = power ? `Updates are off: ${power}. A Raspberry Pi 3 short of power loses USB data `
+    + 'and can lock up during an update. Use a 5.1 V, 2.5 A supply (the official one is best), then restart the Pi.' : '';
+  if (power) document.querySelectorAll('.fw-btn').forEach((b) => { b.disabled = true; });
 }
 
 async function loadFirmwareInfo() {
@@ -199,6 +204,7 @@ async function loadFirmwareInfo() {
     const info = await rpc('server.polydye.firmware');
     state.fw.bundled = info.bundled;
     state.fw.updating = info.updating;
+    state.fw.power = info.power_problem;
   } catch (e) {
     log(`! firmware info: ${e.message}`);
   }

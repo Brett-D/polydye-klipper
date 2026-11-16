@@ -25,6 +25,23 @@ import sys
 
 from ..common import RequestType, TransportType
 
+# Raspberry Pi firmware's throttle flags (same bits as `vcgencmd get_throttled`); absent on other boards.
+THROTTLED_PATH = "/sys/devices/platform/soc/soc:firmware/get_throttled"
+
+
+def power_problem(path: str = THROTTLED_PATH):
+    """Why a USB firmware transfer isn't safe on this Pi right now, or None."""
+    try:
+        with open(path) as f:
+            bits = int(f.read().strip(), 16)
+    except (OSError, ValueError):
+        return None
+    if bits & 0x1:
+        return "the Pi is under-volted right now"
+    if bits & 0x10000:
+        return "the Pi has been under-volted since it started"
+    return None
+
 # Files the page needs, with their content types. Nothing else in web/ is served.
 ASSETS = {
     "ui": ("index.html", "text/html; charset=UTF-8"),
@@ -87,7 +104,7 @@ class PolyDye:
                 bundled = self._image_info(self.bundled_path)
             except ValueError as e:
                 logging.warning(f"polydye: bundled firmware unusable: {e}")
-        return {"bundled": bundled, "updating": self.updating}
+        return {"bundled": bundled, "updating": self.updating, "power_problem": power_problem()}
 
     def _resolve_upload(self, rel: str) -> str:
         config_dir = self.server.lookup_component("file_manager").get_directory("config")
@@ -101,6 +118,10 @@ class PolyDye:
     async def _handle_firmware_update(self, web_request):
         if self.updating:
             raise self.server.error("a firmware update is already running", 409)
+        why = power_problem()
+        if why:
+            # A Pi 3 short of power loses USB data and can lock up during the transfer or the board's restart.
+            raise self.server.error(f"{why}: fix its power supply first (a Pi 3 needs 5.1 V, 2.5 A)", 409)
         rel = web_request.get_str("file", None)
         path = self._resolve_upload(rel) if rel else self.bundled_path
         if not os.path.isfile(path):

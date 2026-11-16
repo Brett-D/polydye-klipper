@@ -40,6 +40,9 @@ FLAG_ONCE = 1
 T_HELLO, T_PUT, T_DELETE, T_CLEAR, T_LIST, T_OK, T_ERR = 0x01, 0x10, 0x11, 0x12, 0x13, 0x80, 0xFF
 T_FW_BEGIN, T_FW_DATA, T_FW_END, T_FW_ABORT, T_FW_CONFIRM, T_REBOOT = 0x20, 0x21, 0x22, 0x23, 0x24, 0x25
 FW_CHUNK = 4096
+# Firmware goes at about the FT232 flashing rate: full USB speed for a whole image upset a Raspberry Pi 3's USB
+# (lost data, then a lock-up when the board restarted). An update takes about 25 s.
+FW_RATE = 48 * 1024
 FW_PROJECT = "polydye"
 ESP32S3_CHIP_ID = 9
 
@@ -178,7 +181,7 @@ def port_present(port):
     return any(p.device == port for p in list_ports.comports())
 
 
-def update_firmware(port, blob, force=False, log=print, confirm=True):
+def update_firmware(port, blob, force=False, log=print, confirm=True, rate=FW_RATE):
     """Writes `blob` to the board, reboots into it and confirms it. Returns the new version."""
     info = image_info(blob)
     board = DataPort(port)
@@ -200,8 +203,12 @@ def update_firmware(port, blob, force=False, log=print, confirm=True):
         board.ser.timeout = 5.  # more than the board's 3 s frame timeout, so a resend finds it ready
         try:
             last = -1
+            start = time.time()
             for off in range(0, len(blob), FW_CHUNK):
                 board.request(T_FW_DATA, struct.pack("<I", off) + blob[off:off + FW_CHUNK], retries=3, log=log)
+                ahead = (off + FW_CHUNK) / float(rate) - (time.time() - start)
+                if ahead > 0:
+                    time.sleep(ahead)
                 pct = (off + FW_CHUNK) * 100 // len(blob)
                 if pct // 5 != last // 5:
                     say(log, "progress: %d%%" % min(pct, 100))
@@ -297,6 +304,7 @@ def main():
     fw.add_argument("file")
     fw.add_argument("--force", action="store_true", help="update even if the board already runs this version")
     fw.add_argument("--no-confirm", action="store_true", help=argparse.SUPPRESS)  # tests the automatic rollback
+    fw.add_argument("--rate", type=float, default=FW_RATE / 1024., help="transfer rate in kB/s (default %(default)g)")
     args = ap.parse_args()
 
     if args.cmd == "firmware-info":
@@ -312,7 +320,7 @@ def main():
             blob = f.read()
         try:
             update_firmware(args.port or default_port(), blob, args.force, log=lambda s: print(s, flush=True),
-                            confirm=not args.no_confirm)
+                            confirm=not args.no_confirm, rate=args.rate * 1024.)
         except (BoardError, ValueError, OSError) as e:
             print("error: %s" % e, file=sys.stderr, flush=True)
             return 1
