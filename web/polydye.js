@@ -3,7 +3,10 @@
 'use strict';
 
 const $ = (id) => document.getElementById(id);
-const state = { klippy: 'disconnected', message: '', board: false, printer: {} };
+const state = {
+  online: false, klippy: 'disconnected', message: '', board: false, printer: {},
+  fw: { bundled: null, updating: false, power: null, boardOnUsb: false },
+};
 let ws = null;
 let nextId = 1;
 const pending = new Map();
@@ -39,7 +42,8 @@ function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/websocket`);
   ws.onopen = async () => {
-    setConn('connected', 'ok');
+    state.online = true;
+    render();
     try {
       await rpc('server.connection.identify', {
         client_name: 'PolyDye', version: '0.1', type: 'web', url: location.href,
@@ -49,7 +53,7 @@ function connect() {
     loadSettings();
   };
   ws.onclose = () => {
-    setConn('disconnected', 'bad');
+    state.online = false;
     for (const p of pending.values()) p.reject(new Error('connection closed'));
     pending.clear();
     state.klippy = 'unreachable';
@@ -76,6 +80,9 @@ function connect() {
         if (/polydye|^!!/i.test(line)) log(line);
         break;
       }
+      case 'notify_polydye_firmware':
+        firmwareProgress(msg.params[0]);
+        break;
       case 'notify_klippy_ready':
       case 'notify_klippy_shutdown':
       case 'notify_klippy_disconnected':
@@ -87,11 +94,28 @@ function connect() {
   };
 }
 
-function setConn(text, cls) {
+// The header pill sums up the state that matters, most important first.
+function statusPill() {
+  const pd = state.printer.polydye || {};
+  if (!state.online) return ['Moonraker offline', 'bad'];
+  if (state.fw.updating) return ['updating board firmware', 'warn'];
+  if (state.klippy === 'startup') return ['Klipper starting', 'warn'];
+  if (state.klippy === 'shutdown') return ['Klipper shut down', 'bad'];
+  if (state.klippy !== 'ready') return [`Klipper ${state.klippy}`, 'bad'];
+  if (!state.board) return [state.fw.boardOnUsb ? 'PolyDye not enabled' : 'PolyDye board not plugged in', 'warn'];
+  if (pd.passes === undefined) return ['PolyDye connecting', 'warn'];
+  if (pd.live) return ['LIVE ink', 'bad'];
+  if (pd.running) return ['printing a pass (dry run)', 'ok'];
+  if (pd.boost) return ['PolyDye on, dry run', 'ok'];
+  return ['PolyDye ready', 'ok'];
+}
+
+function setConn() {
+  const [label, cls] = statusPill();
   const el = $('conn');
-  el.textContent = text;
+  el.textContent = label;
   el.className = `pill ${cls}`;
-  $('estop').disabled = cls !== 'ok';
+  $('estop').disabled = !state.online;
 }
 
 function merge(status) {
@@ -107,7 +131,7 @@ async function initKlippy() {
     state.message = info.state_message || '';
     if (info.state !== 'ready') {
       state.board = false;
-      render();
+      state.printer = {};  // stale while Klipper isn't ready (e.g. "printing" from before a shutdown)
       if (info.state === 'startup') setTimeout(initKlippy, 1000);
       return;
     }
@@ -128,9 +152,18 @@ async function initKlippy() {
   } catch (e) {
     state.klippy = 'disconnected';
     state.message = e.message;
+  } finally {
+    // The firmware API works without Klipper, so this also runs when Klipper isn't ready.
+    render();
+    loadFirmwareInfo();
   }
-  render();
 }
+
+// USB presence (for the pill and Enable PolyDye) changes without any Klipper event, so poll it while the board
+// isn't in use.
+setInterval(() => {
+  if (state.online && !state.board && !state.fw.updating) loadFirmwareInfo();
+}, 5000);
 
 function text(id, value, cls) {
   const el = $(id);
@@ -142,18 +175,22 @@ function render() {
   const banner = $('banner');
   const bannerText = $('banner-text');
   const p = state.printer;
-  const printing = ['printing', 'paused'].includes((p.print_stats || {}).state);
+  const printing = state.klippy === 'ready' && ['printing', 'paused'].includes((p.print_stats || {}).state);
   $('fw-restart-btn').classList.toggle('hidden', !['shutdown', 'error'].includes(state.klippy));
   if (state.klippy !== 'ready') {
     banner.className = 'banner bad';
     bannerText.textContent = `Klipper is ${state.klippy}. ${state.message}`;
   } else if (!state.board) {
     banner.className = 'banner';
-    bannerText.textContent = 'The PolyDye board is not active. Plug its USB (J7) into the Pi, then restart the Klipper '
-      + 'service (Mainsail power menu, Services, klipper). Without the board the printer works as normal.';
+    bannerText.textContent = state.fw.boardOnUsb
+      ? 'The PolyDye board is plugged in, but Klipper started without it. Enable PolyDye restarts the Klipper '
+        + 'service so it picks the board up (the printer must be idle).'
+      : 'The PolyDye board is not active. Plug its USB (J7) into the Pi, then restart the Klipper '
+        + 'service (Mainsail power menu, Services, klipper). Without the board the printer works as normal.';
   } else {
     banner.className = 'banner hidden';
   }
+  $('enable-btn').classList.toggle('hidden', !(state.klippy === 'ready' && !state.board && state.fw.boardOnUsb));
   const pd = p.polydye || {};
   const known = state.board && pd.passes !== undefined;
   text('s-fw', ((p['mcu polydye'] || {}).mcu_version) || '–');
@@ -166,10 +203,101 @@ function render() {
   text('s-late', known ? `${pd.late_max_us.toFixed(1)} µs` : '–');
   text('s-store', known ? pd.store_count : '–');
   text('s-free', known ? `${Math.round(pd.store_free / 1024)} kB` : '–');
+  // Idle-only controls also wait for a firmware update: the dry run uses the same data port. Off stays available.
   document.querySelectorAll('.needs-board').forEach((b) => {
-    b.disabled = !state.board || (b.classList.contains('needs-idle') && printing);
+    b.disabled = !state.board || (b.classList.contains('needs-idle') && (printing || state.fw.updating));
   });
+  renderFirmware(printing);
+  setConn();
 }
+
+// ---- board firmware updates (moonraker/polydye.py runs them) --------------------------------------------------
+
+function boardVersion() {
+  return (state.printer['mcu polydye'] || {}).mcu_version || '';
+}
+
+function renderFirmware(printing) {
+  const bundled = state.fw.bundled;
+  const board = boardVersion();
+  text('fw-board', board || (state.fw.updating ? 'updating…' : '–'));
+  text('fw-bundled', bundled ? bundled.version : 'none');
+  const same = bundled && board && bundled.version === board;
+  $('fw-update-btn').textContent = same ? 'Reinstall bundled firmware' : 'Update to bundled firmware';
+  const offline = !ws || ws.readyState !== WebSocket.OPEN;
+  document.querySelectorAll('.fw-btn').forEach((b) => { b.disabled = offline || printing || state.fw.updating; });
+  if (!bundled) $('fw-update-btn').disabled = true;
+  const power = state.fw.power;
+  $('fw-power').classList.toggle('hidden', !power);
+  $('fw-power').textContent = power ? `Updates are off: ${power}. A Raspberry Pi 3 short of power loses USB data `
+    + 'and can lock up during an update. Use a 5.1 V, 2.5 A supply (the official one is best), then restart the Pi.' : '';
+  if (power) document.querySelectorAll('.fw-btn').forEach((b) => { b.disabled = true; });
+}
+
+async function loadFirmwareInfo() {
+  try {
+    const info = await rpc('server.polydye.firmware');
+    state.fw.bundled = info.bundled;
+    state.fw.updating = info.updating;
+    state.fw.power = info.power_problem;
+    state.fw.boardOnUsb = info.board_on_usb;
+    state.fw.klipperService = info.klipper_service || 'klipper';
+  } catch (e) {
+    log(`! firmware info: ${e.message}`);
+  }
+  render();
+}
+
+function firmwareProgress(p) {
+  $('fw-progress').classList.remove('hidden');
+  if (p.progress !== null && p.progress !== undefined) $('fw-bar').value = p.progress;
+  const msg = $('fw-msg');
+  msg.textContent = p.message;
+  msg.className = p.state === 'error' ? 'bad' : (p.state === 'done' ? 'good' : '');
+  state.fw.updating = p.state === 'running';
+  if (p.state !== 'running' || p.progress === null || p.progress === undefined) log(`firmware: ${p.message}`);
+  render();
+}
+
+async function startFirmwareUpdate(params, label) {
+  const ok = window.confirm(`${label}?\n\nThe printer must be idle. Klipper loses the PolyDye board for about half `
+    + 'a minute while it restarts, then reconnects.');
+  if (!ok) return;
+  try {
+    const r = await rpc('server.polydye.firmware.update', params);
+    state.fw.updating = true;
+    log(`> firmware update to ${r.version}`);
+    firmwareProgress({ state: 'running', message: `updating to ${r.version}`, progress: 0 });
+  } catch (e) {
+    firmwareProgress({ state: 'error', message: e.message, progress: null });
+  }
+}
+
+$('fw-update-btn').addEventListener('click', () => {
+  const bundled = state.fw.bundled;
+  const same = bundled && bundled.version === boardVersion();
+  startFirmwareUpdate(same ? { force: true } : {}, `${same ? 'Reinstall' : 'Install'} firmware ${bundled.version}`);
+});
+
+$('fw-file-btn').addEventListener('click', () => $('fw-file').click());
+
+$('fw-file').addEventListener('change', async (ev) => {
+  const file = ev.target.files[0];
+  ev.target.value = '';
+  if (!file) return;
+  try {
+    const body = new FormData();
+    body.append('root', 'config');
+    body.append('path', 'polydye-fw');
+    body.append('file', file, file.name);
+    const r = await fetch('/server/files/upload', { method: 'POST', body });
+    if (!r.ok) throw new Error(`upload: HTTP ${r.status}`);
+  } catch (e) {
+    firmwareProgress({ state: 'error', message: e.message, progress: null });
+    return;
+  }
+  startFirmwareUpdate({ file: `polydye-fw/${file.name}`, force: true }, `Install ${file.name}`);
+});
 
 // ---- settings: edit the [polydye] section of polydye.cfg ------------------------------------------------------
 
@@ -284,6 +412,18 @@ $('fw-restart-btn').addEventListener('click', async () => {
   log('> FIRMWARE_RESTART');
   try {
     await rpc('printer.firmware_restart');
+  } catch (e) {
+    log(`! ${e.message}`);
+  }
+});
+
+// The plug-in toggle (scripts/polydye-toggle.sh) only runs when the Klipper service starts.
+$('enable-btn').addEventListener('click', async () => {
+  if (['printing', 'paused'].includes((state.printer.print_stats || {}).state)) return;
+  $('enable-btn').classList.add('hidden');
+  log('> restart the Klipper service to enable PolyDye');
+  try {
+    await rpc('machine.services.restart', { service: state.fw.klipperService || 'klipper' });
   } catch (e) {
     log(`! ${e.message}`);
   }

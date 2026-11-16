@@ -21,6 +21,7 @@
     <section id="banner" class="banner hidden">
       <span id="banner-text"></span>
       <button id="fw-restart-btn" class="hidden">Firmware restart</button>
+      <button id="enable-btn" class="hidden">Enable PolyDye</button>
     </section>
 
     <section class="card">
@@ -71,6 +72,27 @@
         <p class="hint">Offsets are the cartridge nozzle-row centre minus the hotend nozzle, in bed coordinates.
           Saving edits only the [polydye] section of polydye.cfg; Klipper applies it after a restart.</p>
       </form>
+    </section>
+
+    <section class="card">
+      <h2>Board firmware</h2>
+      <div class="grid">
+        <div><span class="k">On the board</span><span class="v" id="fw-board">&ndash;</span></div>
+        <div><span class="k">Bundled with this add-on</span><span class="v" id="fw-bundled">&ndash;</span></div>
+      </div>
+      <p class="hint">Updates go over the board's USB cable. Klipper loses the board for about half a minute while it
+        restarts, then reconnects by itself. If the new firmware doesn't start properly, the board goes back to the
+        previous one on its own. Not possible during a print.</p>
+      <p id="fw-power" class="banner hidden"></p>
+      <div class="buttons">
+        <button id="fw-update-btn" class="primary fw-btn">Update to bundled firmware</button>
+        <button id="fw-file-btn" class="fw-btn">Update from file&hellip;</button>
+        <input type="file" id="fw-file" accept=".bin" class="hidden">
+      </div>
+      <div id="fw-progress" class="hidden">
+        <progress id="fw-bar" max="100" value="0"></progress>
+        <span id="fw-msg"></span>
+      </div>
     </section>
 
     <section class="card">

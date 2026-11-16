@@ -100,8 +100,8 @@ fi
 MOONRAKER_CONF="$CONFIG_DIR/moonraker.conf"
 if [ -f "$MOONRAKER_CONF" ]; then
     if [ -d "$COMPONENTS" ] && ! grep -q '^\[polydye\]' "$MOONRAKER_CONF"; then
-        printf '\n[polydye]\n# Serves the PolyDye page (Mainsail sidebar: PolyDye). Installed by polydye-klipper.\n' \
-            >> "$MOONRAKER_CONF"
+        printf '\n[polydye]\n# Serves the PolyDye page (Mainsail sidebar: PolyDye). Installed by polydye-klipper.\nklipper_service: %s\n' \
+            "$KLIPPER_SERVICE" >> "$MOONRAKER_CONF"
         MOONRAKER_CHANGED=1
         say "added [polydye] to moonraker.conf"
     fi

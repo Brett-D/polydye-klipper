@@ -11,6 +11,12 @@ The board appears as two serial ports; the data port is the second one
   polydye_upload.py put --layer 0 --pass 0 --columns 600 --pattern all [--cart color] [--once]
   polydye_upload.py job FILE.pdj
   polydye_upload.py make-test-job FILE.pdj --layers 1 --passes 2 --columns 600 --pattern alternate
+  polydye_upload.py firmware-info FILE.bin
+  polydye_upload.py firmware FILE.bin [--force]
+
+`firmware` updates the board over USB: it writes the image to the board's spare firmware slot, reboots the board
+into it, waits for it to come back and confirms it. If the new firmware doesn't come back working, the board returns
+to the previous one by itself. Klipper loses the board while it reboots; run FIRMWARE_RESTART afterwards.
 
 Job files (.pdj, version 0): b"PDJ0", u32 pass count, then per pass a u32 length and a PUT payload
 (layer u16, pass u16, cart u8, flags u8, columns u16, columns * 42 bytes of nozzle data). Integers are
@@ -20,7 +26,10 @@ This file is part of polydye-klipper (GPLv3).
 """
 import argparse
 import glob
+import hashlib
 import json
+import math
+import os
 import struct
 import sys
 import time
@@ -30,6 +39,13 @@ NOZDATA_SIZE = 42
 CARTS = {"color": 0, "black": 1}
 FLAG_ONCE = 1
 T_HELLO, T_PUT, T_DELETE, T_CLEAR, T_LIST, T_OK, T_ERR = 0x01, 0x10, 0x11, 0x12, 0x13, 0x80, 0xFF
+T_FW_BEGIN, T_FW_DATA, T_FW_END, T_FW_ABORT, T_FW_CONFIRM, T_REBOOT = 0x20, 0x21, 0x22, 0x23, 0x24, 0x25
+FW_CHUNK = 4096
+# Firmware goes at about the FT232 flashing rate: full USB speed for a whole image upset a Raspberry Pi 3's USB
+# (lost data, then a lock-up when the board restarted). An update takes about 25 s.
+FW_RATE = 48 * 1024
+FW_PROJECT = "polydye"
+ESP32S3_CHIP_ID = 9
 
 
 class BoardError(Exception):
@@ -43,15 +59,29 @@ class DataPort:
         self.seq = 0
 
     def close(self):
-        self.ser.close()
+        try:
+            self.ser.close()
+        except OSError:
+            pass  # the board may already have dropped off USB (after REBOOT)
 
-    def request(self, ftype, payload=b""):
+    def request(self, ftype, payload=b"", retries=0, log=None):
+        """Sends one request and returns the reply's JSON. On a timeout, resends it up to `retries` times; only
+        use retries for requests the board treats as idempotent (the firmware update ones)."""
         self.seq = (self.seq + 1) & 0xff
         head = struct.pack("<BBI", ftype, self.seq, len(payload))
         crc = zlib.crc32(payload, zlib.crc32(head))
-        self.ser.write(b"PD" + head + payload + struct.pack("<I", crc))
-        self.ser.flush()
-        return self._reply()
+        frame = b"PD" + head + payload + struct.pack("<I", crc)
+        for attempt in range(retries + 1):
+            self.ser.write(frame)
+            self.ser.flush()
+            try:
+                return self._reply()
+            except BoardError as e:
+                if "timed out" not in str(e) or attempt == retries:
+                    raise
+                # The board drops a frame it doesn't receive in full within 3 s; by now it has, so resend.
+                say(log, "no reply from the board; resending (USB data lost?)")
+                self.ser.reset_input_buffer()
 
     def _read(self, n):
         data = self.ser.read(n)
@@ -60,20 +90,26 @@ class DataPort:
         return data
 
     def _reply(self):
-        prev = b""
+        # A reply for an earlier request (e.g. the late original after a resend) is stale: skip it, within the
+        # usual timeout.
+        deadline = time.time() + (self.ser.timeout or 10.)
         while True:
-            c = self._read(1)
-            if prev == b"P" and c == b"D":
+            if time.time() > deadline:
+                raise BoardError("timed out waiting for the board")
+            prev = b""
+            while True:
+                c = self._read(1)
+                if prev == b"P" and c == b"D":
+                    break
+                prev = c
+            head = self._read(6)
+            ftype, seq, length = struct.unpack("<BBI", head)
+            payload = self._read(length)
+            (crc,) = struct.unpack("<I", self._read(4))
+            if zlib.crc32(payload, zlib.crc32(head)) != crc:
+                raise BoardError("reply CRC mismatch")
+            if seq == self.seq:
                 break
-            prev = c
-        head = self._read(6)
-        ftype, seq, length = struct.unpack("<BBI", head)
-        payload = self._read(length)
-        (crc,) = struct.unpack("<I", self._read(4))
-        if zlib.crc32(payload, zlib.crc32(head)) != crc:
-            raise BoardError("reply CRC mismatch")
-        if seq != self.seq:
-            raise BoardError("reply for request %d, expected %d" % (seq, self.seq))
         body = json.loads(payload.decode() or "{}")
         if ftype == T_ERR:
             raise BoardError(body.get("error", "error"))
@@ -124,6 +160,124 @@ def write_job(path, records):
             f.write(struct.pack("<I", len(r)) + r)
 
 
+def image_info(blob):
+    """Version and checks of an ESP-IDF app image (the firmware's polydye.bin). Raises ValueError if unusable."""
+    # Image header (24 bytes), first segment header (8), then esp_app_desc_t: magic, secure_version, 2 reserved
+    # words, version[32], project_name[32], ...
+    if len(blob) < 112 or blob[0] != 0xE9:
+        raise ValueError("not an ESP32 firmware image")
+    (chip_id,) = struct.unpack_from("<H", blob, 12)
+    if chip_id != ESP32S3_CHIP_ID:
+        raise ValueError("firmware image is for another chip (id %d, the board is an ESP32-S3)" % chip_id)
+    (magic,) = struct.unpack_from("<I", blob, 32)
+    if magic != 0xABCD5432:
+        raise ValueError("firmware image has no app description")
+    version = blob[48:80].split(b"\0", 1)[0].decode(errors="replace")
+    project = blob[80:112].split(b"\0", 1)[0].decode(errors="replace")
+    if project != FW_PROJECT:
+        raise ValueError("not a PolyDye firmware image (project %r)" % project)
+    return {"version": version, "size": len(blob), "sha256": hashlib.sha256(blob).hexdigest()}
+
+
+def say(log, text):
+    if log:
+        log(text)
+
+
+def port_present(port):
+    if os.path.exists(port):
+        return True
+    from serial.tools import list_ports  # Windows COM ports aren't files
+    return any(p.device == port for p in list_ports.comports())
+
+
+def update_firmware(port, blob, force=False, log=print, confirm=True, rate=FW_RATE):
+    """Writes `blob` to the board, reboots into it and confirms it. Returns the new version."""
+    if not (isinstance(rate, (int, float)) and math.isfinite(rate) and rate > 0):
+        raise ValueError("the transfer rate must be a positive number of bytes per second")
+    info = image_info(blob)
+    board = DataPort(port)
+    try:
+        hello = board.hello()
+        if hello.get("protocol", 1) < 2:
+            raise BoardError("the board's firmware (%s) can't update over USB yet; flash it once with the FT232"
+                             % hello.get("firmware"))
+        if hello.get("app_state") == "pending":
+            board.request(T_FW_CONFIRM, retries=2, log=log)  # left unconfirmed by an interrupted update
+        if hello["firmware"] == info["version"] and not force:
+            say(log, "the board already runs %s" % info["version"])
+            return info["version"]
+        say(log, "updating the board from %s to %s (%d kB)" % (hello["firmware"], info["version"],
+                                                               len(blob) // 1024))
+        board.ser.timeout = 60.  # erasing the slot takes a few seconds
+        target = board.request(T_FW_BEGIN, struct.pack("<I", len(blob)) + bytes.fromhex(info["sha256"]),
+                               retries=2, log=log)
+        board.ser.timeout = 5.  # more than the board's 3 s frame timeout, so a resend finds it ready
+        try:
+            last = -1
+            due = time.time()
+            for off in range(0, len(blob), FW_CHUNK):
+                if due > time.time():
+                    time.sleep(due - time.time())
+                # Blocks start at least one slot apart; time lost to a resend is not made up with a burst.
+                due = max(due, time.time()) + FW_CHUNK / float(rate)
+                board.request(T_FW_DATA, struct.pack("<I", off) + blob[off:off + FW_CHUNK], retries=3, log=log)
+                pct = (off + FW_CHUNK) * 100 // len(blob)
+                if pct // 5 != last // 5:
+                    say(log, "progress: %d%%" % min(pct, 100))
+                    last = pct
+            done = board.request(T_FW_END, retries=2, log=log)
+        except BaseException:
+            try:
+                board.request(T_FW_ABORT)
+            except Exception:
+                pass
+            raise
+        say(log, "written to %s and checked; rebooting the board" % target["partition"])
+        try:
+            board.request(T_REBOOT)
+        except (BoardError, OSError) as e:  # pyserial's SerialException is an OSError
+            if isinstance(e, BoardError) and "timed out" not in str(e):
+                raise
+            # The board can restart (and drop off USB) before its reply is read; see whether it comes back.
+    finally:
+        board.close()
+
+    # The board comes back as the same USB device. If the new firmware doesn't work, it returns to the old one
+    # within about two minutes.
+    deadline = time.time() + 180.
+    while port_present(port) and time.time() < deadline - 170.:
+        time.sleep(0.2)
+    hello = None
+    while time.time() < deadline:
+        time.sleep(1.)
+        if not port_present(port):
+            continue
+        try:
+            board = DataPort(port, timeout=3.)
+        except Exception:
+            continue
+        try:
+            hello = board.hello()
+            if hello["firmware"] != done["version"] or hello.get("partition") != target["partition"]:
+                break
+            if not confirm:
+                say(log, "the board runs %s, NOT confirmed: it goes back to the previous firmware within %d s"
+                    % (done["version"], 120))
+                return done["version"]
+            board.request(T_FW_CONFIRM, retries=2, log=log)
+            say(log, "the board runs %s; confirmed" % done["version"])
+            return done["version"]
+        except Exception:
+            continue
+        finally:
+            board.close()
+    if hello is None:
+        raise BoardError("the board didn't come back after the update; check its USB cable and power")
+    raise BoardError("the new firmware didn't start properly; the board went back to %s (%s)"
+                     % (hello["firmware"], hello.get("partition")))
+
+
 def default_port():
     ports = sorted(glob.glob("/dev/serial/by-id/*PolyDye*-if02"))
     if not ports:
@@ -157,7 +311,33 @@ def main():
     m.add_argument("--columns", type=int, default=600)
     m.add_argument("--pattern", default="alternate")
     m.add_argument("--cart", choices=CARTS, default="color")
+    fi = sub.add_parser("firmware-info", help="show a firmware image's version (no board needed)")
+    fi.add_argument("file")
+    fw = sub.add_parser("firmware", help="update the board's firmware over USB")
+    fw.add_argument("file")
+    fw.add_argument("--force", action="store_true", help="update even if the board already runs this version")
+    fw.add_argument("--no-confirm", action="store_true", help=argparse.SUPPRESS)  # tests the automatic rollback
+    fw.add_argument("--rate", type=float, default=FW_RATE / 1024., help="transfer rate in kB/s (default %(default)g)")
     args = ap.parse_args()
+
+    if args.cmd == "firmware-info":
+        try:
+            with open(args.file, "rb") as f:
+                print(json.dumps(image_info(f.read()), indent=2))
+        except (ValueError, OSError) as e:
+            print("error: %s" % e, file=sys.stderr)
+            return 1
+        return 0
+    if args.cmd == "firmware":
+        try:
+            with open(args.file, "rb") as f:
+                blob = f.read()
+            update_firmware(args.port or default_port(), blob, args.force, log=lambda s: print(s, flush=True),
+                            confirm=not args.no_confirm, rate=args.rate * 1024.)
+        except (BoardError, ValueError, OSError) as e:
+            print("error: %s" % e, file=sys.stderr, flush=True)
+            return 1
+        return 0
 
     if args.cmd == "make-test-job":
         data = pattern_data(args.pattern, args.columns)
