@@ -13,6 +13,6 @@ offset_y: -20.2
 #extra_run_up: 1.0
 
 # Where POLYDYE_WIPE meets the sponge (X, G-code coordinates; must be below the X axis maximum). Uncomment to
-# change the default of 235:
+# change the default of 245:
 #[gcode_macro POLYDYE_WIPE]
-#variable_x: 235
+#variable_x: 245
