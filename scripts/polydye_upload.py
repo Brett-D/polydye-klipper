@@ -57,13 +57,24 @@ class DataPort:
     def close(self):
         self.ser.close()
 
-    def request(self, ftype, payload=b""):
+    def request(self, ftype, payload=b"", retries=0, log=None):
+        """Sends one request and returns the reply's JSON. On a timeout, resends it up to `retries` times; only
+        use retries for requests the board treats as idempotent (the firmware update ones)."""
         self.seq = (self.seq + 1) & 0xff
         head = struct.pack("<BBI", ftype, self.seq, len(payload))
         crc = zlib.crc32(payload, zlib.crc32(head))
-        self.ser.write(b"PD" + head + payload + struct.pack("<I", crc))
-        self.ser.flush()
-        return self._reply()
+        frame = b"PD" + head + payload + struct.pack("<I", crc)
+        for attempt in range(retries + 1):
+            self.ser.write(frame)
+            self.ser.flush()
+            try:
+                return self._reply()
+            except BoardError as e:
+                if "timed out" not in str(e) or attempt == retries:
+                    raise
+                # The board drops a frame it doesn't receive in full within 3 s; by now it has, so resend.
+                say(log, "no reply from the board; resending (USB data lost?)")
+                self.ser.reset_input_buffer()
 
     def _read(self, n):
         data = self.ser.read(n)
@@ -160,6 +171,13 @@ def say(log, text):
         log(text)
 
 
+def port_present(port):
+    if os.path.exists(port):
+        return True
+    from serial.tools import list_ports  # Windows COM ports aren't files
+    return any(p.device == port for p in list_ports.comports())
+
+
 def update_firmware(port, blob, force=False, log=print, confirm=True):
     """Writes `blob` to the board, reboots into it and confirms it. Returns the new version."""
     info = image_info(blob)
@@ -170,24 +188,25 @@ def update_firmware(port, blob, force=False, log=print, confirm=True):
             raise BoardError("the board's firmware (%s) can't update over USB yet; flash it once with the FT232"
                              % hello.get("firmware"))
         if hello.get("app_state") == "pending":
-            board.request(T_FW_CONFIRM)  # left unconfirmed by an interrupted update; it's running fine
+            board.request(T_FW_CONFIRM, retries=2, log=log)  # left unconfirmed by an interrupted update
         if hello["firmware"] == info["version"] and not force:
             say(log, "the board already runs %s" % info["version"])
             return info["version"]
         say(log, "updating the board from %s to %s (%d kB)" % (hello["firmware"], info["version"],
                                                                len(blob) // 1024))
         board.ser.timeout = 60.  # erasing the slot takes a few seconds
-        target = board.request(T_FW_BEGIN, struct.pack("<I", len(blob)) + bytes.fromhex(info["sha256"]))
-        board.ser.timeout = 10.
+        target = board.request(T_FW_BEGIN, struct.pack("<I", len(blob)) + bytes.fromhex(info["sha256"]),
+                               retries=2, log=log)
+        board.ser.timeout = 5.  # more than the board's 3 s frame timeout, so a resend finds it ready
         try:
             last = -1
             for off in range(0, len(blob), FW_CHUNK):
-                board.request(T_FW_DATA, struct.pack("<I", off) + blob[off:off + FW_CHUNK])
+                board.request(T_FW_DATA, struct.pack("<I", off) + blob[off:off + FW_CHUNK], retries=3, log=log)
                 pct = (off + FW_CHUNK) * 100 // len(blob)
                 if pct // 5 != last // 5:
                     say(log, "progress: %d%%" % min(pct, 100))
                     last = pct
-            done = board.request(T_FW_END)
+            done = board.request(T_FW_END, retries=2, log=log)
         except BaseException:
             try:
                 board.request(T_FW_ABORT)
@@ -195,19 +214,24 @@ def update_firmware(port, blob, force=False, log=print, confirm=True):
                 pass
             raise
         say(log, "written to %s and checked; rebooting the board" % target["partition"])
-        board.request(T_REBOOT)
+        try:
+            board.request(T_REBOOT)
+        except BoardError as e:
+            if "timed out" not in str(e):
+                raise
+            # The reply can be lost if the board restarts first; carry on and see whether it comes back.
     finally:
         board.close()
 
     # The board comes back as the same USB device. If the new firmware doesn't work, it returns to the old one
     # within about two minutes.
     deadline = time.time() + 180.
-    while os.path.exists(port) and time.time() < deadline - 170.:
+    while port_present(port) and time.time() < deadline - 170.:
         time.sleep(0.2)
     hello = None
     while time.time() < deadline:
         time.sleep(1.)
-        if not os.path.exists(port):
+        if not port_present(port):
             continue
         try:
             board = DataPort(port, timeout=3.)
@@ -221,7 +245,7 @@ def update_firmware(port, blob, force=False, log=print, confirm=True):
                 say(log, "the board runs %s, NOT confirmed: it goes back to the previous firmware within %d s"
                     % (done["version"], 120))
                 return done["version"]
-            board.request(T_FW_CONFIRM)
+            board.request(T_FW_CONFIRM, retries=2, log=log)
             say(log, "the board runs %s; confirmed" % done["version"])
             return done["version"]
         except Exception:
