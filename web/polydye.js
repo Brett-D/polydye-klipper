@@ -335,10 +335,14 @@ function cfgValue(textIn, key) {
   return null;
 }
 
-async function fetchCfg() {
+async function readCfg() {
   const r = await fetch('/server/files/config/polydye.cfg', { cache: 'no-store' });
   if (!r.ok) throw new Error(`polydye.cfg: HTTP ${r.status}`);
-  cfgText = await r.text();
+  return r.text();
+}
+
+async function fetchCfg() {
+  cfgText = await readCfg();
   return cfgText;
 }
 
@@ -403,6 +407,14 @@ async function uploadCfg(updated) {
   cfgText = updated;
 }
 
+// Save and Store each read, merge and upload the whole file; run them one at a time so neither overwrites the other.
+let cfgChain = Promise.resolve();
+function queueCfg(op) {
+  const run = cfgChain.then(op);
+  cfgChain = run.catch(() => {});
+  return run;
+}
+
 $('settings').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const form = ev.target;
@@ -411,7 +423,8 @@ $('settings').addEventListener('submit', async (ev) => {
   values.cartridge_template = values.cartridge_template || null;
   values.pulse_words = values.pulse_words || null;
   try {
-    await uploadCfg(applySettings(cfgText, values));
+    // Re-read first: the file may have been edited elsewhere since the page loaded.
+    await queueCfg(async () => uploadCfg(applySettings(await fetchCfg(), values)));
     log('saved polydye.cfg');
     $('restart-btn').classList.remove('hidden');
   } catch (e) {
@@ -433,16 +446,16 @@ $('restart-btn').addEventListener('click', async () => {
 
 let nudgeStep = 0.1;
 const fmtMm = (v) => String(Number(v.toFixed(4)));
-// Nudge and offset commands run one after another, and Store waits for them, so it never stores values from
-// before a click. gcode() logs failures and never rejects, so the chain keeps going.
+// Nudges and Back to stored values run one after another in click order, and Store waits for them, so it never
+// stores values from before a click.
 let nudgeChain = Promise.resolve();
-function queueNudge(script) {
-  nudgeChain = nudgeChain.then(() => gcode(script));
+function queueNudge(op) {
+  nudgeChain = nudgeChain.then(op).catch((e) => log(`! ${e.message}`));
   return nudgeChain;
 }
 
-function storedNudged(key) {
-  const raw = cfgValue(cfgText, key);
+function storedNudged(key, textIn = cfgText) {
+  const raw = cfgValue(textIn, key);
   const v = parseFloat(raw === null && key === 'direction_trim' ? '0' : raw);
   return Number.isFinite(v) ? v : null;
 }
@@ -474,48 +487,56 @@ document.querySelectorAll('#nudge-steps button').forEach((b) => {
 
 document.querySelectorAll('button[data-nudge]').forEach((b) => {
   b.addEventListener('click', () => {
-    queueNudge(`POLYDYE_NUDGE ${b.dataset.nudge}=${fmtMm(parseFloat(b.dataset.sign) * nudgeStep)}`);
+    const script = `POLYDYE_NUDGE ${b.dataset.nudge}=${fmtMm(parseFloat(b.dataset.sign) * nudgeStep)}`;
+    queueNudge(() => gcode(script));
   });
 });
 
 $('nudge-store').addEventListener('click', async () => {
   try {
-    // Ask Klipper after the last nudge has run: the status subscription may not have caught up yet.
-    await nudgeChain;
-    const r = await rpc('printer.objects.query', { objects: { polydye: NUDGED } });
-    const pd = (r && r.status && r.status.polydye) || {};
-    if (NUDGED.some((k) => typeof pd[k] !== 'number')) {
-      log('! store failed: Klipper did not report the PolyDye offsets');
-      return;
-    }
-    // Re-read first: the file may have been edited elsewhere since the page loaded.
-    const current = await fetchCfg();
-    const values = {};
-    for (const key of NUDGED) values[key] = fmtMm(pd[key]);
-    await uploadCfg(applySettings(current, values));
-    log(`stored offset_x ${values.offset_x}, offset_y ${values.offset_y}, direction_trim ${values.direction_trim}`
-      + ' in polydye.cfg');
-    loadSettings();
+    await queueCfg(async () => {
+      // Ask Klipper after the last nudge has run: the status subscription may not have caught up yet.
+      await nudgeChain;
+      const r = await rpc('printer.objects.query', { objects: { polydye: NUDGED } });
+      const pd = (r && r.status && r.status.polydye) || {};
+      if (NUDGED.some((k) => typeof pd[k] !== 'number')) throw new Error('Klipper did not report the offsets');
+      // Re-read first: the file may have been edited elsewhere since the page loaded.
+      const current = await fetchCfg();
+      const values = {};
+      for (const key of NUDGED) values[key] = fmtMm(pd[key]);
+      await uploadCfg(applySettings(current, values));
+      log(`stored offset_x ${values.offset_x}, offset_y ${values.offset_y}, direction_trim ${values.direction_trim}`
+        + ' in polydye.cfg');
+      // Only the stored fields: other Settings may hold edits that haven't been saved yet.
+      const form = $('settings');
+      for (const key of NUDGED) form.elements[key].value = values[key];
+      render();
+    });
   } catch (e) {
     log(`! store failed: ${e.message}`);
   }
 });
 
-$('nudge-undo').addEventListener('click', async () => {
-  try {
-    await fetchCfg();
-  } catch (e) {
-    log(`! could not read polydye.cfg: ${e.message}`);
-    return;
-  }
-  const x = storedNudged('offset_x');
-  const y = storedNudged('offset_y');
-  const trim = storedNudged('direction_trim');
-  if (x === null || y === null || trim === null) {
-    log('! polydye.cfg has no valid offset_x, offset_y or direction_trim');
-    return;
-  }
-  queueNudge(`POLYDYE_OFFSET X=${fmtMm(x)} Y=${fmtMm(y)} TRIM=${fmtMm(trim)}`);
+$('nudge-undo').addEventListener('click', () => {
+  // Take a place in the queue now, so nudges clicked while polydye.cfg loads run after the restore. Read without
+  // touching the page's copy of the file, which Save and Store manage.
+  queueNudge(async () => {
+    let textIn;
+    try {
+      textIn = await readCfg();
+    } catch (e) {
+      log(`! could not read polydye.cfg: ${e.message}`);
+      return;
+    }
+    const x = storedNudged('offset_x', textIn);
+    const y = storedNudged('offset_y', textIn);
+    const trim = storedNudged('direction_trim', textIn);
+    if (x === null || y === null || trim === null) {
+      log('! polydye.cfg has no valid offset_x, offset_y or direction_trim');
+      return;
+    }
+    await gcode(`POLYDYE_OFFSET X=${fmtMm(x)} Y=${fmtMm(y)} TRIM=${fmtMm(trim)}`);
+  });
 });
 
 // ---- controls -------------------------------------------------------------------------------------------------
