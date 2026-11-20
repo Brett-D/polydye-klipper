@@ -591,6 +591,13 @@ const SIG_POWER = [
   ['GND (2nd)', 'GND', 'CD4504 pin 8'],
 ];
 const SIG_KEY = 'polydye-signal-check';
+const SIG_LAYOUT_KEY = 'polydye-signal-layout';
+// Where each line should come out of the level shifters, from the C1/C2 schematic draft (hardware/README.md
+// section 5): U2 is the CD4504 on the high rail, U1 the one on the low rail. A hypothesis until measured.
+const CHIP_LEGS = {
+  S5: 'U2 2', S1: 'U2 4', S4: 'U2 6', S2: 'U2 10', S3: 'U2 12', DCLK: 'U2 15',
+  D1: 'U1 4', D2: 'U1 6', CSYNC: 'U1 10', D3: 'U1 12',
+};
 const SPIT_HZ = 1000;
 // Bus rates (one word of fire pulse = 1 / rate). The stock setup measures 2.82-2.83 MHz on the board: 2.857 MHz.
 const CLOCK_HZ = { ours: 3333333, stock: 2857142 };
@@ -668,7 +675,30 @@ function cell(textValue) {
   return td;
 }
 
+function signalLayout() {
+  return $('sig-layout').value === 'pogo' ? 'pogo' : 'legs';
+}
+
+function headRow(names) {
+  const tr = document.createElement('tr');
+  names.forEach((name) => {
+    const th = document.createElement('th');
+    th.textContent = name;
+    tr.append(th);
+  });
+  return tr;
+}
+
 function buildSignalTables() {
+  const legs = signalLayout() === 'legs';
+  document.querySelectorAll('.sig-legs').forEach((el) => el.classList.toggle('hidden', !legs));
+  document.querySelectorAll('.sig-pogo').forEach((el) => el.classList.toggle('hidden', legs));
+  const head = $('sig-head');
+  head.textContent = '';
+  head.append(headRow(legs
+    ? ['Signal', '', 'Expect', 'Expected leg (unverified)', 'Leg that reads it', 'Reading (V)']
+    : ['Signal', '', 'Expect at its joint', 'Cartridge pad (contact side, Sprite_tm\'s photo)', 'Joint / pogo found',
+      'Reading (V)']));
   const rows = $('sig-rows');
   rows.textContent = '';
   for (const line of SIG_LINES) {
@@ -681,8 +711,13 @@ function buildSignalTables() {
     hold.addEventListener('click', () => gcode(`POLYDYE_LEVEL LINE=${line} STATE=high`));
     const holdTd = document.createElement('td');
     holdTd.append(hold);
-    tr.append(cell(line), holdTd, cell(expectText(line)), padCell(line), sigInput(line, 'joint', 'text'),
-      sigInput(line, 'volts', 'number'));
+    if (legs) {
+      tr.append(cell(line), holdTd, cell(expectText(line)), cell(CHIP_LEGS[line]), sigInput(line, 'leg', 'text'),
+        sigInput(line, 'leg_volts', 'number'));
+    } else {
+      tr.append(cell(line), holdTd, cell(expectText(line)), padCell(line), sigInput(line, 'joint', 'text'),
+        sigInput(line, 'volts', 'number'));
+    }
     rows.append(tr);
   }
   const power = $('sig-power-rows');
@@ -698,11 +733,18 @@ function signalReport() {
   const pad = (s, n) => String(s).padEnd(n);
   const lines = [
     `PolyDye signal check, ${new Date().toISOString()}, board firmware ${boardVersion() || 'unknown'}`,
-    'Method: cartridge out; interface board out of the holder, face down (FFC connected); probing the pogo pins\''
-      + ' solder joints on its back; black lead on CD4504 pin 8.',
+    'Cartridge out; black lead on CD4504 pin 8. One line held HIGH at a time.',
     '',
-    `${pad('Signal', 10)}${pad('Expect', 12)}${pad('Joint / pogo', 22)}Reading (V)`,
+    'At the CD4504 output legs (expected legs from the C1/C2 schematic draft, unverified):',
+    `${pad('Signal', 10)}${pad('Expect', 12)}${pad('Expected', 12)}${pad('Found', 14)}Reading (V)`,
   ];
+  for (const line of SIG_LINES) {
+    const r = sigResults[line] || {};
+    lines.push(`${pad(line, 10)}${pad(LOW_RAIL.includes(line) ? '~7.6 V' : '~12.6 V', 12)}${pad(CHIP_LEGS[line], 12)}`
+      + `${pad(r.leg || '-', 14)}${r.leg_volts || '-'}`);
+  }
+  lines.push('', 'At the pogo pins\' solder joints (interface board out of the holder, face down, FFC connected):',
+    `${pad('Signal', 10)}${pad('Expect', 12)}${pad('Joint / pogo', 22)}Reading (V)`);
   for (const line of SIG_LINES) {
     const r = sigResults[line] || {};
     lines.push(`${pad(line, 10)}${pad(LOW_RAIL.includes(line) ? '~7.6 V' : '~12.6 V', 12)}${pad(r.joint || '-', 22)}`
@@ -742,6 +784,16 @@ $('sig-clear').addEventListener('click', () => {
 });
 
 $('sig-cart-out').addEventListener('change', () => render());
+try {
+  $('sig-layout').value = localStorage.getItem(SIG_LAYOUT_KEY) === 'pogo' ? 'pogo' : 'legs';
+} catch (e) { /* storage blocked: the default */ }
+$('sig-layout').addEventListener('change', () => {
+  try {
+    localStorage.setItem(SIG_LAYOUT_KEY, signalLayout());
+  } catch (e) { /* storage blocked: only for this visit */ }
+  buildSignalTables();
+  render();
+});
 $('sig-start').addEventListener('click', () => gcode('POLYDYE_ENABLE LIVE=0'));
 $('sig-low').addEventListener('click', () => gcode('POLYDYE_LEVEL STATE=off'));
 $('sig-finish').addEventListener('click', () => gcode('POLYDYE_LEVEL STATE=off\nPOLYDYE_DISABLE'));
