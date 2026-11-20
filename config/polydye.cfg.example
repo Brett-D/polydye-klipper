@@ -10,11 +10,15 @@ offset_y: -8.7
 # Moves the ink of reverse passes along the pass axis to line them up with forward passes (mm). The PolyDye page's
 # Ink position nudges set this and the offsets live; Store writes them here.
 #direction_trim: 0
-# Nozzle waveform: color_a or color_b for a colour cartridge, black_a or black_b for black. Unset keeps the board's
-# default (color_b). Needs current board firmware.
+# Nozzle waveform: color_a or color_b for a colour cartridge, black_a or black_b for black; color_b_late is color_b
+# with the stock PolyDye firmware's timing. Unset keeps the board's default (color_b). Needs current board firmware.
 #cartridge_template: color_b
-# Fire pulse in words of 0.3 us, 6-12. Unset keeps the board's default, 6 (1.8 us). Longer pulses fire harder.
+# Fire pulse in bus words, 6-12 (0.3 us each with our clock). Unset keeps the board's default, 6 (1.8 us). Longer
+# pulses fire harder.
 #pulse_words: 6
+# Cartridge bus clock: ours (3.333 MHz) or stock (the stock PolyDye firmware's setup, 5.714 MHz nominal, so each
+# pulse word is 0.175 us). Unset keeps the board's default (ours). Needs current board firmware.
+#bus_clock: ours
 #dpi: 600
 #pass_speed: 50
 #travel_speed: 150
