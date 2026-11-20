@@ -351,7 +351,10 @@ async function loadSettings() {
   }
   const form = $('settings');
   for (const key of FIELDS) {
-    const value = cfgValue(cfgText, key);
+    let value = cfgValue(cfgText, key);
+    // Klipper lowercases the template; the dropdown's values are lowercase, so match them or it shows nothing and
+    // the next save would comment the setting out.
+    if (value !== null && key === 'cartridge_template') value = value.toLowerCase();
     form.elements[key].value = value === null ? '' : value;
   }
   render();
@@ -430,6 +433,13 @@ $('restart-btn').addEventListener('click', async () => {
 
 let nudgeStep = 0.1;
 const fmtMm = (v) => String(Number(v.toFixed(4)));
+// Nudge and offset commands run one after another, and Store waits for them, so it never stores values from
+// before a click. gcode() logs failures and never rejects, so the chain keeps going.
+let nudgeChain = Promise.resolve();
+function queueNudge(script) {
+  nudgeChain = nudgeChain.then(() => gcode(script));
+  return nudgeChain;
+}
 
 function storedNudged(key) {
   const raw = cfgValue(cfgText, key);
@@ -464,14 +474,20 @@ document.querySelectorAll('#nudge-steps button').forEach((b) => {
 
 document.querySelectorAll('button[data-nudge]').forEach((b) => {
   b.addEventListener('click', () => {
-    gcode(`POLYDYE_NUDGE ${b.dataset.nudge}=${fmtMm(parseFloat(b.dataset.sign) * nudgeStep)}`);
+    queueNudge(`POLYDYE_NUDGE ${b.dataset.nudge}=${fmtMm(parseFloat(b.dataset.sign) * nudgeStep)}`);
   });
 });
 
 $('nudge-store').addEventListener('click', async () => {
-  const pd = state.printer.polydye || {};
-  if (NUDGED.some((k) => typeof pd[k] !== 'number')) return;
   try {
+    // Ask Klipper after the last nudge has run: the status subscription may not have caught up yet.
+    await nudgeChain;
+    const r = await rpc('printer.objects.query', { objects: { polydye: NUDGED } });
+    const pd = (r && r.status && r.status.polydye) || {};
+    if (NUDGED.some((k) => typeof pd[k] !== 'number')) {
+      log('! store failed: Klipper did not report the PolyDye offsets');
+      return;
+    }
     // Re-read first: the file may have been edited elsewhere since the page loaded.
     const current = await fetchCfg();
     const values = {};
@@ -499,7 +515,7 @@ $('nudge-undo').addEventListener('click', async () => {
     log('! polydye.cfg has no valid offset_x, offset_y or direction_trim');
     return;
   }
-  gcode(`POLYDYE_OFFSET X=${fmtMm(x)} Y=${fmtMm(y)} TRIM=${fmtMm(trim)}`);
+  queueNudge(`POLYDYE_OFFSET X=${fmtMm(x)} Y=${fmtMm(y)} TRIM=${fmtMm(trim)}`);
 });
 
 // ---- controls -------------------------------------------------------------------------------------------------
