@@ -205,6 +205,12 @@ function render() {
   text('s-free', known ? `${Math.round(pd.store_free / 1024)} kB` : '–');
   text('s-tpl', known ? (pd.cartridge_template || 'unknown: update the board firmware') : '–');
   text('s-pulse', known && pd.pulse_words ? `${pd.pulse_words} words, ${pd.pulse_us} µs` : '–');
+  let clock = '–';
+  if (known && pd.bus_clock) {
+    clock = `${pd.bus_clock}, ${(pd.bus_hz / 1e6).toFixed(3)} MHz`;
+    if (pd.bus_hz_measured) clock += ` (measured ${(pd.bus_hz_measured / 1e6).toFixed(3)})`;
+  }
+  text('s-clock', clock);
   renderNudges(pd);
   // Idle-only controls also wait for a firmware update: the dry run uses the same data port. Off stays available.
   document.querySelectorAll('.needs-board').forEach((b) => {
@@ -305,8 +311,8 @@ $('fw-file').addEventListener('change', async (ev) => {
 
 // ---- settings: edit the [polydye] section of polydye.cfg ------------------------------------------------------
 
-const FIELDS = ['pass_axis', 'offset_x', 'offset_y', 'direction_trim', 'cartridge_template', 'pulse_words', 'dpi',
-  'pass_speed'];
+const FIELDS = ['pass_axis', 'offset_x', 'offset_y', 'direction_trim', 'cartridge_template', 'pulse_words',
+  'bus_clock', 'dpi', 'pass_speed'];
 const NUDGED = ['offset_x', 'offset_y', 'direction_trim'];
 let cfgText = '';
 
@@ -359,7 +365,7 @@ async function loadSettings() {
     let value = cfgValue(cfgText, key);
     // Klipper lowercases the template; the dropdown's values are lowercase, so match them or it shows nothing and
     // the next save would comment the setting out.
-    if (value !== null && key === 'cartridge_template') value = value.toLowerCase();
+    if (value !== null && (key === 'cartridge_template' || key === 'bus_clock')) value = value.toLowerCase();
     form.elements[key].value = value === null ? '' : value;
   }
   render();
@@ -426,6 +432,7 @@ $('settings').addEventListener('submit', async (ev) => {
       for (const key of FIELDS) values[key] = form.elements[key].value.trim();
       values.cartridge_template = values.cartridge_template || null;
       values.pulse_words = values.pulse_words || null;
+      values.bus_clock = values.bus_clock || null;
       // Re-read first: the file may have been edited elsewhere since the page loaded.
       await uploadCfg(applySettings(await fetchCfg(), values));
     });
@@ -564,7 +571,7 @@ const SIG_POWER = [
 ];
 const SIG_KEY = 'polydye-signal-check';
 const SPIT_HZ = 1000;
-const PULSE_US = 0.3;  // one word of fire pulse
+const CLOCK_HZ = { ours: 3333333, stock: 5714285 };  // nominal bus rates: one word of fire pulse = 1 / rate
 
 function expectText(line) {
   return LOW_RAIL.includes(line) ? 'about 7.6 V (low rail, the reference design\'s 9 V)'
@@ -717,8 +724,9 @@ function fireValues() {
   const stripes = f.stripes.value.replace(/\s+/g, '').split(',').filter((s) => s);
   return {
     x: num('x', 80), y: num('y', 60), z: num('z', 0.5), spacing: num('spacing', 20), stripes,
+    pattern: f.pattern.value,
     valid: stripes.length > 0 && stripes.every((s) => {
-      const m = s.match(/^(color_a|color_b|black_a|black_b):(\d+)$/i);
+      const m = s.match(/^(color_a|color_b|black_a|black_b|color_b_late):(\d+)(:(ours|stock))?$/i);
       return m && Number(m[2]) >= 6 && Number(m[2]) <= 12;
     }),
   };
@@ -730,17 +738,21 @@ function renderFireLegend(axis) {
   table.textContent = '';
   if (!v.valid) {
     const tr = document.createElement('tr');
-    tr.append(cell('Stripes must be template:pulse pairs, e.g. color_b:8, with a pulse of 6 to 12 words.'));
+    tr.append(cell('Each stripe is template:pulse or template:pulse:clock, e.g. color_b:8 or color_b_late:10:stock, '
+      + 'with a pulse of 6 to 12 words and a clock of ours or stock.'));
     table.append(tr);
     return;
   }
+  const current = (state.printer.polydye || {}).bus_clock || 'ours';
   v.stripes.forEach((s, i) => {
-    const [tpl, words] = s.split(':');
+    const [tpl, words, stripeClock] = s.toLowerCase().split(':');
+    const clock = stripeClock || current;
     const x = axis === 'x' ? v.x : v.x + i * v.spacing;
     const y = axis === 'x' ? v.y + i * v.spacing : v.y;
     const tr = document.createElement('tr');
-    tr.append(cell(`${i + 1}`), cell(`X ${fmtMm(x)}  Y ${fmtMm(y)}`), cell(tpl.toLowerCase()),
-      cell(`pulse ${words} words (${(Number(words) * PULSE_US).toFixed(1)} µs)`));
+    tr.append(cell(`${i + 1}`), cell(`X ${fmtMm(x)}  Y ${fmtMm(y)}`), cell(tpl),
+      cell(`pulse ${words} words (${(Number(words) * 1e6 / CLOCK_HZ[clock]).toFixed(2)} µs)`),
+      cell(`${clock} clock`));
     table.append(tr);
   });
 }
@@ -756,18 +768,21 @@ $('fire-btn').addEventListener('click', () => {
     + `if needed, lowers the nozzle to Z ${v.z} mm and prints ${v.stripes.length} stripes, the first at X ${v.x}, `
     + `Y ${v.y}. The template and pulse go back to what they were afterwards.`);
   if (!ok) return;
-  gcode(`PD_FIRE_TEST X=${v.x} Y=${v.y} Z=${v.z} SPACING=${v.spacing} STRIPES=${v.stripes.join(',')}`);
+  gcode(`PD_FIRE_TEST X=${v.x} Y=${v.y} Z=${v.z} SPACING=${v.spacing} PATTERN=${v.pattern} `
+    + `STRIPES=${v.stripes.join(',')}`);
 });
 
 $('spit-btn').addEventListener('click', () => {
   const f = $('spit-form').elements;
   const seconds = Math.min(10, Math.max(0.5, parseFloat(f.seconds.value) || 2));
   const pulse = parseInt(f.pulse.value, 10);
+  const which = f.pattern.value === 'mid' ? 'Nozzle positions 14-90 fire' : 'Every nozzle fires';
   const ok = window.confirm(`Spit test: LIVE INK, no motion.\n\nHold a folded paper towel under the cartridge, `
-    + `against the nozzles. Every nozzle fires ${SPIT_HZ} times a second for ${seconds} s.`);
+    + `against the nozzles. ${which} ${SPIT_HZ} times a second for ${seconds} s.`);
   if (!ok) return;
   gcode(`POLYDYE_SPIT SECONDS=${seconds}${f.template.value ? ` TEMPLATE=${f.template.value}` : ''}`
-    + `${pulse >= 6 && pulse <= 12 ? ` PULSE=${pulse}` : ''} CONFIRM=1`);
+    + `${pulse >= 6 && pulse <= 12 ? ` PULSE=${pulse}` : ''}${f.clock.value ? ` CLOCK=${f.clock.value}` : ''}`
+    + ` PATTERN=${f.pattern.value} CONFIRM=1`);
 });
 
 function renderDiagnostics(pd, printing) {

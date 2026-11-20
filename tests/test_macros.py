@@ -113,14 +113,16 @@ class FireTest(unittest.TestCase):
         self.macros = load_macros()
 
     def test_homes_only_when_needed_then_sets_z_and_passes_the_stripes(self):
-        lines = run(self.macros, "PD_FIRE_TEST", "X=90 STRIPES=color_a:6,color_b:10", homed="")
+        lines = run(self.macros, "PD_FIRE_TEST", "X=90 STRIPES=color_a:6,color_b_late:10:stock PATTERN=MID",
+                    homed="")
         self.assertEqual(lines, ["G28", "SAVE_GCODE_STATE NAME=pd_fire_test", "G90", "G1 Z0.5 F900",
-                                 "POLYDYE_FIRE_TEST X=90.0 Y=60.0 SPACING=20.0 STRIPES=color_a:6,color_b:10",
+                                 "POLYDYE_FIRE_TEST X=90.0 Y=60.0 SPACING=18.0 PATTERN=mid "
+                                 "STRIPES=color_a:6,color_b_late:10:stock",
                                  "RESTORE_GCODE_STATE NAME=pd_fire_test"])
+        # Without STRIPES, POLYDYE_FIRE_TEST picks its default for the board's firmware.
         lines = run(self.macros, "PD_FIRE_TEST", homed="xyz")
         self.assertNotIn("G28", lines)
-        self.assertIn("POLYDYE_FIRE_TEST X=80.0 Y=60.0 SPACING=20.0 "
-                      "STRIPES=color_b:6,color_b:8,color_b:10,color_a:6,color_a:10", lines)
+        self.assertIn("POLYDYE_FIRE_TEST X=70.0 Y=60.0 SPACING=18.0 PATTERN=all", lines)
 
     def test_refuses_z_below_0_2(self):
         with self.assertRaisesRegex(MacroError, "Z must be"):
