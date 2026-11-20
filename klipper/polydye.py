@@ -659,9 +659,10 @@ class PolyDye:
             change = (name is not None and name != st['cartridge_template']) or (
                 pulse is not None and pulse != st['pulse_words']) or (
                 clock is not None and clock != st.get('bus_clock'))
+            # Also when nothing changes: the result must be within the limit, not just different.
             limit = pulse_limit_error(pulse if pulse is not None else st['pulse_words'],
                                       clock if clock is not None else st.get('bus_clock'))
-            if change and limit:
+            if limit:
                 raise gcmd.error("POLYDYE_CARTRIDGE: %s" % (limit,))
             if change and (st['boost'] or st['live'] or st['running'] or st['queued']):
                 raise gcmd.error("POLYDYE_CARTRIDGE: turn PolyDye off (POLYDYE_DISABLE) and let queued passes "

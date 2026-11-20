@@ -372,6 +372,16 @@ class TestCleanup(unittest.TestCase):
         self.assertNotIn('spit', board.sent)
         self.assertFalse([s for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_PASS")])
 
+    def test_cartridge_refuses_an_over_limit_result_even_if_unchanged(self):
+        # A board left at the stock clock and 9 words (3.15 us) by older firmware: resending it is refused too.
+        pd, board = self.make(fail_on="NOTHING")
+        board.clock, board.pulse = 'stock', 9
+        with self.assertRaisesRegex(RuntimeError, "limit is 2.9 us"):
+            pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(PULSE=9, CLOCK='stock'))
+        self.assertEqual(board.sent, [])
+        pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(PULSE=8))
+        self.assertEqual(board.sent, ['pulse'])
+
     def test_spit_needs_confirm(self):
         pd, board = self.make(fail_on="NOTHING")
         pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append(('spit', args[1], args[2])))
