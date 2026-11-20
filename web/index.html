@@ -79,12 +79,12 @@
           <select name="bus_clock">
             <option value="">Board default (ours, 3.333 MHz)</option>
             <option value="ours">ours (3.333 MHz)</option>
-            <option value="stock">stock (5.714 MHz nominal)</option>
+            <option value="stock">stock (2.857 MHz)</option>
           </select>
         </label>
         <label>Resolution (dpi)<input name="dpi" type="number" step="1" min="1" placeholder="600"></label>
         <label>Pass speed (mm/s)<input name="pass_speed" type="number" step="0.1" min="1" placeholder="50"></label>
-        <label>Fire pulse (words of 0.3 µs)<input name="pulse_words" type="number" step="1" min="6" max="12"
+        <label>Fire pulse (bus words)<input name="pulse_words" type="number" step="1" min="6" max="9"
           placeholder="6 (board default)"></label>
         <div class="buttons">
           <button type="submit" class="primary">Save</button>
@@ -94,10 +94,12 @@
           Direction trim moves the ink of reverse passes along the pass axis. The cartridge template is the nozzle
           waveform: a and b are two variants for each cartridge type, so try both at the nozzle check;
           color_b_late is color_b with the stock PolyDye firmware's timing. The bus clock &ldquo;stock&rdquo; copies
-          the stock firmware's faster bus setup, which also makes each pulse word shorter.
+          the stock firmware's bus setup, which runs at 2.857 MHz, so each pulse word lasts 0.35 µs instead of 0.3.
           A black template needs pass data made for a black cartridge. The fire pulse sets how long each nozzle is
           heated: longer pulses put more energy into each drop, for when the board's boost voltage is below the
-          cartridge's. Leave it empty for the board's 6 (1.8 µs). Saving edits only the [polydye] section of
+          cartridge's. Leave it empty for the board's 6 (1.8 µs). Live ink is limited to 2.9 µs, 100 % of the
+          reference heater energy at this board's 12.6 V: 9 words with our clock, 8 with the stock one. Saving edits
+          only the [polydye] section of
           polydye.cfg; Klipper applies it after a restart.</p>
       </form>
     </section>
@@ -171,7 +173,7 @@
       <h3>Fire test <span class="sub">live ink on paper</span></h3>
       <p class="hint">Prints a stripe for each template, fire pulse and bus clock, side by side, so you can see which
         settings put ink down. The default stripes compare our timing with the stock PolyDye firmware's (color_b vs
-        color_b_late, our clock vs stock) at pulse 6 and 10. Tape paper on the bed and fit the cartridge first. The
+        color_b_late, our clock vs stock) at pulse 6 and the longest allowed (9 words, 8 with the stock clock). Tape paper on the bed and fit the cartridge first. The
         test homes if needed, lowers the nozzle to Z and puts the settings back afterwards. Stripes run along the
         pass axis.</p>
       <form id="fire-form" class="compact">
@@ -183,7 +185,7 @@
           <select name="pattern"><option value="all">all</option><option value="mid">positions 14-90 (as stock)</option></select>
         </label>
         <label class="wide">Stripes (template:pulse words[:clock], &hellip;)
-          <input name="stripes" value="color_b:6:ours,color_b_late:6:ours,color_b:6:stock,color_b_late:6:stock,color_b:10:ours,color_b_late:10:ours,color_b:10:stock,color_b_late:10:stock"></label>
+          <input name="stripes" value="color_b:6:ours,color_b_late:6:ours,color_b:6:stock,color_b_late:6:stock,color_b:9:ours,color_b_late:9:ours,color_b:8:stock,color_b_late:8:stock"></label>
       </form>
       <table class="table" id="fire-legend"></table>
       <div class="buttons">
@@ -204,7 +206,7 @@
             <option value="color_b_late">color_b_late</option>
           </select>
         </label>
-        <label>Fire pulse (words)<input name="pulse" type="number" step="1" min="6" max="12" placeholder="current"></label>
+        <label>Fire pulse (words)<input name="pulse" type="number" step="1" min="6" max="9" placeholder="current"></label>
         <label>Bus clock
           <select name="clock"><option value="">Current</option><option value="ours">ours</option><option value="stock">stock</option></select>
         </label>

@@ -571,12 +571,16 @@ const SIG_POWER = [
 ];
 const SIG_KEY = 'polydye-signal-check';
 const SPIT_HZ = 1000;
-const CLOCK_HZ = { ours: 3333333, stock: 5714285 };  // nominal bus rates: one word of fire pulse = 1 / rate
+// Bus rates (one word of fire pulse = 1 / rate). The stock setup measures 2.82-2.83 MHz on the board: 2.857 MHz.
+const CLOCK_HZ = { ours: 3333333, stock: 2857142 };
+const PULSE_MAX_US = 2.9;  // live-ink limit, whatever the clock (polydye.py PULSE_MAX_US)
+const pulseUs = (words, clock) => (words * 1e6) / CLOCK_HZ[clock];
+const pulseOk = (words, clock) => words >= 6 && words <= 12 && pulseUs(words, clock) <= PULSE_MAX_US + 1e-9;
 // Fire test defaults, like POLYDYE_FIRE_TEST's: the A/B matrix of our timing and the stock firmware's, or, for board
 // firmware without the stock options, five template/pulse pairs. Used until the stripes are edited.
 const FIRE_STRIPES = 'color_b:6:ours,color_b_late:6:ours,color_b:6:stock,color_b_late:6:stock,'
-  + 'color_b:10:ours,color_b_late:10:ours,color_b:10:stock,color_b_late:10:stock';
-const FIRE_STRIPES_BASIC = 'color_b:6,color_b:8,color_b:10,color_a:6,color_a:10';
+  + 'color_b:9:ours,color_b_late:9:ours,color_b:8:stock,color_b_late:8:stock';
+const FIRE_STRIPES_BASIC = 'color_b:6,color_b:8,color_b:9,color_a:6,color_a:9';
 let fireStripesEdited = false;
 
 function expectText(line) {
@@ -728,12 +732,13 @@ function fireValues() {
     return Number.isFinite(v) ? v : fallback;
   };
   const stripes = f.stripes.value.replace(/\s+/g, '').split(',').filter((s) => s);
+  const current = (state.printer.polydye || {}).bus_clock || 'ours';
   return {
-    x: num('x', 80), y: num('y', 60), z: num('z', 0.5), spacing: num('spacing', 20), stripes,
+    x: num('x', 70), y: num('y', 60), z: num('z', 0.5), spacing: num('spacing', 18), stripes,
     pattern: f.pattern.value,
     valid: stripes.length > 0 && stripes.every((s) => {
       const m = s.match(/^(color_a|color_b|black_a|black_b|color_b_late):(\d+)(:(ours|stock))?$/i);
-      return m && Number(m[2]) >= 6 && Number(m[2]) <= 12;
+      return m && pulseOk(Number(m[2]), (m[4] || current).toLowerCase());
     }),
   };
 }
@@ -744,8 +749,9 @@ function renderFireLegend(axis) {
   table.textContent = '';
   if (!v.valid) {
     const tr = document.createElement('tr');
-    tr.append(cell('Each stripe is template:pulse or template:pulse:clock, e.g. color_b:8 or color_b_late:10:stock, '
-      + 'with a pulse of 6 to 12 words and a clock of ours or stock.'));
+    tr.append(cell('Each stripe is template:pulse or template:pulse:clock, e.g. color_b:8 or color_b_late:8:stock, '
+      + `with a clock of ours or stock and a pulse of 6 words or more and at most ${PULSE_MAX_US} µs: `
+      + '9 words with our clock, 8 with the stock one.'));
     table.append(tr);
     return;
   }
@@ -757,7 +763,7 @@ function renderFireLegend(axis) {
     const y = axis === 'x' ? v.y + i * v.spacing : v.y;
     const tr = document.createElement('tr');
     tr.append(cell(`${i + 1}`), cell(`X ${fmtMm(x)}  Y ${fmtMm(y)}`), cell(tpl),
-      cell(`pulse ${words} words (${(Number(words) * 1e6 / CLOCK_HZ[clock]).toFixed(2)} µs)`),
+      cell(`pulse ${words} words (${pulseUs(Number(words), clock).toFixed(2)} µs)`),
       cell(`${clock} clock`));
     table.append(tr);
   });
@@ -785,6 +791,14 @@ $('spit-btn').addEventListener('click', () => {
   const f = $('spit-form').elements;
   const seconds = Math.min(10, Math.max(0.5, parseFloat(f.seconds.value) || 2));
   const pulse = parseInt(f.pulse.value, 10);
+  const pd = state.printer.polydye || {};
+  const clock = f.clock.value || pd.bus_clock || 'ours';
+  const words = pulse >= 6 ? pulse : pd.pulse_words;
+  if (words && !pulseOk(words, clock)) {
+    log(`! spit test: ${words} words is ${pulseUs(words, clock).toFixed(2)} µs at the ${clock} clock; `
+      + `the limit is ${PULSE_MAX_US} µs`);
+    return;
+  }
   const which = f.pattern.value === 'mid' ? 'Nozzle positions 14-90 fire' : 'Every nozzle fires';
   const ok = window.confirm(`Spit test: LIVE INK, no motion.\n\nHold a folded paper towel under the cartridge, `
     + `against the nozzles. ${which} ${SPIT_HZ} times a second for ${seconds} s.`);
