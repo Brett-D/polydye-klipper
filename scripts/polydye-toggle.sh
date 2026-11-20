@@ -32,6 +32,10 @@ if [ -n "$port" ]; then
 # Don't edit this file; PolyDye settings are in polydye.cfg.
 [mcu polydye]
 serial: $port
+# Klipper only learns that the board restarts on command once it has connected to it; until then FIRMWARE_RESTART
+# would try an Arduino-style reset on the port, which fails if the board is unplugged and leaves Moonraker connected
+# to a dead Klipper instance.
+restart_method: command
 
 [include $REPO_DIR/config/polydye_macros.cfg]
 [include polydye.cfg]
