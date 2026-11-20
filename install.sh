@@ -9,7 +9,8 @@
 #   3. Creates polydye.cfg (your settings) from the template if you don't have one.
 #   4. Adds [include polydye-active*.cfg] to printer.cfg, above any SAVE_CONFIG block (backup made first).
 #   5. Installs a hook so polydye-toggle.sh runs whenever the Klipper service starts: with the PolyDye board
-#      plugged in, PolyDye is enabled; without it, Klipper starts exactly as before.
+#      plugged in, PolyDye is enabled; without it, Klipper starts exactly as before. It also restores the link
+#      from step 1 if that has gone missing.
 #   6. Adds [polydye] and, from the main branch, [update_manager polydye] to moonraker.conf.
 #   7. Adds a PolyDye entry to Mainsail's sidebar (.theme/navi.json).
 #   8. Restarts Moonraker (if its config changed) and Klipper.
@@ -88,7 +89,7 @@ fi
 DROPIN_DIR="$SYSTEMD_DIR/$KLIPPER_SERVICE.service.d"
 DROPIN="$DROPIN_DIR/polydye.conf"
 DROPIN_TEXT="[Service]
-ExecStartPre=-$REPO_DIR/scripts/polydye-toggle.sh $CONFIG_DIR"
+ExecStartPre=-$REPO_DIR/scripts/polydye-toggle.sh $CONFIG_DIR $KLIPPER_DIR"
 if [ "$(cat "$DROPIN" 2>/dev/null)" != "$DROPIN_TEXT" ]; then
     $SUDO mkdir -p "$DROPIN_DIR"
     printf '%s\n' "$DROPIN_TEXT" | $SUDO tee "$DROPIN" > /dev/null
@@ -133,7 +134,7 @@ if [ -d "$COMPONENTS" ]; then
 fi
 
 # 8. Apply
-"$REPO_DIR/scripts/polydye-toggle.sh" "$CONFIG_DIR"
+"$REPO_DIR/scripts/polydye-toggle.sh" "$CONFIG_DIR" "$KLIPPER_DIR"
 if [ -z "$NO_SERVICES" ]; then
     [ -z "$MOONRAKER_CHANGED" ] || $SUDO systemctl restart "$MOONRAKER_SERVICE"
     $SUDO systemctl restart "$KLIPPER_SERVICE"
