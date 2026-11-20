@@ -206,6 +206,18 @@ class Stripes(unittest.TestCase):
         self.assertEqual(polydye.stripe_positions('x', 80., 60., 20., 2), [(80., 60.), (80., 80.)])
 
 
+class TestPassData(unittest.TestCase):
+    def test_repeat_sends_each_column_n_times(self):
+        full, empty = b"\xff" * polydye.NOZDATA_SIZE, b"\x00" * polydye.NOZDATA_SIZE
+        data, total = polydye.test_pass_data('alternate', 4, 2)
+        self.assertEqual((data, total), (full + full + empty + empty + full + full + empty + empty, 8))
+        data, total = polydye.test_pass_data('mid', 3, 3)
+        self.assertEqual((len(data), total), (9 * polydye.NOZDATA_SIZE, 9))
+        self.assertEqual(polydye.test_pass_data('all', 5), (full * 5, 5))
+        with self.assertRaises(ValueError):
+            polydye.test_pass_data('stripes', 5)
+
+
 class FakeBoard:
     """Just enough of the board for POLYDYE_FIRE_TEST / POLYDYE_SPIT: tracks mode, template and pulse."""
 
@@ -260,7 +272,9 @@ class TestCleanup(unittest.TestCase):
                 board.boost = board.live = False
         reactor = types.SimpleNamespace(monotonic=lambda: 0., pause=lambda t: None)
         objects = {'gcode': types.SimpleNamespace(run_script_from_command=run_script),
-                   'toolhead': types.SimpleNamespace(wait_moves=lambda: None)}
+                   'toolhead': types.SimpleNamespace(wait_moves=lambda: None),
+                   'print_stats': types.SimpleNamespace(get_status=lambda eventtime: {'state': board.print_state})}
+        board.print_state = 'standby'
         pd.printer = types.SimpleNamespace(lookup_object=lambda name, default=None: objects.get(name, default),
                                            get_reactor=lambda: reactor, is_shutdown=lambda: False,
                                            command_error=RuntimeError)
@@ -275,10 +289,13 @@ class TestCleanup(unittest.TestCase):
     def test_fire_test_error_turns_off_and_restores(self):
         pd, board = self.make(fail_on="POLYDYE_PASS")
         with self.assertRaisesRegex(RuntimeError, "out of range"):
-            pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b_late:10:stock", X=80., Y=60., SPACING=20., COLUMNS=600,
-                                               UPLOAD=1, LAYER=0, PASS=0, PATTERN='mid'))
+            pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b_late:10:stock", X=80., Y=60., Z=0.5, SPACING=20.,
+                                               COLUMNS=600, UPLOAD=1, LAYER=0, PASS=0, PATTERN='mid'))
         self.assertIn("POLYDYE_CARTRIDGE TEMPLATE=color_b_late PULSE=10 CLOCK=stock", board.sent)
         self.assertIn("POLYDYE_UPLOAD_TEST_PASS LAYER=0 PASS=0 COLUMNS=600 PATTERN=mid", board.sent)
+        # The G-code state saved before the Z move is restored after the error.
+        self.assertLess(board.sent.index("SAVE_GCODE_STATE NAME=pd_fire_test"), board.sent.index("G90\nG1 Z0.500 F900"))
+        self.assertEqual(board.sent[-1], "RESTORE_GCODE_STATE NAME=pd_fire_test")
         self.assertEqual((board.boost, board.live, board.template, board.pulse, board.clock),
                          (False, False, 'color_a', 8, 'ours'))
 
@@ -293,6 +310,18 @@ class TestCleanup(unittest.TestCase):
                                   "POLYDYE_PASS LAYER=0 PASS=0 X=100.000 Y=60.000 DIR=1"])
         self.assertEqual(sum(1 for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_UPLOAD")), 1)
         self.assertEqual((board.boost, board.template, board.pulse), (False, 'color_a', 8))
+
+    def test_refused_during_a_paused_print_before_anything_is_sent(self):
+        for state in ('printing', 'paused'):
+            pd, board = self.make(fail_on="NOTHING")
+            board.print_state = state
+            pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append('spit'))
+            with self.assertRaisesRegex(RuntimeError, "not during a print"):
+                pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:10", X=80., Y=60., SPACING=20., COLUMNS=600,
+                                                   UPLOAD=1, LAYER=0, PASS=0, PATTERN='all'))
+            with self.assertRaisesRegex(RuntimeError, "not during a print"):
+                pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., PATTERN='all', CONFIRM=1))
+            self.assertEqual(board.sent, [])
 
     def test_spit_needs_confirm(self):
         pd, board = self.make(fail_on="NOTHING")

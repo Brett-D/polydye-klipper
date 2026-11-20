@@ -40,9 +40,11 @@ def raise_error(msg):
     raise MacroError(msg)
 
 
-def printer_status(macros, homed="xyz", pos=(50., 60., 2., 0.), axis_max=(250., 208., 250.), g92_x=0.):
+def printer_status(macros, homed="xyz", pos=(50., 60., 2., 0.), axis_max=(250., 208., 250.), g92_x=0.,
+                   print_state="standby"):
     # g92_x: a G92 shift in X, so machine position = G-code position + g92_x (homing origin stays 0).
     status = {
+        "print_stats": {"state": print_state},
         "toolhead": {"homed_axes": homed, "axis_maximum": dict(zip("xyz", axis_max)),
                      "axis_minimum": {"x": 0., "y": -22., "z": 0.}},
         "gcode_move": {"homing_origin": {"x": 0., "y": 0., "z": 0., "e": 0.},
@@ -115,14 +117,17 @@ class FireTest(unittest.TestCase):
     def test_homes_only_when_needed_then_sets_z_and_passes_the_stripes(self):
         lines = run(self.macros, "PD_FIRE_TEST", "X=90 STRIPES=color_a:6,color_b_late:10:stock PATTERN=MID",
                     homed="")
-        self.assertEqual(lines, ["G28", "SAVE_GCODE_STATE NAME=pd_fire_test", "G90", "G1 Z0.5 F900",
-                                 "POLYDYE_FIRE_TEST X=90.0 Y=60.0 SPACING=18.0 PATTERN=mid "
-                                 "STRIPES=color_a:6,color_b_late:10:stock",
-                                 "RESTORE_GCODE_STATE NAME=pd_fire_test"])
+        # The Z move and the G-code state are POLYDYE_FIRE_TEST's, so they're restored even if it fails.
+        self.assertEqual(lines, ["G28", "POLYDYE_FIRE_TEST X=90.0 Y=60.0 Z=0.5 SPACING=18.0 PATTERN=mid "
+                                        "STRIPES=color_a:6,color_b_late:10:stock"])
         # Without STRIPES, POLYDYE_FIRE_TEST picks its default for the board's firmware.
         lines = run(self.macros, "PD_FIRE_TEST", homed="xyz")
-        self.assertNotIn("G28", lines)
-        self.assertIn("POLYDYE_FIRE_TEST X=70.0 Y=60.0 SPACING=18.0 PATTERN=all", lines)
+        self.assertEqual(lines, ["POLYDYE_FIRE_TEST X=70.0 Y=60.0 Z=0.5 SPACING=18.0 PATTERN=all"])
+
+    def test_refuses_during_a_print_before_homing(self):
+        for state in ("printing", "paused"):
+            with self.assertRaisesRegex(MacroError, "not during a print"):
+                run(self.macros, "PD_FIRE_TEST", homed="", print_state=state)
 
     def test_refuses_z_below_0_2(self):
         with self.assertRaisesRegex(MacroError, "Z must be"):

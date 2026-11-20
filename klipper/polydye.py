@@ -227,6 +227,19 @@ def stripe_positions(axis, x, y, spacing, count):
     return [(x, y + i * spacing) for i in range(count)]
 
 
+def test_pass_data(pattern, columns, repeat=1):
+    """Nozzle data for POLYDYE_UPLOAD_TEST_PASS: `columns` columns of `pattern`, each sent `repeat` times in a row.
+    Returns (data, column count). Raises ValueError for an unknown pattern."""
+    full, empty = b"\xff" * NOZDATA_SIZE, b"\x00" * NOZDATA_SIZE
+    if pattern == 'alternate':
+        cols = [full if i % 2 == 0 else empty for i in range(columns)]
+    elif pattern in ('all', 'none', 'mid'):
+        cols = [{'all': full, 'none': empty, 'mid': color_column(MID_POSITIONS)}[pattern]] * columns
+    else:
+        raise ValueError("PATTERN must be alternate, all, none or mid")
+    return b"".join(col * repeat for col in cols), columns * repeat
+
+
 def nudge_offsets(offset_x, offset_y, trim, dx, dy, dtrim):
     """New (offset_x, offset_y, direction_trim) after moving the ink by (dx, dy) on the bed and reverse passes by
     dtrim along the pass axis.
@@ -641,13 +654,12 @@ class PolyDye:
         columns = gcmd.get_int('COLUMNS', 600, minval=1, maxval=65535)
         pattern = gcmd.get('PATTERN', 'alternate').lower()
         repeat = gcmd.get_int('REPEAT', 1, minval=1, maxval=8)
-        full, empty = b"\xff" * NOZDATA_SIZE, b"\x00" * NOZDATA_SIZE
-        if pattern == 'alternate':
-            data = b"".join(full if i // repeat % 2 == 0 else empty for i in range(columns))
-        elif pattern in ('all', 'none', 'mid'):
-            data = {'all': full, 'none': empty, 'mid': color_column(MID_POSITIONS)}[pattern] * columns
-        else:
-            raise gcmd.error("POLYDYE_UPLOAD_TEST_PASS: PATTERN must be alternate, all, none or mid")
+        try:
+            data, total = test_pass_data(pattern, columns, repeat)
+        except ValueError as e:
+            raise gcmd.error("POLYDYE_UPLOAD_TEST_PASS: %s" % (e,))
+        if total > 65535:
+            raise gcmd.error("POLYDYE_UPLOAD_TEST_PASS: COLUMNS x REPEAT must be at most 65535 (it is %d)" % (total,))
         if not self.data_port:
             raise gcmd.error("POLYDYE_UPLOAD_TEST_PASS: set data_port in [polydye]")
         try:
@@ -658,11 +670,12 @@ class PolyDye:
                 raise ValueError("PATTERN=mid is for a colour cartridge template")
             self.data_seq = (self.data_seq + 1) & 0xff
             data_port_request(self.data_port, self.data_seq, DATA_PUT,
-                              struct.pack("<HHBBH", layer, pass_num, cart, 0, columns) + data)
+                              struct.pack("<HHBBH", layer, pass_num, cart, 0, total) + data)
         except (DataPortError, OSError, ValueError) as e:
             raise gcmd.error("POLYDYE_UPLOAD_TEST_PASS: %s" % (e,))
         gcmd.respond_info("PolyDye: stored test pass layer %d pass %d (%d columns, %s%s)"
-                          % (layer, pass_num, columns, pattern, ", each column %d times" % (repeat,) if repeat > 1 else ""))
+                          % (layer, pass_num, total, pattern,
+                             ", each of %d sent %d times" % (columns, repeat) if repeat > 1 else ""))
 
     cmd_POLYDYE_LEVEL_help = ("Signal check, cartridge OUT: hold one cartridge line (LINE=D1..D3|CSYNC|S1..S5|DCLK) "
                               "HIGH or LOW for a multimeter (STATE=high|low|off); needs POLYDYE_ENABLE LIVE=0 first")
@@ -702,6 +715,16 @@ class PolyDye:
         else:
             gcmd.respond_info("PolyDye signal check: %s held LOW" % (line,))
 
+    def _check_not_printing(self, gcmd, name):
+        """Refuses a test during a print, also a paused one (its layer 0 pass 0 and position must stay as they are)."""
+        sdcard = self.printer.lookup_object('virtual_sdcard', None)
+        print_stats = self.printer.lookup_object('print_stats', None)
+        state = None
+        if print_stats is not None:
+            state = print_stats.get_status(self.printer.get_reactor().monotonic()).get('state')
+        if (sdcard is not None and sdcard.is_active()) or state in ('printing', 'paused'):
+            raise gcmd.error("%s: not during a print (cancel it first)" % (name,))
+
     def _wait_off_and_idle(self, timeout=10.):
         """Waits until the board reports the boost and live output off and nothing queued or printing."""
         reactor = self.printer.get_reactor()
@@ -715,8 +738,9 @@ class PolyDye:
             reactor.pause(reactor.monotonic() + 0.1)
 
     cmd_POLYDYE_FIRE_TEST_help = ("LIVE INK on paper: one stripe per TEMPLATE:PULSE[:CLOCK] in STRIPES, side by side "
-                                  "from X, Y, SPACING mm apart, PATTERN=all|mid; restores the template, pulse and clock "
-                                  "afterwards. UPLOAD=0 prints the pass already stored as LAYER, PASS instead")
+                                  "from X, Y, SPACING mm apart, at Z if given, PATTERN=all|mid; restores the template, "
+                                  "pulse, clock and G-code state afterwards. UPLOAD=0 prints the pass already stored as "
+                                  "LAYER, PASS instead")
 
     def cmd_POLYDYE_FIRE_TEST(self, gcmd):
         if self.query_cartridge_cmd is None:
@@ -733,9 +757,10 @@ class PolyDye:
         pattern = gcmd.get('PATTERN', 'all').lower()
         if pattern not in TEST_PATTERNS:
             raise gcmd.error("POLYDYE_FIRE_TEST: PATTERN must be all or mid")
-        x = gcmd.get_float('X', 80.)
+        x = gcmd.get_float('X', 70.)
         y = gcmd.get_float('Y', 60.)
-        spacing = gcmd.get_float('SPACING', 20., above=0.)
+        z = gcmd.get_float('Z', None, minval=0.2)
+        spacing = gcmd.get_float('SPACING', 18., above=0.)
         columns = gcmd.get_int('COLUMNS', 600, minval=1, maxval=4800)
         upload = gcmd.get_int('UPLOAD', 1, minval=0, maxval=1)
         layer = gcmd.get_int('LAYER', 0, minval=0, maxval=65535)
@@ -749,9 +774,7 @@ class PolyDye:
                 raise gcmd.error("POLYDYE_FIRE_TEST: layer %d pass %d is for a %s cartridge; use %s templates only, or "
                                  "UPLOAD=1" % (layer, pass_num, stored, stored))
             columns = info['columns']
-        sdcard = self.printer.lookup_object('virtual_sdcard', None)
-        if sdcard is not None and sdcard.is_active():
-            raise gcmd.error("POLYDYE_FIRE_TEST: not during a print")
+        self._check_not_printing(gcmd, "POLYDYE_FIRE_TEST")
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.wait_moves()
         st = self._fresh_status()
@@ -767,7 +790,11 @@ class PolyDye:
                 for i, ((tpl, words, clock), (px, py)) in enumerate(zip(stripes, positions)))))
         run = self.printer.lookup_object('gcode').run_script_from_command
         uploaded = None if upload else 'stored'
+        # Everything is checked by now; from here on the G-code state and the board settings are always put back.
+        run("SAVE_GCODE_STATE NAME=pd_fire_test")
         try:
+            if z is not None:
+                run("G90\nG1 Z%.3f F900" % (z,))
             for i, ((tpl, words, clock), (px, py)) in enumerate(zip(stripes, positions)):
                 run("POLYDYE_DISABLE")
                 self._wait_off_and_idle()
@@ -784,6 +811,11 @@ class PolyDye:
                                   % (i + 1, len(stripes), px, py, tpl, words, ", %s clock" % (clock,) if clock else ""))
         finally:
             self._restore_after_test(before)
+            if not self.printer.is_shutdown():
+                try:
+                    run("RESTORE_GCODE_STATE NAME=pd_fire_test")
+                except Exception:
+                    logging.exception("polydye: fire test couldn't restore the G-code state")
         gcmd.respond_info("PolyDye fire test done; %s" % (cartridge_text(self._fresh_status()),))
 
     cmd_POLYDYE_SPIT_help = ("LIVE INK, no motion: fire every nozzle (PATTERN=all) or positions 14-90 (mid) for "
@@ -812,9 +844,7 @@ class PolyDye:
         if gcmd.get_int('CONFIRM', 0) != 1:
             raise gcmd.error("POLYDYE_SPIT fires every nozzle with live ink: hold a folded paper towel under the "
                              "cartridge, then run it again with CONFIRM=1")
-        sdcard = self.printer.lookup_object('virtual_sdcard', None)
-        if sdcard is not None and sdcard.is_active():
-            raise gcmd.error("POLYDYE_SPIT: not during a print")
+        self._check_not_printing(gcmd, "POLYDYE_SPIT")
         reactor = self.printer.get_reactor()
         self.printer.lookup_object('toolhead').wait_moves()
         st = self._fresh_status()
