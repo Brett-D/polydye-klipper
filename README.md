@@ -88,11 +88,17 @@ does. It shows:
   - **Spit test** (live ink, no motion, with a confirmation): every nozzle (or positions 14–90) fires 1000 times a
     second for a few seconds into a paper towel held under the cartridge (`POLYDYE_SPIT`). It also makes a steady load for a USB-C
     power meter on the board's power input, to compare the current with the cartridge in and out.
-- **Signal check** (cartridge out, multimeter): a guided check of where each cartridge signal arrives. With the
-  interface board slid out of the holder and laid face down, the page holds one line HIGH at a time
-  (`POLYDYE_LEVEL`) and shows the voltage to expect and the cartridge pad it should reach. You note which pogo
-  pin's solder joint reads it. A power-off continuity step covers the fire lines (PWRA, PWRB) and ground. Results
-  stay in the browser and can be saved to `polydye_signal_check.txt` in the config folder.
+- **Signal check** (cartridge out, multimeter): a guided check of where each cartridge signal arrives. The page
+  holds one line HIGH at a time (`POLYDYE_LEVEL`) and shows the voltage to expect. You probe at one of two places:
+  - **CD4504 output legs** on the daughter board, black lead on pin 8: the page shows the leg each line should
+    come out on (U2 legs 2, 4, 6, 10, 12, 15 for S5, S1, S4, S2, S3, DCLK; U1 legs 4, 6, 10, 12 for D1, D2, CSYNC,
+    D3, from the schematic draft and not verified yet), and you note the leg that actually reads it;
+  - **pogo pin joints** on the interface board, slid out of the holder and laid face down: the page shows the
+    cartridge pad each line should reach, and you note the joint. A power-off continuity step covers the fire
+    lines (PWRA, PWRB) and ground.
+
+  Results stay in the browser and can be saved to `polydye_signal_check.txt` in the config folder, with both
+  layouts' findings.
 - **Board firmware:** the board's version and the one bundled with this add-on, with buttons to update to it or
   to a `.bin` you choose (see below).
 - The pill at the top right sums up the state: Moonraker offline, Klipper starting or shut down, PolyDye not

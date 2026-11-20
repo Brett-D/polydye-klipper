@@ -227,10 +227,32 @@
 
     <section class="card">
       <h2>Signal check <span class="sub">cartridge out, multimeter</span></h2>
-      <p class="hint">Finds where each cartridge signal arrives, to check the chain from the daughter board through
-        the FFC and the interface board to the cartridge pads. The page holds one line HIGH at a time; it should
-        read its rail voltage at exactly one pogo pin and about 0 V everywhere else.</p>
-      <ol class="steps">
+      <p class="hint">Finds where each cartridge signal arrives. The page holds one line HIGH at a time; it should read
+        its rail voltage at exactly one point and about 0 V at the others. Probe where you can reach: the CD4504
+        output legs on the daughter board check the board's own wiring and level shifting; the pogo pins' solder
+        joints on the interface board check the whole chain to the cartridge pads.</p>
+      <div class="buttons">
+        <label class="check">Probe at
+          <select id="sig-layout">
+            <option value="legs">CD4504 output legs (daughter board)</option>
+            <option value="pogo">pogo pin joints (interface board)</option>
+          </select>
+        </label>
+      </div>
+      <ol class="steps sig-legs">
+        <li><b>Keep the cartridge out</b> for the whole check.</li>
+        <li><b>Meter</b> on DC volts, black lead on pin 8 (GND) of either CD4504 on the daughter board.</li>
+        <li><b>The chips:</b> U2, next to the power JST, carries S1&ndash;S5 and DCLK on the high rail; U1, next to the
+          ribbon header, carries D1&ndash;D3 and CSYNC on the low rail. Pin 1 is at the dot or notch; pins 1&ndash;8 run
+          down one side and 9&ndash;16 back up the other. The outputs are U2 legs 2, 4, 6, 10, 12 and 15, and U1 legs 4,
+          6, 10 and 12.</li>
+        <li><b>Start</b> turns the boost on in dry run (nothing fires). Then press <b>High</b> on a signal, find the leg
+          that reads the expected voltage, and note it (for example U2 4). The expected leg comes from the schematic
+          draft and isn't verified yet: note what you actually find. A line goes back to LOW after 5 minutes by
+          itself.</li>
+        <li><b>Finish</b> puts every line LOW and the boost off. Then save the results.</li>
+      </ol>
+      <ol class="steps sig-pogo">
         <li><b>Keep the cartridge out</b> for the whole check.</li>
         <li><b>Power off.</b> Slide the interface board out of the holder with its FFC still connected, and lay it
           face down, so the pogo pins' solder joints on its back face up. Power on again.</li>
@@ -249,10 +271,10 @@
         <span id="sig-state" class="v"></span>
       </div>
       <table class="table">
-        <thead><tr><th>Signal</th><th></th><th>Expect at its joint</th><th>Cartridge pad (contact side, Sprite_tm's photo)</th>
-          <th>Joint / pogo found</th><th>Reading (V)</th></tr></thead>
+        <thead id="sig-head"></thead>
         <tbody id="sig-rows"></tbody>
       </table>
+      <div class="sig-pogo">
       <h3>Fire lines and ground <span class="sub">power off, continuity</span></h3>
       <p class="hint">PWRA and PWRB carry the nozzle heater pulses and are never held on. Turn the power off and set
         the meter to continuity. Beep from the drain of the AO3401 (marked &ldquo;3401&rdquo;) in each pulse limiter
@@ -263,6 +285,7 @@
         <thead><tr><th>Signal</th><th>Beep from</th><th>Cartridge pad</th><th>Joint / pogo found</th><th>Beeps?</th></tr></thead>
         <tbody id="sig-power-rows"></tbody>
       </table>
+      </div>
       <div class="buttons">
         <button id="sig-save" class="primary">Save results to polydye_signal_check.txt</button>
         <button id="sig-clear">Clear results</button>
