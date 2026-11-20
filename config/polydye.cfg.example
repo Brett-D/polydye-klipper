@@ -5,8 +5,8 @@
 # Required; they depend on the cartridge mount. These are the nominal values (+/-5 mm) for the PolyDye mount with
 # the cartridge right of a Sprite extruder, printing along Y. Calibrate them before printing with ink.
 pass_axis: y
-offset_x: 62.6
-offset_y: -20.2
+offset_x: 58.6
+offset_y: -8.7
 #dpi: 600
 #pass_speed: 50
 #travel_speed: 150

@@ -129,8 +129,8 @@ Your `polydye.cfg`:
 [polydye]
 # Required. They depend on how the cartridge is mounted; measure, then calibrate.
 pass_axis: y          # x or y: the axis the cartridge moves along while printing
-offset_x: 62.6        # cartridge nozzle-row centre minus hotend nozzle, mm (bed coordinates)
-offset_y: -20.2
+offset_x: 58.6        # cartridge nozzle-row centre minus hotend nozzle, mm (bed coordinates)
+offset_y: -8.7
 # Optional:
 #dpi: 600             # dots per inch along the pass
 #pass_speed: 50       # mm/s
@@ -143,9 +143,10 @@ offset_y: -20.2
 ```
 
 The template has the nominal values (±5 mm) for the PolyDye mount on an Ender 3 with a Sprite extruder: the
-cartridge sits right of the Sprite (BLTouch between them) and prints along Y. With these offsets the cartridge can
-ink bed X 63–220 and Y 0–215. Other mounts need their own values; measure from the hotend nozzle to the centre of
-the cartridge's nozzles, negative Y if the cartridge is in front.
+carrier bolts to the four side holes of the Sprite's motor, the cartridge sits right of the hotend and prints along
+Y, and the BLTouch stays in its stock position. With these offsets the cartridge can ink bed X 59–229 and Y 0–199
+of the 229 × 208 mm print area. Other mounts need their own values; measure from the hotend nozzle to the centre
+of the cartridge's nozzles, negative Y if the cartridge is in front.
 
 On a bed-slinger such as the Ender 3, Y moves the bed, so Y passes shake it. Configure an `[input_shaper]` for
 the pass axis, and the run-up will include its settle time automatically.
@@ -197,7 +198,7 @@ Macros (Mainsail's Macros panel, while the board is plugged in):
 | `PD_STATUS` | `POLYDYE_STATUS` |
 | `PD_DRY_RUN_TEST [X=100] [Y=40]` | Homes if needed, lifts Z to 20 mm, uploads a test pass and prints it in both directions without ink, then reports status. The printer moves; nothing fires |
 | `PD_OFF` | Drops queued passes, then turns live output and the boost off |
-| `POLYDYE_WIPE [X=245] [LENGTH=25] [STROKES=3] [SPEED=50] [Z_HOP=1]` | Wipes the cartridge on a damp sponge at the right end of the X gantry: lifts Z by `Z_HOP`, moves to `X` (G-code coordinates; 245 suits the PolyDye mount: the nozzles first touch the sponge at about X 231, outside a 229 mm print area), strokes `STROKES` times between `X` and `X - LENGTH` at `SPEED` mm/s, then returns. It refuses an `X` at or beyond the X axis maximum (your hard stop) before homing or moving. Homes first if needed |
+| `POLYDYE_WIPE [X=245] [LENGTH=25] [STROKES=3] [SPEED=50] [Z_HOP=1]` | Wipes the cartridge on a damp sponge at the right end of the X gantry: lifts Z by `Z_HOP`, moves to `X` (G-code coordinates; 245 suits the PolyDye mount and keeps clear of the parts at the end of the gantry), strokes `STROKES` times between `X` and `X - LENGTH` at `SPEED` mm/s, then returns. It refuses an `X` at or beyond the X axis maximum (your hard stop) before homing or moving. Homes first if needed |
 
 The macros are loaded before `polydye.cfg`, so you can change their defaults there instead of editing the add-on
 (which would stop Mainsail updating it):
