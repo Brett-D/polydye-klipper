@@ -203,6 +203,9 @@ function render() {
   text('s-late', known ? `${pd.late_max_us.toFixed(1)} µs` : '–');
   text('s-store', known ? pd.store_count : '–');
   text('s-free', known ? `${Math.round(pd.store_free / 1024)} kB` : '–');
+  text('s-tpl', known ? (pd.cartridge_template || 'unknown: update the board firmware') : '–');
+  text('s-pulse', known && pd.pulse_words ? `${pd.pulse_words} words, ${pd.pulse_us} µs` : '–');
+  renderNudges(pd);
   // Idle-only controls also wait for a firmware update: the dry run uses the same data port. Off stays available.
   document.querySelectorAll('.needs-board').forEach((b) => {
     b.disabled = !state.board || (b.classList.contains('needs-idle') && (printing || state.fw.updating));
@@ -301,7 +304,9 @@ $('fw-file').addEventListener('change', async (ev) => {
 
 // ---- settings: edit the [polydye] section of polydye.cfg ------------------------------------------------------
 
-const FIELDS = ['pass_axis', 'offset_x', 'offset_y', 'dpi', 'pass_speed'];
+const FIELDS = ['pass_axis', 'offset_x', 'offset_y', 'direction_trim', 'cartridge_template', 'pulse_words', 'dpi',
+  'pass_speed'];
+const NUDGED = ['offset_x', 'offset_y', 'direction_trim'];
 let cfgText = '';
 
 function sectionRange(lines) {
@@ -318,45 +323,74 @@ function keyRegex(key) {
   return new RegExp(`^(\\s*)(#\\s*)?${key}\\s*[:=]\\s*([^#]*?)\\s*(#.*)?$`);
 }
 
+// The value of an active (uncommented) setting in the [polydye] section, or null.
+function cfgValue(textIn, key) {
+  const lines = textIn.split('\n');
+  const range = sectionRange(lines);
+  if (!range) return null;
+  for (let i = range[0] + 1; i < range[1]; i++) {
+    const m = lines[i].match(keyRegex(key));
+    if (m && !m[2]) return m[3];
+  }
+  return null;
+}
+
+async function readCfg() {
+  const r = await fetch('/server/files/config/polydye.cfg', { cache: 'no-store' });
+  if (!r.ok) throw new Error(`polydye.cfg: HTTP ${r.status}`);
+  return r.text();
+}
+
+async function fetchCfg() {
+  cfgText = await readCfg();
+  return cfgText;
+}
+
 async function loadSettings() {
   try {
-    const r = await fetch('/server/files/config/polydye.cfg', { cache: 'no-store' });
-    if (!r.ok) throw new Error(`polydye.cfg: HTTP ${r.status}`);
-    cfgText = await r.text();
+    await fetchCfg();
   } catch (e) {
     log(`! could not read polydye.cfg: ${e.message}`);
     return;
   }
-  const lines = cfgText.split('\n');
-  const range = sectionRange(lines);
-  if (!range) return;
   const form = $('settings');
   for (const key of FIELDS) {
-    for (let i = range[0] + 1; i < range[1]; i++) {
-      const m = lines[i].match(keyRegex(key));
-      if (m && !m[2]) {
-        form.elements[key].value = m[3];
-        break;
-      }
-    }
+    let value = cfgValue(cfgText, key);
+    // Klipper lowercases the template; the dropdown's values are lowercase, so match them or it shows nothing and
+    // the next save would comment the setting out.
+    if (value !== null && key === 'cartridge_template') value = value.toLowerCase();
+    form.elements[key].value = value === null ? '' : value;
   }
+  render();
 }
 
+// values: key -> string to set ('' leaves the line alone) or null to comment the setting out.
 function applySettings(textIn, values) {
   const lines = textIn.split('\n');
   const range = sectionRange(lines);
   if (!range) throw new Error('polydye.cfg has no [polydye] section');
+  const setLine = (h, v, commented) => {
+    lines[h.i] = `${h.m[1]}${commented ? '#' : ''}${h.key}: ${v}${h.m[4] ? `  ${h.m[4]}` : ''}`;
+  };
   for (const [key, value] of Object.entries(values)) {
     if (value === '') continue;
-    let done = false;
-    for (let i = range[0] + 1; i < range[1] && !done; i++) {
+    const hits = [];
+    for (let i = range[0] + 1; i < range[1]; i++) {
       const m = lines[i].match(keyRegex(key));
-      if (m) {
-        lines[i] = `${m[1]}${key}: ${value}${m[4] ? `  ${m[4]}` : ''}`;
-        done = true;
-      }
+      if (m) hits.push({ i, m, key, active: !m[2] });
     }
-    if (!done) {
+    const active = hits.filter((h) => h.active);
+    if (value === null) {
+      active.forEach((h) => setLine(h, h.m[3], true));
+      continue;
+    }
+    // Replace the active setting; reuse a commented-out example only when there is none. Klipper rejects an option
+    // set twice, so any further active copies are commented out.
+    const target = active[0] || hits[0];
+    if (target) {
+      setLine(target, value, false);
+      active.slice(1).forEach((h) => setLine(h, h.m[3], true));
+    } else {
       lines.splice(range[0] + 1, 0, `${key}: ${value}`);
       range[1] += 1;
     }
@@ -364,19 +398,36 @@ function applySettings(textIn, values) {
   return lines.join('\n');
 }
 
+async function uploadCfg(updated) {
+  const body = new FormData();
+  body.append('root', 'config');
+  body.append('file', new Blob([updated], { type: 'text/plain' }), 'polydye.cfg');
+  const r = await fetch('/server/files/upload', { method: 'POST', body });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  cfgText = updated;
+}
+
+// Save and Store each read, merge and upload the whole file; run them one at a time so neither overwrites the other.
+let cfgChain = Promise.resolve();
+function queueCfg(op) {
+  const run = cfgChain.then(op);
+  cfgChain = run.catch(() => {});
+  return run;
+}
+
 $('settings').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const form = ev.target;
-  const values = {};
-  for (const key of FIELDS) values[key] = form.elements[key].value.trim();
   try {
-    const updated = applySettings(cfgText, values);
-    const body = new FormData();
-    body.append('root', 'config');
-    body.append('file', new Blob([updated], { type: 'text/plain' }), 'polydye.cfg');
-    const r = await fetch('/server/files/upload', { method: 'POST', body });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    cfgText = updated;
+    await queueCfg(async () => {
+      // Read the form only now: a Store queued before this Save may just have refreshed the offset inputs.
+      const values = {};
+      for (const key of FIELDS) values[key] = form.elements[key].value.trim();
+      values.cartridge_template = values.cartridge_template || null;
+      values.pulse_words = values.pulse_words || null;
+      // Re-read first: the file may have been edited elsewhere since the page loaded.
+      await uploadCfg(applySettings(await fetchCfg(), values));
+    });
     log('saved polydye.cfg');
     $('restart-btn').classList.remove('hidden');
   } catch (e) {
@@ -392,6 +443,103 @@ $('restart-btn').addEventListener('click', async () => {
   } catch (e) {
     log(`! ${e.message}`);
   }
+});
+
+// ---- ink position nudges: POLYDYE_NUDGE changes Klipper's live values; Store writes them to polydye.cfg -------
+
+let nudgeStep = 0.1;
+const fmtMm = (v) => String(Number(v.toFixed(4)));
+// Nudges and Back to stored values run one after another in click order, and Store waits for them, so it never
+// stores values from before a click.
+let nudgeChain = Promise.resolve();
+function queueNudge(op) {
+  nudgeChain = nudgeChain.then(op).catch((e) => log(`! ${e.message}`));
+  return nudgeChain;
+}
+
+function storedNudged(key, textIn = cfgText) {
+  const raw = cfgValue(textIn, key);
+  const v = parseFloat(raw === null && key === 'direction_trim' ? '0' : raw);
+  return Number.isFinite(v) ? v : null;
+}
+
+function renderNudges(pd) {
+  const axis = (pd.pass_axis || 'y').toUpperCase();
+  $('trim-minus').textContent = `−${axis}`;
+  $('trim-plus').textContent = `+${axis}`;
+  $('trim-minus').title = `Move the ink of reverse passes towards −${axis}`;
+  $('trim-plus').title = `Move the ink of reverse passes towards +${axis}`;
+  for (const [key, id] of [['offset_x', 'n-x'], ['offset_y', 'n-y'], ['direction_trim', 'n-trim']]) {
+    const live = state.board ? pd[key] : undefined;
+    if (typeof live !== 'number') {
+      text(id, '–');
+      continue;
+    }
+    const stored = storedNudged(key);
+    const unsaved = cfgText !== '' && (stored === null || Math.abs(live - stored) > 1e-6);
+    text(id, `${live.toFixed(3)} mm${unsaved ? ' (not stored)' : ''}`, unsaved ? 'on' : '');
+  }
+}
+
+document.querySelectorAll('#nudge-steps button').forEach((b) => {
+  b.addEventListener('click', () => {
+    nudgeStep = parseFloat(b.dataset.step);
+    document.querySelectorAll('#nudge-steps button').forEach((o) => o.classList.toggle('selected', o === b));
+  });
+});
+
+document.querySelectorAll('button[data-nudge]').forEach((b) => {
+  b.addEventListener('click', () => {
+    const script = `POLYDYE_NUDGE ${b.dataset.nudge}=${fmtMm(parseFloat(b.dataset.sign) * nudgeStep)}`;
+    queueNudge(() => gcode(script));
+  });
+});
+
+$('nudge-store').addEventListener('click', async () => {
+  try {
+    await queueCfg(async () => {
+      // Ask Klipper after the last nudge has run: the status subscription may not have caught up yet.
+      await nudgeChain;
+      const r = await rpc('printer.objects.query', { objects: { polydye: NUDGED } });
+      const pd = (r && r.status && r.status.polydye) || {};
+      if (NUDGED.some((k) => typeof pd[k] !== 'number')) throw new Error('Klipper did not report the offsets');
+      // Re-read first: the file may have been edited elsewhere since the page loaded.
+      const current = await fetchCfg();
+      const values = {};
+      for (const key of NUDGED) values[key] = fmtMm(pd[key]);
+      await uploadCfg(applySettings(current, values));
+      log(`stored offset_x ${values.offset_x}, offset_y ${values.offset_y}, direction_trim ${values.direction_trim}`
+        + ' in polydye.cfg');
+      // Only the stored fields: other Settings may hold edits that haven't been saved yet.
+      const form = $('settings');
+      for (const key of NUDGED) form.elements[key].value = values[key];
+      render();
+    });
+  } catch (e) {
+    log(`! store failed: ${e.message}`);
+  }
+});
+
+$('nudge-undo').addEventListener('click', () => {
+  // Take a place in the queue now, so nudges clicked while polydye.cfg loads run after the restore. Read without
+  // touching the page's copy of the file, which Save and Store manage.
+  queueNudge(async () => {
+    let textIn;
+    try {
+      textIn = await readCfg();
+    } catch (e) {
+      log(`! could not read polydye.cfg: ${e.message}`);
+      return;
+    }
+    const x = storedNudged('offset_x', textIn);
+    const y = storedNudged('offset_y', textIn);
+    const trim = storedNudged('direction_trim', textIn);
+    if (x === null || y === null || trim === null) {
+      log('! polydye.cfg has no valid offset_x, offset_y or direction_trim');
+      return;
+    }
+    await gcode(`POLYDYE_OFFSET X=${fmtMm(x)} Y=${fmtMm(y)} TRIM=${fmtMm(trim)}`);
+  });
 });
 
 // ---- controls -------------------------------------------------------------------------------------------------

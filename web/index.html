@@ -37,6 +37,8 @@
         <div><span class="k">Worst column lateness</span><span class="v" id="s-late">&ndash;</span></div>
         <div><span class="k">Stored passes</span><span class="v" id="s-store">&ndash;</span></div>
         <div><span class="k">Free pass memory</span><span class="v" id="s-free">&ndash;</span></div>
+        <div><span class="k">Cartridge template</span><span class="v" id="s-tpl">&ndash;</span></div>
+        <div><span class="k">Fire pulse</span><span class="v" id="s-pulse">&ndash;</span></div>
       </div>
     </section>
 
@@ -61,17 +63,75 @@
         <label>Pass axis
           <select name="pass_axis"><option value="y">Y (bed moves)</option><option value="x">X (toolhead moves)</option></select>
         </label>
-        <label>Cartridge offset X (mm)<input name="offset_x" type="number" step="0.01" required></label>
-        <label>Cartridge offset Y (mm)<input name="offset_y" type="number" step="0.01" required></label>
+        <label>Cartridge offset X (mm)<input name="offset_x" type="number" step="any" required></label>
+        <label>Cartridge offset Y (mm)<input name="offset_y" type="number" step="any" required></label>
+        <label>Direction trim (mm)<input name="direction_trim" type="number" step="any" placeholder="0"></label>
+        <label>Cartridge template
+          <select name="cartridge_template">
+            <option value="">Board default (color_b)</option>
+            <option value="color_a">color_a</option><option value="color_b">color_b</option>
+            <option value="black_a">black_a</option><option value="black_b">black_b</option>
+          </select>
+        </label>
         <label>Resolution (dpi)<input name="dpi" type="number" step="1" min="1" placeholder="600"></label>
         <label>Pass speed (mm/s)<input name="pass_speed" type="number" step="0.1" min="1" placeholder="50"></label>
+        <label>Fire pulse (words of 0.3 µs)<input name="pulse_words" type="number" step="1" min="6" max="12"
+          placeholder="6 (board default)"></label>
         <div class="buttons">
           <button type="submit" class="primary">Save</button>
           <button type="button" id="restart-btn" class="hidden">Restart Klipper to apply</button>
         </div>
         <p class="hint">Offsets are the cartridge nozzle-row centre minus the hotend nozzle, in bed coordinates.
-          Saving edits only the [polydye] section of polydye.cfg; Klipper applies it after a restart.</p>
+          Direction trim moves the ink of reverse passes along the pass axis. The cartridge template is the nozzle
+          waveform: a and b are two variants for each cartridge type, so try both at the nozzle check.
+          A black template needs pass data made for a black cartridge. The fire pulse sets how long each nozzle is
+          heated: longer pulses put more energy into each drop, for when the board's boost voltage is below the
+          cartridge's. Leave it empty for the board's 6 (1.8 µs). Saving edits only the [polydye] section of
+          polydye.cfg; Klipper applies it after a restart.</p>
       </form>
+    </section>
+
+    <section class="card">
+      <h2>Ink position <span class="sub">live nudges</span></h2>
+      <p class="hint">Moves where the ink lands, from the next pass on, without a restart; it also works during a
+        print. Compare the ink with the plastic it should sit on: if the ink is 0.1 mm too far left, press +X with
+        0.1 mm. Reverse passes moves only the passes printed in the reverse direction, to line them up with the
+        forward ones. Nudges are lost at the next Klipper restart unless you press Store.</p>
+      <div class="nudge">
+        <div>
+          <span class="k">Step (mm)</span>
+          <div class="buttons step-btns" id="nudge-steps">
+            <button type="button" data-step="0.02">0.02</button>
+            <button type="button" data-step="0.05">0.05</button>
+            <button type="button" data-step="0.1" class="selected">0.1</button>
+            <button type="button" data-step="0.2">0.2</button>
+            <button type="button" data-step="0.3">0.3</button>
+            <button type="button" data-step="0.4">0.4</button>
+          </div>
+        </div>
+        <div class="pad">
+          <button type="button" class="needs-board up" data-nudge="Y" data-sign="1" title="Move the ink towards +Y">+Y &uarr;</button>
+          <button type="button" class="needs-board left" data-nudge="X" data-sign="-1" title="Move the ink towards -X">&larr; &minus;X</button>
+          <button type="button" class="needs-board right" data-nudge="X" data-sign="1" title="Move the ink towards +X">+X &rarr;</button>
+          <button type="button" class="needs-board down" data-nudge="Y" data-sign="-1" title="Move the ink towards -Y">&minus;Y &darr;</button>
+        </div>
+        <div>
+          <span class="k">Reverse passes</span>
+          <div class="buttons">
+            <button type="button" class="needs-board" data-nudge="TRIM" data-sign="-1" id="trim-minus">&minus;</button>
+            <button type="button" class="needs-board" data-nudge="TRIM" data-sign="1" id="trim-plus">+</button>
+          </div>
+        </div>
+      </div>
+      <div class="grid">
+        <div><span class="k">Offset X</span><span class="v" id="n-x">&ndash;</span></div>
+        <div><span class="k">Offset Y</span><span class="v" id="n-y">&ndash;</span></div>
+        <div><span class="k">Direction trim</span><span class="v" id="n-trim">&ndash;</span></div>
+      </div>
+      <div class="buttons">
+        <button type="button" id="nudge-store" class="primary needs-board">Store in polydye.cfg</button>
+        <button type="button" id="nudge-undo" class="needs-board">Back to stored values</button>
+      </div>
     </section>
 
     <section class="card">
@@ -97,12 +157,12 @@
 
     <section class="card">
       <h2>Calibration</h2>
-      <p class="hint">These steps print real ink, so they need a cartridge in a mounted holder. They will be enabled
-        in a later version.</p>
+      <p class="hint">These steps print real ink, so they need a cartridge in a mounted holder. The printed patterns
+        will come in a later version; the Ink position nudges above already work for lining the ink up by eye.</p>
       <ol class="steps">
-        <li><b>Nozzle check</b>: print every nozzle once to find blocked ones.</li>
-        <li><b>Cartridge offset</b>: print ink marks next to a plastic reference and measure the offset.</li>
-        <li><b>Direction alignment</b>: print in both directions and line the passes up.</li>
+        <li><b>Nozzle check</b>: print every nozzle once to find blocked ones, with both templates (a and b).</li>
+        <li><b>Cartridge offset</b>: print ink marks next to a plastic reference and nudge X and Y until they line up.</li>
+        <li><b>Direction alignment</b>: print in both directions and nudge Reverse passes until the passes line up.</li>
         <li><b>Pulse length</b>: tune the fire pulse for even drops at this board's voltage.</li>
       </ol>
     </section>

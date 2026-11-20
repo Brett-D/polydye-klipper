@@ -47,6 +47,29 @@ class PassGeometry(unittest.TestCase):
         self.assertAlmostEqual(end[0], first[0] - (10 * 0.5 + 2.0))
         self.assertAlmostEqual(end[1], first[1])
 
+    def test_direction_trim_moves_only_reverse_passes_along_the_pass_axis(self):
+        args = (600, 25.4 / 600, 3.0, (-0.2, -77.7), (0, 0, 0, 0))
+        fwd = polydye.pass_geometry('y', 100., 40., 1, *args, trim=0.3)
+        self.assertEqual(fwd, polydye.pass_geometry('y', 100., 40., 1, *args))
+        plain = polydye.pass_geometry('y', 100., 40., -1, *args)
+        rev = polydye.pass_geometry('y', 100., 40., -1, *args, trim=0.3)
+        for p, r in zip(plain, rev):
+            self.assertAlmostEqual(r[0], p[0])
+            self.assertAlmostEqual(r[1], p[1] + 0.3)
+
+
+class Nudge(unittest.TestCase):
+    def test_ink_moves_the_way_of_the_nudge(self):
+        # Ink lands at bed target - configured offset + true offset; the toolhead goes to target - offset.
+        x, y, trim = polydye.nudge_offsets(62.6, -20.2, 0., 0.1, -0.05, 0.)
+        _, first_before, _ = polydye.pass_geometry('y', 100., 40., 1, 10, 0.1, 3., (62.6, -20.2), (0, 0, 0, 0))
+        _, first_after, _ = polydye.pass_geometry('y', 100., 40., 1, 10, 0.1, 3., (x, y), (0, 0, 0, 0))
+        self.assertAlmostEqual(first_after[0] - first_before[0], 0.1)
+        self.assertAlmostEqual(first_after[1] - first_before[1], -0.05)
+
+    def test_trim_and_rounding(self):
+        self.assertEqual(polydye.nudge_offsets(0.1, 0.2, 0.1, -0.2, 0., 0.2), (0.3, 0.2, 0.3))
+
 
 class PeriodTicks(unittest.TestCase):
     def test_fraction(self):
@@ -122,6 +145,29 @@ class StatusPoll(unittest.TestCase):
                 self.assertEqual(pd._status_event(float(t)), t + polydye.STATUS_INTERVAL)
         self.assertEqual(sum(1 for r in logs.records if r.exc_info), 2)    # the first failure, and the first after
         self.assertEqual(sum(1 for r in logs.records if "work again" in r.getMessage()), 1)   # recovering
+
+
+class StatusCommand(unittest.TestCase):
+    def test_answers_while_the_first_background_query_is_in_flight(self):
+        # Just after connecting: the poll's first query is waiting for the board and nothing is cached yet.
+        pd = object.__new__(polydye.PolyDye)
+        pd.querying, pd.last_status, pd.oid = True, {}, 0
+
+        def pause(waketime):
+            pd.querying = False     # the background query finishes
+        reactor = types.SimpleNamespace(monotonic=lambda: 0., pause=pause)
+        pd.printer = types.SimpleNamespace(get_reactor=lambda: reactor)
+        pd.mcu = types.SimpleNamespace(get_constant_float=lambda name: 10e6)
+        status = {'flags': polydye.FLAG_BOOST, 'queued': 0, 'passes': 3, 'late_max': 100, 'faults': 0,
+                  'store_count': 1, 'store_free': 4096}
+        pd.query_cmd = types.SimpleNamespace(send=lambda args: status)
+        pd.query_cartridge_cmd = types.SimpleNamespace(send=lambda args: {'template': 0, 'pulse': 8})
+        pd.pass_axis, pd.offset_x, pd.offset_y, pd.direction_trim, pd.dpi, pd.pass_speed = 'y', 1., 2., 0., 600., 50.
+        replies = []
+        pd.cmd_POLYDYE_STATUS(types.SimpleNamespace(respond_info=replies.append))
+        self.assertIn("boost=1", replies[0])
+        self.assertIn("passes=3", replies[0])
+        self.assertIn("color_a", replies[0])
 
 
 if __name__ == "__main__":

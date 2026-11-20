@@ -49,6 +49,15 @@ pre#log { margin: 0; max-height: 220px; overflow: auto; white-space: pre-wrap; c
 #fw-progress progress { flex: 0 0 240px; height: 10px; accent-color: var(--accent); }
 #fw-msg.bad { color: var(--bad); }
 #fw-msg.good { color: var(--ok); }
+.nudge { display: flex; flex-wrap: wrap; align-items: center; gap: 24px; margin-bottom: 12px; }
+.step-btns button { padding: 6px 10px; min-width: 52px; }
+button.selected { border-color: var(--accent); background: #17324a; }
+.pad { display: grid; grid-template-columns: repeat(3, 64px); grid-template-rows: repeat(3, 40px); gap: 6px; }
+.pad button { padding: 4px; }
+.pad .up { grid-column: 2; grid-row: 1; }
+.pad .left { grid-column: 1; grid-row: 2; }
+.pad .right { grid-column: 3; grid-row: 2; }
+.pad .down { grid-column: 2; grid-row: 3; }
 .on { color: var(--warn); }
 .live { color: var(--bad); font-weight: 500; }
 .good { color: var(--ok); }
