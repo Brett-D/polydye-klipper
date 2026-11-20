@@ -38,6 +38,7 @@
         <div><span class="k">Stored passes</span><span class="v" id="s-store">&ndash;</span></div>
         <div><span class="k">Free pass memory</span><span class="v" id="s-free">&ndash;</span></div>
         <div><span class="k">Cartridge template</span><span class="v" id="s-tpl">&ndash;</span></div>
+        <div><span class="k">Fire pulse</span><span class="v" id="s-pulse">&ndash;</span></div>
       </div>
     </section>
 
@@ -74,6 +75,8 @@
         </label>
         <label>Resolution (dpi)<input name="dpi" type="number" step="1" min="1" placeholder="600"></label>
         <label>Pass speed (mm/s)<input name="pass_speed" type="number" step="0.1" min="1" placeholder="50"></label>
+        <label>Fire pulse (words of 0.3 µs)<input name="pulse_words" type="number" step="1" min="6" max="12"
+          placeholder="6 (board default)"></label>
         <div class="buttons">
           <button type="submit" class="primary">Save</button>
           <button type="button" id="restart-btn" class="hidden">Restart Klipper to apply</button>
@@ -81,7 +84,9 @@
         <p class="hint">Offsets are the cartridge nozzle-row centre minus the hotend nozzle, in bed coordinates.
           Direction trim moves the ink of reverse passes along the pass axis. The cartridge template is the nozzle
           waveform: a and b are two variants for each cartridge type, so try both at the nozzle check.
-          A black template needs pass data made for a black cartridge. Saving edits only the [polydye] section of
+          A black template needs pass data made for a black cartridge. The fire pulse sets how long each nozzle is
+          heated: longer pulses put more energy into each drop, for when the board's boost voltage is below the
+          cartridge's. Leave it empty for the board's 6 (1.8 µs). Saving edits only the [polydye] section of
           polydye.cfg; Klipper applies it after a restart.</p>
       </form>
     </section>

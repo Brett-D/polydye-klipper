@@ -13,6 +13,8 @@ offset_y: -20.2
 # Nozzle waveform: color_a or color_b for a colour cartridge, black_a or black_b for black. Unset keeps the board's
 # default (color_b). Needs current board firmware.
 #cartridge_template: color_b
+# Fire pulse in words of 0.3 us, 6-12. Unset keeps the board's default, 6 (1.8 us). Longer pulses fire harder.
+#pulse_words: 6
 #dpi: 600
 #pass_speed: 50
 #travel_speed: 150

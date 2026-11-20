@@ -204,6 +204,7 @@ function render() {
   text('s-store', known ? pd.store_count : '–');
   text('s-free', known ? `${Math.round(pd.store_free / 1024)} kB` : '–');
   text('s-tpl', known ? (pd.cartridge_template || 'unknown: update the board firmware') : '–');
+  text('s-pulse', known && pd.pulse_words ? `${pd.pulse_words} words, ${pd.pulse_us} µs` : '–');
   renderNudges(pd);
   // Idle-only controls also wait for a firmware update: the dry run uses the same data port. Off stays available.
   document.querySelectorAll('.needs-board').forEach((b) => {
@@ -303,7 +304,8 @@ $('fw-file').addEventListener('change', async (ev) => {
 
 // ---- settings: edit the [polydye] section of polydye.cfg ------------------------------------------------------
 
-const FIELDS = ['pass_axis', 'offset_x', 'offset_y', 'direction_trim', 'cartridge_template', 'dpi', 'pass_speed'];
+const FIELDS = ['pass_axis', 'offset_x', 'offset_y', 'direction_trim', 'cartridge_template', 'pulse_words', 'dpi',
+  'pass_speed'];
 const NUDGED = ['offset_x', 'offset_y', 'direction_trim'];
 let cfgText = '';
 
@@ -360,19 +362,28 @@ function applySettings(textIn, values) {
   const lines = textIn.split('\n');
   const range = sectionRange(lines);
   if (!range) throw new Error('polydye.cfg has no [polydye] section');
+  const setLine = (h, v, commented) => {
+    lines[h.i] = `${h.m[1]}${commented ? '#' : ''}${h.key}: ${v}${h.m[4] ? `  ${h.m[4]}` : ''}`;
+  };
   for (const [key, value] of Object.entries(values)) {
     if (value === '') continue;
-    let done = false;
-    for (let i = range[0] + 1; i < range[1] && !done; i++) {
+    const hits = [];
+    for (let i = range[0] + 1; i < range[1]; i++) {
       const m = lines[i].match(keyRegex(key));
-      if (m && value === null) {
-        if (!m[2]) lines[i] = `${m[1]}#${key}: ${m[3]}${m[4] ? `  ${m[4]}` : ''}`;
-      } else if (m) {
-        lines[i] = `${m[1]}${key}: ${value}${m[4] ? `  ${m[4]}` : ''}`;
-        done = true;
-      }
+      if (m) hits.push({ i, m, key, active: !m[2] });
     }
-    if (!done && value !== null) {
+    const active = hits.filter((h) => h.active);
+    if (value === null) {
+      active.forEach((h) => setLine(h, h.m[3], true));
+      continue;
+    }
+    // Replace the active setting; reuse a commented-out example only when there is none. Klipper rejects an option
+    // set twice, so any further active copies are commented out.
+    const target = active[0] || hits[0];
+    if (target) {
+      setLine(target, value, false);
+      active.slice(1).forEach((h) => setLine(h, h.m[3], true));
+    } else {
       lines.splice(range[0] + 1, 0, `${key}: ${value}`);
       range[1] += 1;
     }
@@ -395,6 +406,7 @@ $('settings').addEventListener('submit', async (ev) => {
   const values = {};
   for (const key of FIELDS) values[key] = form.elements[key].value.trim();
   values.cartridge_template = values.cartridge_template || null;
+  values.pulse_words = values.pulse_words || null;
   try {
     await uploadCfg(applySettings(cfgText, values));
     log('saved polydye.cfg');
