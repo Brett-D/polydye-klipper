@@ -368,7 +368,19 @@ async function loadSettings() {
     if (value !== null && (key === 'cartridge_template' || key === 'bus_clock')) value = value.toLowerCase();
     form.elements[key].value = value === null ? '' : value;
   }
+  syncPulseMax();
   render();
+}
+
+// Longest pulse within the live-ink limit at a clock: 9 words with ours, 8 with stock.
+function maxPulseWords(clock) {
+  return Math.min(12, Math.floor((PULSE_MAX_US * CLOCK_HZ[clock || 'ours']) / 1e6 + 1e-9));
+}
+
+// The pulse field's maximum follows the clock chosen next to it.
+function syncPulseMax() {
+  const form = $('settings');
+  form.elements.pulse_words.max = String(maxPulseWords(form.elements.bus_clock.value));
 }
 
 // values: key -> string to set ('' leaves the line alone) or null to comment the setting out.
@@ -433,6 +445,13 @@ $('settings').addEventListener('submit', async (ev) => {
       values.cartridge_template = values.cartridge_template || null;
       values.pulse_words = values.pulse_words || null;
       values.bus_clock = values.bus_clock || null;
+      // Klipper refuses to start with a pulse over the limit at the saved clock, so don't save one.
+      const clock = values.bus_clock || 'ours';
+      const words = Number(values.pulse_words);
+      if (values.pulse_words && !pulseOk(words, clock)) {
+        throw new Error(`fire pulse ${words} words is ${pulseUs(words, clock).toFixed(2)} µs with the ${clock} `
+          + `clock; the limit is ${PULSE_MAX_US} µs (at most ${maxPulseWords(clock)} words)`);
+      }
       // Re-read first: the file may have been edited elsewhere since the page loaded.
       await uploadCfg(applySettings(await fetchCfg(), values));
     });
@@ -442,6 +461,8 @@ $('settings').addEventListener('submit', async (ev) => {
     log(`! save failed: ${e.message}`);
   }
 });
+
+$('settings').elements.bus_clock.addEventListener('change', () => syncPulseMax());
 
 $('restart-btn').addEventListener('click', async () => {
   $('restart-btn').classList.add('hidden');
