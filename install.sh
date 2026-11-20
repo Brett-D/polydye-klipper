@@ -88,8 +88,9 @@ fi
 # 5. Plug-in toggle hook on the Klipper service
 DROPIN_DIR="$SYSTEMD_DIR/$KLIPPER_SERVICE.service.d"
 DROPIN="$DROPIN_DIR/polydye.conf"
+# systemd splits unquoted arguments on spaces; quote the directories.
 DROPIN_TEXT="[Service]
-ExecStartPre=-$REPO_DIR/scripts/polydye-toggle.sh $CONFIG_DIR $KLIPPER_DIR"
+ExecStartPre=-$REPO_DIR/scripts/polydye-toggle.sh \"$CONFIG_DIR\" \"$KLIPPER_DIR\""
 if [ "$(cat "$DROPIN" 2>/dev/null)" != "$DROPIN_TEXT" ]; then
     $SUDO mkdir -p "$DROPIN_DIR"
     printf '%s\n' "$DROPIN_TEXT" | $SUDO tee "$DROPIN" > /dev/null

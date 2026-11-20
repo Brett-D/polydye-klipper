@@ -48,15 +48,15 @@ check 'awk "/include polydye-active/{i=NR} /SAVE_CONFIG/{s=NR} END{exit !(i && i
     "include is above SAVE_CONFIG"
 check '[ "$(grep -c "^\[polydye\]$" "$T/config/moonraker.conf")" = 1 ]' "[polydye] added to moonraker.conf once"
 check 'grep -qx "klipper_service: klipper" "$T/config/moonraker.conf"' "[polydye] names the Klipper service for Enable PolyDye"
-check 'grep -q "ExecStartPre=-$REPO/scripts/polydye-toggle.sh $T/config" "$T/systemd/klipper.service.d/polydye.conf"' \
+check 'grep -qF "ExecStartPre=-$REPO/scripts/polydye-toggle.sh \"$T/config\"" "$T/systemd/klipper.service.d/polydye.conf"' \
     "toggle hook installed"
 check 'python3 -c "import json,sys; e=json.load(open(sys.argv[1])); t=[x[\"title\"] for x in e]; \
     sys.exit(not (t.count(\"PolyDye\") == 1 and \"Spoolman\" in t))" "$T/config/.theme/navi.json"' \
     "sidebar entry added once, existing entries kept"
 check '! grep -q "added\|created\|installed\|restored" "$T/install2.log"' "second install changes nothing"
 check '[ ! -e "$T/config/polydye-active.cfg" ]' "no board: PolyDye stays off"
-check 'grep -q "polydye-toggle.sh $T/config $T/klipper$" "$T/systemd/klipper.service.d/polydye.conf"' \
-    "toggle hook passes the Klipper dir"
+check 'grep -qxF "ExecStartPre=-$REPO/scripts/polydye-toggle.sh \"$T/config\" \"$T/klipper\"" \
+    "$T/systemd/klipper.service.d/polydye.conf"' "toggle hook passes both dirs, quoted for systemd"
 
 # The toggle puts back a lost or broken extras link (and Klipper's git exclude), as the Klipper service starts.
 EXTRA="$T/klipper/klippy/extras/polydye.py"
