@@ -449,8 +449,9 @@ $('restart-btn').addEventListener('click', async () => {
 
 let nudgeStep = 0.1;
 const fmtMm = (v) => String(Number(v.toFixed(4)));
-// Nudges and Back to stored values run one after another in click order, and Store waits for them, so it never
-// stores values from before a click.
+// Nudges and Back to stored values run one after another in click order. Store waits for the nudges clicked before
+// it, and Back for the Save/Store clicked before it. Each waits only on earlier clicks, so the two queues can never
+// wait on each other in a circle.
 let nudgeChain = Promise.resolve();
 function queueNudge(op) {
   nudgeChain = nudgeChain.then(op).catch((e) => log(`! ${e.message}`));
@@ -496,10 +497,11 @@ document.querySelectorAll('button[data-nudge]').forEach((b) => {
 });
 
 $('nudge-store').addEventListener('click', async () => {
+  const nudgesBefore = nudgeChain;
   try {
     await queueCfg(async () => {
-      // Ask Klipper after the last nudge has run: the status subscription may not have caught up yet.
-      await nudgeChain;
+      // Ask Klipper after those nudges have run: the status subscription may not have caught up yet.
+      await nudgesBefore;
       const r = await rpc('printer.objects.query', { objects: { polydye: NUDGED } });
       const pd = (r && r.status && r.status.polydye) || {};
       if (NUDGED.some((k) => typeof pd[k] !== 'number')) throw new Error('Klipper did not report the offsets');
@@ -523,7 +525,9 @@ $('nudge-store').addEventListener('click', async () => {
 $('nudge-undo').addEventListener('click', () => {
   // Take a place in the queue now, so nudges clicked while polydye.cfg loads run after the restore. Read without
   // touching the page's copy of the file, which Save and Store manage.
+  const cfgBefore = cfgChain;
   queueNudge(async () => {
+    await cfgBefore;    // a Store still uploading would otherwise be read as the old values
     let textIn;
     try {
       textIn = await readCfg();
