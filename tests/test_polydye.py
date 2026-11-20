@@ -172,14 +172,17 @@ class StatusCommand(unittest.TestCase):
 
 class Stripes(unittest.TestCase):
     def test_parse(self):
-        self.assertEqual(polydye.parse_stripes(polydye.FIRE_TEST_STRIPES_BASIC),
-                         [('color_b', 6, None), ('color_b', 8, None), ('color_b', 10, None), ('color_a', 6, None),
-                          ('color_a', 10, None)])
+        basic = polydye.parse_stripes(polydye.FIRE_TEST_STRIPES_BASIC)
+        self.assertEqual(len(basic), 5)
         matrix = polydye.parse_stripes(polydye.FIRE_TEST_STRIPES)
         self.assertEqual(len(matrix), 8)
         self.assertEqual({(tpl, clock) for tpl, _, clock in matrix},
                          {(tpl, clock) for tpl in ('color_b', 'color_b_late') for clock in ('ours', 'stock')})
-        self.assertEqual({words for _, words, _ in matrix}, {6, 10})
+        # Every default stripe is within the live-ink limit, and the longer ones are the longest allowed.
+        for tpl, words, clock in matrix + basic:
+            self.assertIsNone(polydye.pulse_limit_error(words, clock), (tpl, words, clock))
+        self.assertEqual(max(w for _, w, c in matrix if c == 'ours'), polydye.max_pulse_words('ours'))
+        self.assertEqual(max(w for _, w, c in matrix if c == 'stock'), polydye.max_pulse_words('stock'))
         self.assertEqual(polydye.parse_stripes(" Black_A:12 , color_b_late:8:STOCK"),
                          [('black_a', 12, None), ('color_b_late', 8, 'stock')])
         for bad in ("", "color_c:6", "color_a", "color_a:x", "color_a:5", "color_a:13", "color_a:6:fast",
@@ -189,8 +192,18 @@ class Stripes(unittest.TestCase):
 
     def test_pulse_us_follows_the_clock(self):
         self.assertAlmostEqual(polydye.pulse_us(6, 'ours'), 1.8, places=3)
-        self.assertAlmostEqual(polydye.pulse_us(6, 'stock'), 1.05, places=3)
+        # The stock setup runs at 2.857 MHz on the board (its divider of 1 acts as 2).
+        self.assertAlmostEqual(polydye.pulse_us(6, 'stock'), 2.1, places=3)
+        self.assertAlmostEqual(polydye.pulse_us(12, 'stock'), 4.2, places=3)
         self.assertAlmostEqual(polydye.pulse_us(10, None), 3.0, places=3)
+
+    def test_pulse_limit_is_in_microseconds(self):
+        self.assertEqual((polydye.max_pulse_words('ours'), polydye.max_pulse_words('stock')), (9, 8))
+        self.assertIsNone(polydye.pulse_limit_error(9, None))
+        self.assertIn("2.9 us", polydye.pulse_limit_error(10, 'ours'))
+        self.assertIn("at most 8 words", polydye.pulse_limit_error(9, 'stock'))
+        self.assertAlmostEqual(polydye.pulse_energy_pct(polydye.PULSE_MAX_US), 100., delta=1.)
+        self.assertAlmostEqual(polydye.pulse_energy_pct(4.2), 145., delta=1.)  # pulse 12, stock clock
 
     def test_mid_column(self):
         everything = polydye.color_column(range(112))
@@ -216,6 +229,51 @@ class TestPassData(unittest.TestCase):
         self.assertEqual(polydye.test_pass_data('all', 5), (full * 5, 5))
         with self.assertRaises(ValueError):
             polydye.test_pass_data('stripes', 5)
+
+
+class InitOrder(unittest.TestCase):
+    """The settings sent on every connect never pass through an over-limit combination."""
+
+    def test_order(self):
+        f = polydye.init_pulse_clock
+        self.assertEqual(f(8, 'stock', True), [(8, None), (None, 'stock')])
+        self.assertEqual(f(None, 'stock', True), [(polydye.PULSE_MIN, None), (None, 'stock')])
+        self.assertEqual(f(9, 'ours', True), [(None, 'ours'), (9, None)])
+        self.assertEqual(f(9, None, True), [(None, 'ours'), (9, None)])
+        self.assertEqual(f(None, None, True), [])
+        self.assertEqual(f(9, None, False), [(9, None)])  # board firmware without the clock choice
+
+    def test_no_step_is_over_the_limit_from_any_starting_point(self):
+        for pulse, clock in ((9, 'ours'), (8, 'stock'), (None, 'stock'), (9, None), (6, 'ours')):
+            for start in ((9, 'ours'), (8, 'stock'), (6, 'ours'), (6, 'stock')):
+                words, now = start
+                for step_words, step_clock in polydye.init_pulse_clock(pulse, clock, True):
+                    words = step_words if step_words is not None else words
+                    now = step_clock or now
+                    self.assertIsNone(polydye.pulse_limit_error(words, now), (pulse, clock, start))
+
+
+class SendOrder(unittest.TestCase):
+    """The board refuses any moment where the pulse would be over the limit, so the order of the sends matters."""
+
+    def sends(self, st, name, pulse, clock):
+        pd = object.__new__(polydye.PolyDye)
+        pd.oid, sent = 0, []
+        pd.set_template_cmd = types.SimpleNamespace(send=lambda args: sent.append('template'))
+        pd.set_pulse_cmd = types.SimpleNamespace(send=lambda args: sent.append(('pulse', args[1])))
+        pd.set_clock_cmd = types.SimpleNamespace(send=lambda args: sent.append(('clock', polydye.CLOCKS[args[1]])))
+        pd._send_cartridge(st, name, pulse, clock)
+        return sent
+
+    def test_slower_clock_after_the_pulse_faster_before(self):
+        # ours, 9 words -> stock, 8: 9 words at the stock clock would be 3.15 us.
+        self.assertEqual(self.sends({'cartridge_template': 'color_b', 'bus_clock': 'ours'}, None, 8, 'stock'),
+                         [('pulse', 8), ('clock', 'stock')])
+        # stock, 8 -> ours, 9: 9 words at the stock clock would be 3.15 us.
+        self.assertEqual(self.sends({'cartridge_template': 'color_b', 'bus_clock': 'stock'}, None, 9, 'ours'),
+                         [('clock', 'ours'), ('pulse', 9)])
+        self.assertEqual(self.sends({'cartridge_template': 'color_b', 'bus_clock': 'ours'}, 'color_a', None, None),
+                         ['template'])
 
 
 class FakeBoard:
@@ -289,9 +347,9 @@ class TestCleanup(unittest.TestCase):
     def test_fire_test_error_turns_off_and_restores(self):
         pd, board = self.make(fail_on="POLYDYE_PASS")
         with self.assertRaisesRegex(RuntimeError, "out of range"):
-            pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b_late:10:stock", X=80., Y=60., Z=0.5, SPACING=20.,
+            pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b_late:8:stock", X=80., Y=60., Z=0.5, SPACING=20.,
                                                COLUMNS=600, UPLOAD=1, LAYER=0, PASS=0, PATTERN='mid'))
-        self.assertIn("POLYDYE_CARTRIDGE TEMPLATE=color_b_late PULSE=10 CLOCK=stock", board.sent)
+        self.assertIn("POLYDYE_CARTRIDGE TEMPLATE=color_b_late PULSE=8 CLOCK=stock", board.sent)
         self.assertIn("POLYDYE_UPLOAD_TEST_PASS LAYER=0 PASS=0 COLUMNS=600 PATTERN=mid", board.sent)
         # The G-code state saved before the Z move is restored after the error.
         self.assertLess(board.sent.index("SAVE_GCODE_STATE NAME=pd_fire_test"), board.sent.index("G90\nG1 Z0.500 F900"))
@@ -301,10 +359,10 @@ class TestCleanup(unittest.TestCase):
 
     def test_fire_test_restores_after_success(self):
         pd, board = self.make(fail_on="NOTHING")
-        pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:10,color_b:12", X=80., Y=60., SPACING=20.,
+        pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:7,color_b:9", X=80., Y=60., SPACING=20.,
                                            COLUMNS=600, UPLOAD=1, LAYER=0, PASS=0, PATTERN='all'))
         # A stripe without a clock keeps the clock the test started with.
-        self.assertIn("POLYDYE_CARTRIDGE TEMPLATE=color_b PULSE=12 CLOCK=ours", board.sent)
+        self.assertIn("POLYDYE_CARTRIDGE TEMPLATE=color_b PULSE=9 CLOCK=ours", board.sent)
         passes = [s for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_PASS")]
         self.assertEqual(passes, ["POLYDYE_PASS LAYER=0 PASS=0 X=80.000 Y=60.000 DIR=1",
                                   "POLYDYE_PASS LAYER=0 PASS=0 X=100.000 Y=60.000 DIR=1"])
@@ -317,11 +375,49 @@ class TestCleanup(unittest.TestCase):
             board.print_state = state
             pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append('spit'))
             with self.assertRaisesRegex(RuntimeError, "not during a print"):
-                pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:10", X=80., Y=60., SPACING=20., COLUMNS=600,
+                pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:9", X=80., Y=60., SPACING=20., COLUMNS=600,
                                                    UPLOAD=1, LAYER=0, PASS=0, PATTERN='all'))
             with self.assertRaisesRegex(RuntimeError, "not during a print"):
                 pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., PATTERN='all', CONFIRM=1))
             self.assertEqual(board.sent, [])
+
+    def test_pulses_over_the_limit_are_refused_before_anything_is_sent(self):
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append('spit'))
+        with self.assertRaisesRegex(RuntimeError, "limit is 2.9 us"):
+            pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:6,color_b:9:stock", X=80., Y=60., SPACING=20.,
+                                               COLUMNS=600, UPLOAD=1, LAYER=0, PASS=0, PATTERN='all'))
+        with self.assertRaisesRegex(RuntimeError, "limit is 2.9 us"):
+            pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., PULSE=9, CLOCK='stock', PATTERN='all', CONFIRM=1))  # 3.15 us
+        with self.assertRaisesRegex(RuntimeError, "limit is 2.9 us"):
+            pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., PULSE=10, PATTERN='all', CONFIRM=1))  # 3.0 us at our clock
+        self.assertNotIn('spit', board.sent)
+        self.assertFalse([s for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_PASS")])
+
+    def test_cartridge_refuses_an_over_limit_result_even_if_unchanged(self):
+        # A board left at the stock clock and 9 words (3.15 us) by older firmware: resending it is refused too.
+        pd, board = self.make(fail_on="NOTHING")
+        board.clock, board.pulse = 'stock', 9
+        with self.assertRaisesRegex(RuntimeError, "limit is 2.9 us"):
+            pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(PULSE=9, CLOCK='stock'))
+        self.assertEqual(board.sent, [])
+        pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(PULSE=8))
+        self.assertEqual(board.sent, ['pulse'])
+
+    def test_tests_and_live_ink_refuse_an_over_limit_starting_setting(self):
+        # Older firmware left at stock / 9 words (3.15 us): a test would put it back afterwards, live ink would use it.
+        pd, board = self.make(fail_on="NOTHING")
+        board.clock, board.pulse = 'stock', 9
+        pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append('spit'))
+        pd.mode_cmd = types.SimpleNamespace(send=lambda args: board.sent.append('mode'))
+        with self.assertRaisesRegex(RuntimeError, "PULSE=8"):
+            pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., PULSE=8, PATTERN='all', CONFIRM=1))
+        with self.assertRaisesRegex(RuntimeError, "over-limit pulse"):
+            pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:6", X=80., Y=60., SPACING=20., COLUMNS=600,
+                                               UPLOAD=1, LAYER=0, PASS=0, PATTERN='all'))
+        with self.assertRaisesRegex(RuntimeError, "over-limit pulse"):
+            pd.cmd_POLYDYE_ENABLE(self.gcmd(LIVE=1))
+        self.assertEqual(board.sent, [])
 
     def test_spit_needs_confirm(self):
         pd, board = self.make(fail_on="NOTHING")
@@ -333,9 +429,9 @@ class TestCleanup(unittest.TestCase):
     def test_spit_sends_columns_then_turns_off_and_restores(self):
         pd, board = self.make(fail_on="NOTHING")
         pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append(('spit', args[1], args[2])))
-        pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1.5, PULSE=12, CLOCK='stock', PATTERN='mid', CONFIRM=1))
+        pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1.5, PULSE=7, CLOCK='stock', PATTERN='mid', CONFIRM=1))
         self.assertIn(('spit', 1500, 1), board.sent)
-        self.assertLess(board.sent.index("POLYDYE_CARTRIDGE PULSE=12 CLOCK=stock"), board.sent.index(('mode', 1, 1)))
+        self.assertLess(board.sent.index("POLYDYE_CARTRIDGE PULSE=7 CLOCK=stock"), board.sent.index(('mode', 1, 1)))
         self.assertEqual((board.boost, board.live, board.pulse, board.clock), (False, False, 8, 'ours'))
 
 
