@@ -48,13 +48,31 @@ check 'awk "/include polydye-active/{i=NR} /SAVE_CONFIG/{s=NR} END{exit !(i && i
     "include is above SAVE_CONFIG"
 check '[ "$(grep -c "^\[polydye\]$" "$T/config/moonraker.conf")" = 1 ]' "[polydye] added to moonraker.conf once"
 check 'grep -qx "klipper_service: klipper" "$T/config/moonraker.conf"' "[polydye] names the Klipper service for Enable PolyDye"
-check 'grep -q "ExecStartPre=-$REPO/scripts/polydye-toggle.sh $T/config" "$T/systemd/klipper.service.d/polydye.conf"' \
+check 'grep -qF "ExecStartPre=-$REPO/scripts/polydye-toggle.sh \"$T/config\"" "$T/systemd/klipper.service.d/polydye.conf"' \
     "toggle hook installed"
 check 'python3 -c "import json,sys; e=json.load(open(sys.argv[1])); t=[x[\"title\"] for x in e]; \
     sys.exit(not (t.count(\"PolyDye\") == 1 and \"Spoolman\" in t))" "$T/config/.theme/navi.json"' \
     "sidebar entry added once, existing entries kept"
-check '! grep -q "added\|created\|installed" "$T/install2.log"' "second install changes nothing"
+check '! grep -q "added\|created\|installed\|restored" "$T/install2.log"' "second install changes nothing"
 check '[ ! -e "$T/config/polydye-active.cfg" ]' "no board: PolyDye stays off"
+check 'grep -qxF "ExecStartPre=-$REPO/scripts/polydye-toggle.sh \"$T/config\" \"$T/klipper\"" \
+    "$T/systemd/klipper.service.d/polydye.conf"' "toggle hook passes both dirs, quoted for systemd"
+
+# The toggle puts back a lost or broken extras link (and Klipper's git exclude), as the Klipper service starts.
+EXTRA="$T/klipper/klippy/extras/polydye.py"
+rm "$EXTRA"
+: > "$T/klipper/.git/info/exclude"
+"$REPO/scripts/polydye-toggle.sh" "$T/config" "$T/klipper" > "$T/toggle1.log"
+check '[ "$(readlink "$EXTRA")" = "$REPO/klipper/polydye.py" ] && grep -q restored "$T/toggle1.log"' \
+    "toggle restores a missing extras link"
+check 'grep -qx "klippy/extras/polydye.py" "$T/klipper/.git/info/exclude"' "toggle restores the git exclude"
+ln -sfn "$T/gone/polydye.py" "$EXTRA"
+HOME="$T" "$REPO/scripts/polydye-toggle.sh" "$T/config" > "$T/toggle2.log"
+check '[ "$(readlink "$EXTRA")" = "$REPO/klipper/polydye.py" ]' \
+    "toggle repairs a broken link (Klipper dir defaults to ~/klipper, as with older hooks)"
+"$REPO/scripts/polydye-toggle.sh" "$T/config" "$T/klipper" > "$T/toggle3.log"
+check '! grep -q restored "$T/toggle3.log" && [ "$(grep -c polydye "$T/klipper/.git/info/exclude")" = 1 ]' \
+    "a good link is left alone"
 
 bash "$REPO/uninstall.sh" > /dev/null
 check 'cmp -s "$T/printer.orig" "$T/config/printer.cfg"' "printer.cfg restored byte for byte"

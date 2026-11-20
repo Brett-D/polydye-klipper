@@ -46,6 +46,9 @@ that too. Afterwards `printer.cfg` and `moonraker.conf` are byte-for-byte what t
   `polydye-active.cfg` with `[mcu polydye]`, an include of your `polydye.cfg` and the PolyDye macros. Otherwise it
   deletes that file.
 - A wildcard include that matches nothing is ignored, so without the board Klipper starts exactly as before.
+- It also restores the add-on's link in `~/klipper/klippy/extras` if it has gone missing or broken. A lost link
+  makes Klipper halt with "Section 'polydye' is not a valid config section"; restarting the Klipper service fixes
+  it.
 
 **To switch,** plug or unplug the board's J7 USB, then restart the **Klipper service**: Mainsail's power menu →
 Services → klipper, or `sudo systemctl restart klipper`. `RESTART` and `FIRMWARE_RESTART` don't re-run the script.
