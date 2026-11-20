@@ -147,5 +147,28 @@ class StatusPoll(unittest.TestCase):
         self.assertEqual(sum(1 for r in logs.records if "work again" in r.getMessage()), 1)   # recovering
 
 
+class StatusCommand(unittest.TestCase):
+    def test_answers_while_the_first_background_query_is_in_flight(self):
+        # Just after connecting: the poll's first query is waiting for the board and nothing is cached yet.
+        pd = object.__new__(polydye.PolyDye)
+        pd.querying, pd.last_status, pd.oid = True, {}, 0
+
+        def pause(waketime):
+            pd.querying = False     # the background query finishes
+        reactor = types.SimpleNamespace(monotonic=lambda: 0., pause=pause)
+        pd.printer = types.SimpleNamespace(get_reactor=lambda: reactor)
+        pd.mcu = types.SimpleNamespace(get_constant_float=lambda name: 10e6)
+        status = {'flags': polydye.FLAG_BOOST, 'queued': 0, 'passes': 3, 'late_max': 100, 'faults': 0,
+                  'store_count': 1, 'store_free': 4096}
+        pd.query_cmd = types.SimpleNamespace(send=lambda args: status)
+        pd.query_cartridge_cmd = types.SimpleNamespace(send=lambda args: {'template': 0, 'pulse': 8})
+        pd.pass_axis, pd.offset_x, pd.offset_y, pd.direction_trim, pd.dpi, pd.pass_speed = 'y', 1., 2., 0., 600., 50.
+        replies = []
+        pd.cmd_POLYDYE_STATUS(types.SimpleNamespace(respond_info=replies.append))
+        self.assertIn("boost=1", replies[0])
+        self.assertIn("passes=3", replies[0])
+        self.assertIn("color_a", replies[0])
+
+
 if __name__ == "__main__":
     unittest.main()

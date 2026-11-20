@@ -401,7 +401,9 @@ class PolyDye:
     cmd_POLYDYE_STATUS_help = "Report PolyDye board status"
 
     def cmd_POLYDYE_STATUS(self, gcmd):
-        st = self._query_status()
+        # Fresh, not the cached answer: right after connecting, the first background query may still be in flight
+        # with nothing cached yet.
+        st = self._fresh_status()
         gcmd.respond_info(
             "PolyDye: boost=%d live=%d running=%d queued=%d passes=%d late_max=%.1fus faults=%d"
             " stored_passes=%d store_free=%dkB\n%s\npass_axis=%s offset_x=%.3f offset_y=%.3f"
