@@ -146,6 +146,7 @@ class PolyDye:
         self.last_status = {}
         self.last_pass = None
         self.querying = False
+        self.query_failing = False
         self.status_timer = None
         printer.register_event_handler('klippy:ready', self._handle_ready)
         printer.register_event_handler('klippy:shutdown', self._handle_shutdown)
@@ -181,14 +182,25 @@ class PolyDye:
 
     def _handle_shutdown(self):
         if self.status_timer is not None:
+            logging.info("polydye: Klipper shut down; board status updates stopped until a restart")
             self.printer.get_reactor().update_timer(self.status_timer, self.printer.get_reactor().NEVER)
 
     def _status_event(self, eventtime):
-        if not self.querying:
+        # Klipper ignores update_timer() for a timer whose callback is running. Unplugging the board shuts Klipper down
+        # while a query here is still waiting for the board, so _handle_shutdown can't stop this timer: it has to stop
+        # itself, or it would retry a dead link every STATUS_INTERVAL until the next restart.
+        if not self.printer.is_shutdown() and not self.querying:
             try:
                 self._query_status()
+                if self.query_failing:
+                    logging.info("polydye: status queries work again")
+                self.query_failing = False
             except Exception:
-                logging.exception("polydye: status query failed")
+                if not self.printer.is_shutdown() and not self.query_failing:
+                    logging.exception("polydye: status query failed (not logged again until one succeeds)")
+                self.query_failing = True
+        if self.printer.is_shutdown():
+            return self.printer.get_reactor().NEVER
         return eventtime + STATUS_INTERVAL
 
     def _query_status(self):
