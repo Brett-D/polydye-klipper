@@ -572,6 +572,12 @@ const SIG_POWER = [
 const SIG_KEY = 'polydye-signal-check';
 const SPIT_HZ = 1000;
 const CLOCK_HZ = { ours: 3333333, stock: 5714285 };  // nominal bus rates: one word of fire pulse = 1 / rate
+// Fire test defaults, like POLYDYE_FIRE_TEST's: the A/B matrix of our timing and the stock firmware's, or, for board
+// firmware without the stock options, five template/pulse pairs. Used until the stripes are edited.
+const FIRE_STRIPES = 'color_b:6:ours,color_b_late:6:ours,color_b:6:stock,color_b_late:6:stock,'
+  + 'color_b:10:ours,color_b_late:10:ours,color_b:10:stock,color_b_late:10:stock';
+const FIRE_STRIPES_BASIC = 'color_b:6,color_b:8,color_b:10,color_a:6,color_a:10';
+let fireStripesEdited = false;
 
 function expectText(line) {
   return LOW_RAIL.includes(line) ? 'about 7.6 V (low rail, the reference design\'s 9 V)'
@@ -757,7 +763,10 @@ function renderFireLegend(axis) {
   });
 }
 
-$('fire-form').addEventListener('input', () => renderFireLegend((state.printer.polydye || {}).pass_axis));
+$('fire-form').addEventListener('input', (ev) => {
+  if (ev.target.name === 'stripes') fireStripesEdited = true;
+  renderFireLegend((state.printer.polydye || {}).pass_axis);
+});
 $('fire-form').addEventListener('submit', (ev) => ev.preventDefault());
 $('spit-form').addEventListener('submit', (ev) => ev.preventDefault());
 
@@ -790,6 +799,10 @@ function renderDiagnostics(pd, printing) {
   const diag = known && 'level' in pd;  // board firmware with the signal check and the spit test
   const busy = printing || state.fw.updating || !!pd.running || !!pd.queued;
   $('diag-old').classList.toggle('hidden', !known || diag);
+  // Stripes the board can print, until the user types their own.
+  if (known && !fireStripesEdited) {
+    $('fire-form').elements.stripes.value = 'bus_clock' in pd ? FIRE_STRIPES : FIRE_STRIPES_BASIC;
+  }
   $('fire-btn').disabled = !known || !pd.cartridge_template || busy || !fireValues().valid;
   $('spit-btn').disabled = !diag || busy;
   const cartOut = $('sig-cart-out').checked;
