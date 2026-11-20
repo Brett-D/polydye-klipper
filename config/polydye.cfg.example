@@ -5,8 +5,8 @@
 # Required; they depend on the cartridge mount. These are the nominal values (+/-5 mm) for the PolyDye mount with
 # the cartridge right of a Sprite extruder, printing along Y. Calibrate them before printing with ink.
 pass_axis: y
-offset_x: 62.6
-offset_y: -20.2
+offset_x: 58.6
+offset_y: -8.7
 # Moves the ink of reverse passes along the pass axis to line them up with forward passes (mm). The PolyDye page's
 # Ink position nudges set this and the offsets live; Store writes them here.
 #direction_trim: 0
