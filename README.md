@@ -50,6 +50,11 @@ that too. Afterwards `printer.cfg` and `moonraker.conf` are byte-for-byte what t
 **To switch,** plug or unplug the board's J7 USB, then restart the **Klipper service**: Mainsail's power menu →
 Services → klipper, or `sudo systemctl restart klipper`. `RESTART` and `FIRMWARE_RESTART` don't re-run the script.
 
+**Unplugging while Klipper runs** shuts Klipper down ("Lost communication with MCU 'polydye'"), as with any MCU. The
+board's status updates stop there. Plug the board back in and use `FIRMWARE_RESTART`. Without the board,
+`FIRMWARE_RESTART` waits for it (Klipper shows "startup") and gives up with an error after about 90 s. To carry
+on without PolyDye, restart the Klipper service instead.
+
 ### Hardware notes
 
 - Power the board from its own supply (J4). J7 carries data only: its 5 V pin isn't tied to the board's 5 V
@@ -111,10 +116,16 @@ python3 ~/polydye-klipper/scripts/polydye_upload.py firmware ~/polydye-klipper/f
 ```
 [mcu polydye]
 serial: /dev/serial/by-id/usb-PolyDye_PolyDye_ink_controller_<MAC>-if00
+restart_method: command
 
 [include /home/<user>/polydye-klipper/config/polydye_macros.cfg]
 [include polydye.cfg]
 ```
+
+`restart_method: command` makes `FIRMWARE_RESTART` reboot the board with Klipper's reset command. Klipper picks
+that by itself once it has talked to the board. Without the option, a `FIRMWARE_RESTART` while the board is missing
+would try an Arduino-style reset on its absent port. That fails, and Moonraker is left talking to a Klipper that
+no longer answers until the Klipper service restarts.
 
 Your `polydye.cfg`:
 

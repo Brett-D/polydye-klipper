@@ -103,5 +103,49 @@ class ShaperDuration(unittest.TestCase):
         self.assertTrue(math.isclose(polydye.shaper_duration(printer, 'x'), .01))
 
 
+class StatusPoll(unittest.TestCase):
+    """PolyDye._status_event, the background query that keeps printer.polydye current."""
+
+    def make(self, query):
+        pd = object.__new__(polydye.PolyDye)
+        reactor = types.SimpleNamespace(NEVER=9e99)
+        state = {'shutdown': False}
+        pd.printer = types.SimpleNamespace(is_shutdown=lambda: state['shutdown'], get_reactor=lambda: reactor)
+        pd.querying = pd.query_failing = False
+        pd._query_status = lambda: query(state)
+        return pd, state, reactor
+
+    def test_unplugging_mid_query_stops_the_poll_without_a_traceback(self):
+        # The board is unplugged while a query waits for it: Klipper shuts down, then the query fails.
+        def query(state):
+            state['shutdown'] = True
+            raise RuntimeError("mcu 'polydye': No communication with MCU")
+        pd, _, reactor = self.make(query)
+        with self.assertNoLogs(level='INFO'):
+            self.assertEqual(pd._status_event(100.), reactor.NEVER)
+
+    def test_no_query_once_shut_down(self):
+        calls = []
+        pd, state, reactor = self.make(lambda s: calls.append(1))
+        state['shutdown'] = True
+        self.assertEqual(pd._status_event(100.), reactor.NEVER)
+        self.assertEqual(calls, [])
+
+    def test_failures_log_one_traceback_until_a_query_succeeds(self):
+        results = [RuntimeError("timeout"), RuntimeError("timeout"), RuntimeError("timeout"), None,
+                   RuntimeError("timeout")]
+
+        def query(state):
+            r = results.pop(0)
+            if r is not None:
+                raise r
+        pd, _, _ = self.make(query)
+        with self.assertLogs(level='INFO') as logs:
+            for t in range(5):
+                self.assertEqual(pd._status_event(float(t)), t + polydye.STATUS_INTERVAL)
+        self.assertEqual(sum(1 for r in logs.records if r.exc_info), 2)    # the first failure, and the first after
+        self.assertEqual(sum(1 for r in logs.records if "work again" in r.getMessage()), 1)   # recovering
+
+
 if __name__ == "__main__":
     unittest.main()
