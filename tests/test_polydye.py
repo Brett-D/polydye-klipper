@@ -231,6 +231,28 @@ class TestPassData(unittest.TestCase):
             polydye.test_pass_data('stripes', 5)
 
 
+class InitOrder(unittest.TestCase):
+    """The settings sent on every connect never pass through an over-limit combination."""
+
+    def test_order(self):
+        f = polydye.init_pulse_clock
+        self.assertEqual(f(8, 'stock', True), [(8, None), (None, 'stock')])
+        self.assertEqual(f(None, 'stock', True), [(polydye.PULSE_MIN, None), (None, 'stock')])
+        self.assertEqual(f(9, 'ours', True), [(None, 'ours'), (9, None)])
+        self.assertEqual(f(9, None, True), [(None, 'ours'), (9, None)])
+        self.assertEqual(f(None, None, True), [])
+        self.assertEqual(f(9, None, False), [(9, None)])  # board firmware without the clock choice
+
+    def test_no_step_is_over_the_limit_from_any_starting_point(self):
+        for pulse, clock in ((9, 'ours'), (8, 'stock'), (None, 'stock'), (9, None), (6, 'ours')):
+            for start in ((9, 'ours'), (8, 'stock'), (6, 'ours'), (6, 'stock')):
+                words, now = start
+                for step_words, step_clock in polydye.init_pulse_clock(pulse, clock, True):
+                    words = step_words if step_words is not None else words
+                    now = step_clock or now
+                    self.assertIsNone(polydye.pulse_limit_error(words, now), (pulse, clock, start))
+
+
 class SendOrder(unittest.TestCase):
     """The board refuses any moment where the pulse would be over the limit, so the order of the sends matters."""
 

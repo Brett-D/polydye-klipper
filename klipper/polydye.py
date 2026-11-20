@@ -265,6 +265,23 @@ def test_pass_data(pattern, columns, repeat=1):
     return b"".join(col * repeat for col in cols), columns * repeat
 
 
+def init_pulse_clock(pulse_words, bus_clock, has_clock):
+    """The pulse and clock settings to send on connect, as (words, None) / (None, clock) steps in order.
+
+    The board refuses any moment where the pulse would be over the limit, and after a Klipper RESTART it still has the
+    previous pulse and clock. The slower stock clock goes after a pulse that's within the limit there; our clock goes
+    first, since a pulse within the limit at the stock clock is within it at ours. With pulse_words but no bus_clock,
+    the clock goes back to ours (the board's default) so the pulse is checked against the clock it was set for.
+    """
+    clock = (bus_clock or ('ours' if pulse_words is not None else None)) if has_clock else None
+    if clock == 'stock':
+        return [(pulse_words or PULSE_MIN, None), (None, 'stock')]
+    steps = [(None, 'ours')] if clock == 'ours' else []
+    if pulse_words is not None:
+        steps.append((pulse_words, None))
+    return steps
+
+
 def nudge_offsets(offset_x, offset_y, trim, dx, dy, dtrim):
     """New (offset_x, offset_y, direction_trim) after moving the ink by (dx, dy) on the bed and reverse passes by
     dtrim along the pass axis.
@@ -368,9 +385,6 @@ class PolyDye:
             self.set_clock_cmd = self.mcu.lookup_command("polydye_set_clock oid=%c stock=%c", cq=cq)
             self.query_clock_cmd = self.mcu.lookup_query_command("polydye_query_clock oid=%c", CLOCK, oid=self.oid,
                                                                  cq=cq)
-            if self.bus_clock is not None:
-                self.mcu.add_config_cmd("polydye_set_clock oid=%d stock=%d" % (self.oid, CLOCKS.index(self.bus_clock)),
-                                        is_init=True)
         else:
             for option, value in (('cartridge_template', self.cartridge_template in NEW_TEMPLATES),
                                   ('bus_clock', self.bus_clock is not None)):
@@ -394,8 +408,12 @@ class PolyDye:
         if self.cartridge_template is not None:
             self.mcu.add_config_cmd("polydye_set_template oid=%d template=%d"
                                     % (self.oid, TEMPLATES.index(self.cartridge_template)), is_init=True)
-        if self.pulse_words is not None:
-            self.mcu.add_config_cmd("polydye_set_pulse oid=%d words=%d" % (self.oid, self.pulse_words), is_init=True)
+        for words, clock in init_pulse_clock(self.pulse_words, self.bus_clock, self.set_clock_cmd is not None):
+            if words is not None:
+                self.mcu.add_config_cmd("polydye_set_pulse oid=%d words=%d" % (self.oid, words), is_init=True)
+            else:
+                self.mcu.add_config_cmd("polydye_set_clock oid=%d stock=%d" % (self.oid, CLOCKS.index(clock)),
+                                        is_init=True)
 
     def _settle(self):
         if self.settle_time is not None:
