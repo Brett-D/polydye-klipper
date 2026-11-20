@@ -382,6 +382,21 @@ class TestCleanup(unittest.TestCase):
         pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(PULSE=8))
         self.assertEqual(board.sent, ['pulse'])
 
+    def test_tests_and_live_ink_refuse_an_over_limit_starting_setting(self):
+        # Older firmware left at stock / 9 words (3.15 us): a test would put it back afterwards, live ink would use it.
+        pd, board = self.make(fail_on="NOTHING")
+        board.clock, board.pulse = 'stock', 9
+        pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append('spit'))
+        pd.mode_cmd = types.SimpleNamespace(send=lambda args: board.sent.append('mode'))
+        with self.assertRaisesRegex(RuntimeError, "PULSE=8"):
+            pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., PULSE=8, PATTERN='all', CONFIRM=1))
+        with self.assertRaisesRegex(RuntimeError, "over-limit pulse"):
+            pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:6", X=80., Y=60., SPACING=20., COLUMNS=600,
+                                               UPLOAD=1, LAYER=0, PASS=0, PATTERN='all'))
+        with self.assertRaisesRegex(RuntimeError, "over-limit pulse"):
+            pd.cmd_POLYDYE_ENABLE(self.gcmd(LIVE=1))
+        self.assertEqual(board.sent, [])
+
     def test_spit_needs_confirm(self):
         pd, board = self.make(fail_on="NOTHING")
         pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append(('spit', args[1], args[2])))

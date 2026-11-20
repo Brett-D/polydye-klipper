@@ -561,9 +561,22 @@ class PolyDye:
 
     cmd_POLYDYE_ENABLE_help = "Turn on the PolyDye boost (LIVE=1 also allows real ink; LIVE=0 is a dry run)"
 
+    def _check_current_pulse(self, gcmd, name, st):
+        """Refuses to go on from a board whose current pulse and clock are over the limit (older firmware doesn't
+        stop that combination), so live ink never uses it and a test can't put it back afterwards."""
+        if st.get('pulse_words') is not None and pulse_limit_error(st['pulse_words'], st.get('bus_clock')):
+            clock = st.get('bus_clock') or 'ours'
+            raise gcmd.error("%s: the board is set to an over-limit pulse: %s. Set a shorter one first, e.g. "
+                             "POLYDYE_CARTRIDGE PULSE=%d" % (name, pulse_limit_error(st['pulse_words'], clock),
+                                                             max_pulse_words(clock)))
+
     def cmd_POLYDYE_ENABLE(self, gcmd):
         live = gcmd.get_int('LIVE', 1, minval=0, maxval=1)
-        boost_was_on = self._fresh_status()['boost'] if live else True
+        boost_was_on = True
+        if live:
+            st = self._fresh_status()
+            self._check_current_pulse(gcmd, "POLYDYE_ENABLE", st)
+            boost_was_on = st['boost']
         self.mode_cmd.send([self.oid, 1, live])
         if not boost_was_on:
             # The rails need a moment after the boost turns on, and the board refuses live ink that comes sooner:
@@ -821,6 +834,7 @@ class PolyDye:
         st = self._fresh_status()
         if st['running'] or st['queued']:
             raise gcmd.error("POLYDYE_FIRE_TEST: wait for queued passes to finish")
+        self._check_current_pulse(gcmd, "POLYDYE_FIRE_TEST", st)
         before = (st['cartridge_template'], st['pulse_words'], st.get('bus_clock'))
         stripes = [(tpl, words, clock or before[2]) for tpl, words, clock in stripes]
         for tpl, words, clock in stripes:
@@ -894,6 +908,7 @@ class PolyDye:
         st = self._fresh_status()
         if st['running'] or st['queued']:
             raise gcmd.error("POLYDYE_SPIT: wait for queued passes to finish")
+        self._check_current_pulse(gcmd, "POLYDYE_SPIT", st)
         before = (st['cartridge_template'], st['pulse_words'], st.get('bus_clock'))
         limit = pulse_limit_error(pulse if pulse is not None else st['pulse_words'], clock or before[2])
         if limit:
