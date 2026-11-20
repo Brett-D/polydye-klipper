@@ -61,3 +61,15 @@ button.selected { border-color: var(--accent); background: #17324a; }
 .on { color: var(--warn); }
 .live { color: var(--bad); font-weight: 500; }
 .good { color: var(--ok); }
+.card h3 { margin: 18px 0 8px; font-size: 14px; font-weight: 500; }
+.card h3 .sub { color: var(--muted); font-size: 12px; font-weight: 400; margin-left: 6px; }
+form.compact { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); margin-bottom: 8px; }
+form.compact .wide { grid-column: 1 / -1; }
+.table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 13px; }
+.table th { text-align: left; color: var(--muted); font-weight: 400; font-size: 12px; }
+.table th, .table td { padding: 5px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.table input, .table select { width: 100%; min-width: 70px; padding: 4px 6px; }
+.table button { padding: 4px 10px; }
+.table tr.held td { background: #2a2116; }
+.pads b { color: var(--warn); }
+label.check { flex-direction: row; align-items: center; gap: 6px; font-size: 14px; color: var(--text); }

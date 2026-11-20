@@ -107,5 +107,25 @@ class Wipe(unittest.TestCase):
         self.assertIn("G1 X220.0 F1200.0", lines)
 
 
+@unittest.skipUnless(jinja2, "needs jinja2 (part of klippy's environment)")
+class FireTest(unittest.TestCase):
+    def setUp(self):
+        self.macros = load_macros()
+
+    def test_homes_only_when_needed_then_sets_z_and_passes_the_stripes(self):
+        lines = run(self.macros, "PD_FIRE_TEST", "X=90 STRIPES=color_a:6,color_b:10", homed="")
+        self.assertEqual(lines, ["G28", "SAVE_GCODE_STATE NAME=pd_fire_test", "G90", "G1 Z0.5 F900",
+                                 "POLYDYE_FIRE_TEST X=90.0 Y=60.0 SPACING=20.0 STRIPES=color_a:6,color_b:10",
+                                 "RESTORE_GCODE_STATE NAME=pd_fire_test"])
+        lines = run(self.macros, "PD_FIRE_TEST", homed="xyz")
+        self.assertNotIn("G28", lines)
+        self.assertIn("POLYDYE_FIRE_TEST X=80.0 Y=60.0 SPACING=20.0 "
+                      "STRIPES=color_b:6,color_b:8,color_b:10,color_a:6,color_a:10", lines)
+
+    def test_refuses_z_below_0_2(self):
+        with self.assertRaisesRegex(MacroError, "Z must be"):
+            run(self.macros, "PD_FIRE_TEST", "Z=0")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -81,8 +81,17 @@ does. It shows:
   ink ±X or ±Y, or move only the reverse passes along the pass axis (direction trim). Nudges apply from the next
   pass, also during a print, with no restart. Values not yet in `polydye.cfg` show "not stored". **Store** writes
   them into `polydye.cfg` and **Back to stored values** undoes the nudges.
-- **Calibration:** nozzle check, cartridge offset, direction alignment and pulse length. The printed patterns need
-  ink and are not enabled yet; the Ink position nudges already work.
+- **Calibration:**
+  - **Fire test** (live ink on paper, with a confirmation): one stripe per template and fire pulse, side by side,
+    with a table of where each stripe goes (`PD_FIRE_TEST`).
+  - **Spit test** (live ink, no motion, with a confirmation): every nozzle fires 1000 times a second for a few
+    seconds into a paper towel held under the cartridge (`POLYDYE_SPIT`). It also makes a steady load for a USB-C
+    power meter on the board's power input, to compare the current with the cartridge in and out.
+- **Signal check** (cartridge out, multimeter): a guided check of where each cartridge signal arrives. With the
+  interface board slid out of the holder and laid face down, the page holds one line HIGH at a time
+  (`POLYDYE_LEVEL`) and shows the voltage to expect and the cartridge pad it should reach. You note which pogo
+  pin's solder joint reads it. A power-off continuity step covers the fire lines (PWRA, PWRB) and ground. Results
+  stay in the browser and can be saved to `polydye_signal_check.txt` in the config folder.
 - **Board firmware:** the board's version and the one bundled with this add-on, with buttons to update to it or
   to a `.bin` you choose (see below).
 - The pill at the top right sums up the state: Moonraker offline, Klipper starting or shut down, PolyDye not
@@ -214,6 +223,9 @@ If anything would print a pass wrongly, Klipper stops with a readable reason, fo
 | `POLYDYE_OFFSET [X=] [Y=] [TRIM=]` | Sets `offset_x`, `offset_y` and `direction_trim` until the next restart; without arguments, shows them |
 | `POLYDYE_CARTRIDGE [TEMPLATE=color_a\|color_b\|black_a\|black_b] [PULSE=6..12]` | Switches the board's waveform template and fire pulse until the next restart (to compare them at the nozzle check); without arguments, shows them. Only with PolyDye off and no passes queued |
 | `POLYDYE_UPLOAD_TEST_PASS [LAYER=0] [PASS=0] [COLUMNS=600] [PATTERN=alternate\|all\|none]` | Uploads a test pass over the board's data port, for dry runs. Not during a print: it briefly blocks Klipper while it sends |
+| `POLYDYE_FIRE_TEST [X=80] [Y=60] [SPACING=20] [STRIPES=color_b:6,color_b:8,color_b:10,color_a:6,color_a:10] [COLUMNS=600] [UPLOAD=1] [LAYER=0] [PASS=0]` | **Live ink.** Prints one stripe per `TEMPLATE:PULSE` pair: a solid pass of `COLUMNS` columns along the pass axis, the stripes `SPACING` mm apart across it, the first at `X`, `Y`. `UPLOAD=0` prints the pass already stored as `LAYER`, `PASS` instead. Turns PolyDye off and puts the template and pulse back afterwards, also after an error. Doesn't home or move Z (`PD_FIRE_TEST` does) |
+| `POLYDYE_SPIT [SECONDS=2] [TEMPLATE=] [PULSE=] CONFIRM=1` | **Live ink, no motion.** Fires every nozzle at 1 kHz for `SECONDS` (at most 10) into a paper towel held under the cartridge, through the same waveform and safety checks as a pass. Refused without `CONFIRM=1`, during a print or with passes queued. Turns PolyDye off and puts the template and pulse back afterwards |
+| `POLYDYE_LEVEL LINE=D1\|D2\|D3\|CSYNC\|S1..S5\|DCLK [STATE=high\|low\|off]` | Signal check, **cartridge out**: holds one cartridge line at its rail voltage (`high`) or 0 V for a multimeter; `STATE=off` puts every line LOW. Needs `POLYDYE_ENABLE LIVE=0` first and nothing queued. The fire lines are never held. A line goes back to LOW after 5 minutes, or when a pass is scheduled or PolyDye turns off |
 
 Macros (Mainsail's Macros panel, while the board is plugged in):
 
@@ -222,6 +234,7 @@ Macros (Mainsail's Macros panel, while the board is plugged in):
 | `PD_STATUS` | `POLYDYE_STATUS` |
 | `PD_DRY_RUN_TEST [X=100] [Y=40]` | Homes if needed, lifts Z to 20 mm, uploads a test pass and prints it in both directions without ink, then reports status. The printer moves; nothing fires |
 | `PD_OFF` | Drops queued passes, then turns live output and the boost off |
+| `PD_FIRE_TEST [X=80] [Y=60] [Z=0.5] [SPACING=20] [STRIPES=…]` | **Live ink.** Homes if needed, moves to `Z` and runs `POLYDYE_FIRE_TEST` |
 | `POLYDYE_WIPE [X=245] [LENGTH=25] [STROKES=3] [SPEED=50] [Z_HOP=1]` | Wipes the cartridge on a damp sponge at the right end of the X gantry: lifts Z by `Z_HOP`, moves to `X` (G-code coordinates; 245 suits the PolyDye mount and keeps clear of the parts at the end of the gantry), strokes `STROKES` times between `X` and `X - LENGTH` at `SPEED` mm/s, then returns. It refuses an `X` at or beyond the X axis maximum (your hard stop) before homing or moving. Homes first if needed |
 
 The macros are loaded before `polydye.cfg`, so you can change their defaults there instead of editing the add-on
@@ -235,7 +248,8 @@ variable_length: 20
 
 `printer.polydye` (macros, Mainsail, the PolyDye page) has the board status, refreshed every 2 s: `boost`, `live`,
 `running`, `queued`, `passes`, `late_max_us`, `faults`, `store_count`, `store_free`, `cartridge_template`, `pulse_words`
-and `pulse_us` (`null` with older board firmware). It also has `last_pass`, `pass_axis`, `offset_x`, `offset_y` and `direction_trim`, the
+and `pulse_us` (`null` with older board firmware), and `level`: the signal-check line held, as `{line, state,
+remaining}` in seconds, or `null` (missing with older board firmware). It also has `last_pass`, `pass_axis`, `offset_x`, `offset_y` and `direction_trim`, the
 values in use including nudges.
 
 ## Uploading passes

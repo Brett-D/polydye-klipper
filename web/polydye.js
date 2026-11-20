@@ -211,6 +211,7 @@ function render() {
     b.disabled = !state.board || (b.classList.contains('needs-idle') && (printing || state.fw.updating));
   });
   renderFirmware(printing);
+  renderDiagnostics(pd, printing);
   setConn();
 }
 
@@ -545,6 +546,259 @@ $('nudge-undo').addEventListener('click', () => {
     await gcode(`POLYDYE_OFFSET X=${fmtMm(x)} Y=${fmtMm(y)} TRIM=${fmtMm(trim)}`);
   });
 });
+
+// ---- diagnostics: fire test (PD_FIRE_TEST), spit test (POLYDYE_SPIT), signal check (POLYDYE_LEVEL) ---------------
+
+// Cartridge contact pads (hardware/README.md section 4, from Sprite_tm's photo, looking at the contact side).
+const PAD_SIDES = [
+  ['7-pad side', ['S3', 'DCLK', 'D1', 'TS', 'D2', 'GND', 'PWRA']],
+  ['9-pad side', ['PWRB', 'S5', 'D3', 'CSYNC', 'S1', 'S4', 'S2', 'GND', 'ID']],
+];
+const SIG_LINES = ['D1', 'D2', 'D3', 'CSYNC', 'S1', 'S2', 'S3', 'S4', 'S5', 'DCLK'];
+const LOW_RAIL = ['D1', 'D2', 'D3', 'CSYNC'];
+const SIG_POWER = [
+  ['PWRA', 'PWRA', 'AO3401 drain, F3 pulse limiter'],
+  ['PWRB', 'PWRB', 'AO3401 drain, F5 pulse limiter'],
+  ['GND', 'GND', 'CD4504 pin 8'],
+  ['GND (2nd)', 'GND', 'CD4504 pin 8'],
+];
+const SIG_KEY = 'polydye-signal-check';
+const SPIT_HZ = 1000;
+const PULSE_US = 0.3;  // one word of fire pulse
+
+function expectText(line) {
+  return LOW_RAIL.includes(line) ? 'about 7.6 V (low rail, the reference design\'s 9 V)'
+    : 'about 12.6 V (high rail, the reference design\'s 16 V)';
+}
+
+// "7-pad side: S3 · DCLK · D1 · …" with the signal in bold; GND matches both GND pads.
+function padCell(name) {
+  const td = document.createElement('td');
+  td.className = 'pads';
+  PAD_SIDES.forEach(([side, pads]) => {
+    if (!pads.includes(name)) return;
+    const div = document.createElement('div');
+    div.append(`${side}: `);
+    pads.forEach((pad, i) => {
+      if (i) div.append(' · ');
+      if (pad === name) {
+        const b = document.createElement('b');
+        b.textContent = pad;
+        div.append(b);
+      } else {
+        div.append(pad);
+      }
+    });
+    td.append(div);
+  });
+  return td;
+}
+
+let sigResults = {};
+try {
+  sigResults = JSON.parse(localStorage.getItem(SIG_KEY) || '{}') || {};
+} catch (e) { /* unreadable: start empty */ }
+
+function sigInput(key, field, type) {
+  const el = document.createElement(type === 'beep' ? 'select' : 'input');
+  if (type === 'beep') {
+    ['', 'yes', 'no'].forEach((v) => {
+      const o = document.createElement('option');
+      o.value = v;
+      o.textContent = v || '–';
+      el.append(o);
+    });
+  } else {
+    el.type = type;
+    if (type === 'number') el.step = 'any';
+  }
+  el.value = (sigResults[key] || {})[field] || '';
+  el.addEventListener('input', () => {
+    sigResults[key] = Object.assign(sigResults[key] || {}, { [field]: el.value.trim() });
+    try {
+      localStorage.setItem(SIG_KEY, JSON.stringify(sigResults));
+    } catch (e) { /* storage full or blocked: keep it in memory */ }
+  });
+  const td = document.createElement('td');
+  td.append(el);
+  return td;
+}
+
+function cell(textValue) {
+  const td = document.createElement('td');
+  td.textContent = textValue;
+  return td;
+}
+
+function buildSignalTables() {
+  const rows = $('sig-rows');
+  rows.textContent = '';
+  for (const line of SIG_LINES) {
+    const tr = document.createElement('tr');
+    tr.dataset.line = line;
+    const hold = document.createElement('button');
+    hold.type = 'button';
+    hold.className = 'sig-high';
+    hold.textContent = 'High';
+    hold.addEventListener('click', () => gcode(`POLYDYE_LEVEL LINE=${line} STATE=high`));
+    const holdTd = document.createElement('td');
+    holdTd.append(hold);
+    tr.append(cell(line), holdTd, cell(expectText(line)), padCell(line), sigInput(line, 'joint', 'text'),
+      sigInput(line, 'volts', 'number'));
+    rows.append(tr);
+  }
+  const power = $('sig-power-rows');
+  power.textContent = '';
+  for (const [key, pad, from] of SIG_POWER) {
+    const tr = document.createElement('tr');
+    tr.append(cell(key), cell(from), padCell(pad), sigInput(key, 'joint', 'text'), sigInput(key, 'beep', 'beep'));
+    power.append(tr);
+  }
+}
+
+function signalReport() {
+  const pad = (s, n) => String(s).padEnd(n);
+  const lines = [
+    `PolyDye signal check, ${new Date().toISOString()}, board firmware ${boardVersion() || 'unknown'}`,
+    'Method: cartridge out; interface board out of the holder, face down (FFC connected); probing the pogo pins\''
+      + ' solder joints on its back; black lead on CD4504 pin 8.',
+    '',
+    `${pad('Signal', 10)}${pad('Expect', 12)}${pad('Joint / pogo', 22)}Reading (V)`,
+  ];
+  for (const line of SIG_LINES) {
+    const r = sigResults[line] || {};
+    lines.push(`${pad(line, 10)}${pad(LOW_RAIL.includes(line) ? '~7.6 V' : '~12.6 V', 12)}${pad(r.joint || '-', 22)}`
+      + `${r.volts || '-'}`);
+  }
+  lines.push('', `${pad('Signal', 10)}${pad('Beep from', 34)}${pad('Joint / pogo', 22)}Beeps`);
+  for (const [key, , from] of SIG_POWER) {
+    const r = sigResults[key] || {};
+    lines.push(`${pad(key, 10)}${pad(from, 34)}${pad(r.joint || '-', 22)}${r.beep || '-'}`);
+  }
+  lines.push('', 'Cartridge pads (contact side, Sprite_tm\'s photo):');
+  PAD_SIDES.forEach(([side, pads]) => lines.push(`  ${side}: ${pads.join(' ')}`));
+  return `${lines.join('\n')}\n`;
+}
+
+$('sig-save').addEventListener('click', async () => {
+  try {
+    const body = new FormData();
+    body.append('root', 'config');
+    body.append('file', new Blob([signalReport()], { type: 'text/plain' }), 'polydye_signal_check.txt');
+    const r = await fetch('/server/files/upload', { method: 'POST', body });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    log('saved polydye_signal_check.txt in the config folder');
+  } catch (e) {
+    log(`! save failed: ${e.message}`);
+  }
+});
+
+$('sig-clear').addEventListener('click', () => {
+  if (!window.confirm('Clear the signal check results in this browser?')) return;
+  sigResults = {};
+  try {
+    localStorage.removeItem(SIG_KEY);
+  } catch (e) { /* nothing stored */ }
+  buildSignalTables();
+  render();
+});
+
+$('sig-cart-out').addEventListener('change', () => render());
+$('sig-start').addEventListener('click', () => gcode('POLYDYE_ENABLE LIVE=0'));
+$('sig-low').addEventListener('click', () => gcode('POLYDYE_LEVEL STATE=off'));
+$('sig-finish').addEventListener('click', () => gcode('POLYDYE_LEVEL STATE=off\nPOLYDYE_DISABLE'));
+
+function fireValues() {
+  const f = $('fire-form').elements;
+  const num = (name, fallback) => {
+    const v = parseFloat(f[name].value);
+    return Number.isFinite(v) ? v : fallback;
+  };
+  const stripes = f.stripes.value.replace(/\s+/g, '').split(',').filter((s) => s);
+  return {
+    x: num('x', 80), y: num('y', 60), z: num('z', 0.5), spacing: num('spacing', 20), stripes,
+    valid: stripes.length > 0 && stripes.every((s) => {
+      const m = s.match(/^(color_a|color_b|black_a|black_b):(\d+)$/i);
+      return m && Number(m[2]) >= 6 && Number(m[2]) <= 12;
+    }),
+  };
+}
+
+function renderFireLegend(axis) {
+  const v = fireValues();
+  const table = $('fire-legend');
+  table.textContent = '';
+  if (!v.valid) {
+    const tr = document.createElement('tr');
+    tr.append(cell('Stripes must be template:pulse pairs, e.g. color_b:8, with a pulse of 6 to 12 words.'));
+    table.append(tr);
+    return;
+  }
+  v.stripes.forEach((s, i) => {
+    const [tpl, words] = s.split(':');
+    const x = axis === 'x' ? v.x : v.x + i * v.spacing;
+    const y = axis === 'x' ? v.y + i * v.spacing : v.y;
+    const tr = document.createElement('tr');
+    tr.append(cell(`${i + 1}`), cell(`X ${fmtMm(x)}  Y ${fmtMm(y)}`), cell(tpl.toLowerCase()),
+      cell(`pulse ${words} words (${(Number(words) * PULSE_US).toFixed(1)} µs)`));
+    table.append(tr);
+  });
+}
+
+$('fire-form').addEventListener('input', () => renderFireLegend((state.printer.polydye || {}).pass_axis));
+$('fire-form').addEventListener('submit', (ev) => ev.preventDefault());
+$('spit-form').addEventListener('submit', (ev) => ev.preventDefault());
+
+$('fire-btn').addEventListener('click', () => {
+  const v = fireValues();
+  if (!v.valid) return;
+  const ok = window.confirm(`Print the fire test with LIVE INK?\n\nPaper taped on the bed, cartridge fitted. It homes `
+    + `if needed, lowers the nozzle to Z ${v.z} mm and prints ${v.stripes.length} stripes, the first at X ${v.x}, `
+    + `Y ${v.y}. The template and pulse go back to what they were afterwards.`);
+  if (!ok) return;
+  gcode(`PD_FIRE_TEST X=${v.x} Y=${v.y} Z=${v.z} SPACING=${v.spacing} STRIPES=${v.stripes.join(',')}`);
+});
+
+$('spit-btn').addEventListener('click', () => {
+  const f = $('spit-form').elements;
+  const seconds = Math.min(10, Math.max(0.5, parseFloat(f.seconds.value) || 2));
+  const pulse = parseInt(f.pulse.value, 10);
+  const ok = window.confirm(`Spit test: LIVE INK, no motion.\n\nHold a folded paper towel under the cartridge, `
+    + `against the nozzles. Every nozzle fires ${SPIT_HZ} times a second for ${seconds} s.`);
+  if (!ok) return;
+  gcode(`POLYDYE_SPIT SECONDS=${seconds}${f.template.value ? ` TEMPLATE=${f.template.value}` : ''}`
+    + `${pulse >= 6 && pulse <= 12 ? ` PULSE=${pulse}` : ''} CONFIRM=1`);
+});
+
+function renderDiagnostics(pd, printing) {
+  const known = state.board && pd.passes !== undefined;
+  const diag = known && 'level' in pd;  // board firmware with the signal check and the spit test
+  const busy = printing || state.fw.updating || !!pd.running || !!pd.queued;
+  $('diag-old').classList.toggle('hidden', !known || diag);
+  $('fire-btn').disabled = !known || !pd.cartridge_template || busy || !fireValues().valid;
+  $('spit-btn').disabled = !diag || busy;
+  const cartOut = $('sig-cart-out').checked;
+  const level = pd.level || null;
+  $('sig-start').disabled = !diag || busy || !cartOut || !!pd.live;
+  $('sig-low').disabled = !diag || !level;
+  $('sig-finish').disabled = !diag;
+  const canHold = diag && cartOut && pd.boost && !pd.live && !busy;
+  document.querySelectorAll('#sig-rows tr').forEach((tr) => {
+    tr.classList.toggle('held', !!level && level.line === tr.dataset.line);
+    tr.querySelector('.sig-high').disabled = !canHold;
+  });
+  let status = '';
+  if (diag) {
+    if (level) status = `${level.line} held ${level.state.toUpperCase()}, ${level.remaining} s left`;
+    else if (pd.live) status = 'live ink is on: turn it off first';
+    else if (pd.boost) status = 'boost on, every line LOW';
+    else status = cartOut ? 'press Start' : 'take the cartridge out first';
+  }
+  text('sig-state', status, level ? 'on' : '');
+  renderFireLegend(pd.pass_axis);
+}
+
+buildSignalTables();
 
 // ---- controls -------------------------------------------------------------------------------------------------
 

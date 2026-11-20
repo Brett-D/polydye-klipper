@@ -151,7 +151,7 @@ class StatusCommand(unittest.TestCase):
     def test_answers_while_the_first_background_query_is_in_flight(self):
         # Just after connecting: the poll's first query is waiting for the board and nothing is cached yet.
         pd = object.__new__(polydye.PolyDye)
-        pd.querying, pd.last_status, pd.oid = True, {}, 0
+        pd.querying, pd.last_status, pd.oid, pd.query_level_cmd = True, {}, 0, None
 
         def pause(waketime):
             pd.querying = False     # the background query finishes
@@ -168,6 +168,115 @@ class StatusCommand(unittest.TestCase):
         self.assertIn("boost=1", replies[0])
         self.assertIn("passes=3", replies[0])
         self.assertIn("color_a", replies[0])
+
+
+class Stripes(unittest.TestCase):
+    def test_parse(self):
+        self.assertEqual(polydye.parse_stripes(polydye.FIRE_TEST_STRIPES),
+                         [('color_b', 6), ('color_b', 8), ('color_b', 10), ('color_a', 6), ('color_a', 10)])
+        self.assertEqual(polydye.parse_stripes(" Black_A:12 , "), [('black_a', 12)])
+        for bad in ("", "color_c:6", "color_a", "color_a:x", "color_a:5", "color_a:13"):
+            with self.assertRaises(ValueError):
+                polydye.parse_stripes(bad)
+
+    def test_positions_side_by_side_across_the_pass_axis(self):
+        self.assertEqual(polydye.stripe_positions('y', 80., 60., 20., 3), [(80., 60.), (100., 60.), (120., 60.)])
+        self.assertEqual(polydye.stripe_positions('x', 80., 60., 20., 2), [(80., 60.), (80., 80.)])
+
+
+class FakeBoard:
+    """Just enough of the board for POLYDYE_FIRE_TEST / POLYDYE_SPIT: tracks mode, template and pulse."""
+
+    def __init__(self):
+        self.boost = self.live = False
+        self.template, self.pulse = 'color_a', 8
+        self.sent = []
+
+    def status(self):
+        return {'boost': self.boost, 'live': self.live, 'running': False, 'queued': 0, 'faults': 0,
+                'cartridge_template': self.template, 'pulse_words': self.pulse, 'pulse_us': self.pulse * .3}
+
+
+class TestCleanup(unittest.TestCase):
+    """A failing stripe must still leave PolyDye off with the template and pulse put back."""
+
+    def make(self, fail_on):
+        board = FakeBoard()
+        pd = object.__new__(polydye.PolyDye)
+        pd.oid, pd.pass_axis = 0, 'y'
+        pd.query_cartridge_cmd = object()
+
+        def mode(args):
+            board.boost, board.live = bool(args[1]), bool(args[2])
+            board.sent.append(('mode', args[1], args[2]))
+        pd.mode_cmd = types.SimpleNamespace(send=mode)
+        pd.set_template_cmd = types.SimpleNamespace(
+            send=lambda args: (setattr(board, 'template', polydye.TEMPLATES[args[1]]), board.sent.append('tpl')))
+        pd.set_pulse_cmd = types.SimpleNamespace(
+            send=lambda args: (setattr(board, 'pulse', args[1]), board.sent.append('pulse')))
+        pd._fresh_status = pd._query_status = board.status
+
+        def run_script(script):
+            board.sent.append(script)
+            if script.startswith(fail_on):
+                raise RuntimeError("Move out of range")
+            if script.startswith("POLYDYE_CARTRIDGE"):
+                for word in script.split()[1:]:
+                    key, value = word.split('=')
+                    if key == 'TEMPLATE':
+                        board.template = value
+                    else:
+                        board.pulse = int(value)
+            elif script == "POLYDYE_ENABLE LIVE=1":
+                board.boost = board.live = True
+            elif script == "POLYDYE_DISABLE":
+                board.boost = board.live = False
+        reactor = types.SimpleNamespace(monotonic=lambda: 0., pause=lambda t: None)
+        objects = {'gcode': types.SimpleNamespace(run_script_from_command=run_script),
+                   'toolhead': types.SimpleNamespace(wait_moves=lambda: None)}
+        pd.printer = types.SimpleNamespace(lookup_object=lambda name, default=None: objects.get(name, default),
+                                           get_reactor=lambda: reactor, is_shutdown=lambda: False,
+                                           command_error=RuntimeError)
+        return pd, board
+
+    def gcmd(self, **params):
+        def get(name, default=None, **kw):
+            return params.get(name, default)
+        return types.SimpleNamespace(get=get, get_float=get, get_int=get, respond_info=lambda msg: None,
+                                     error=RuntimeError)
+
+    def test_fire_test_error_turns_off_and_restores(self):
+        pd, board = self.make(fail_on="POLYDYE_PASS")
+        with self.assertRaisesRegex(RuntimeError, "out of range"):
+            pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:10", X=80., Y=60., SPACING=20., COLUMNS=600,
+                                               UPLOAD=1, LAYER=0, PASS=0))
+        self.assertIn("POLYDYE_UPLOAD_TEST_PASS LAYER=0 PASS=0 COLUMNS=600 PATTERN=all", board.sent)
+        self.assertEqual((board.boost, board.live, board.template, board.pulse), (False, False, 'color_a', 8))
+
+    def test_fire_test_restores_after_success(self):
+        pd, board = self.make(fail_on="NOTHING")
+        pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:10,color_b:12", X=80., Y=60., SPACING=20.,
+                                           COLUMNS=600, UPLOAD=1, LAYER=0, PASS=0))
+        passes = [s for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_PASS")]
+        self.assertEqual(passes, ["POLYDYE_PASS LAYER=0 PASS=0 X=80.000 Y=60.000 DIR=1",
+                                  "POLYDYE_PASS LAYER=0 PASS=0 X=100.000 Y=60.000 DIR=1"])
+        self.assertEqual(sum(1 for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_UPLOAD")), 1)
+        self.assertEqual((board.boost, board.template, board.pulse), (False, 'color_a', 8))
+
+    def test_spit_needs_confirm(self):
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append(('spit', args[1])))
+        with self.assertRaisesRegex(RuntimeError, "CONFIRM=1"):
+            pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=2.))
+        self.assertEqual(board.sent, [])
+
+    def test_spit_sends_columns_then_turns_off_and_restores(self):
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append(('spit', args[1])))
+        pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1.5, PULSE=12, CONFIRM=1))
+        self.assertIn(('spit', 1500), board.sent)
+        self.assertLess(board.sent.index("POLYDYE_CARTRIDGE PULSE=12"), board.sent.index(('mode', 1, 1)))
+        self.assertEqual((board.boost, board.live, board.pulse), (False, False, 8))
 
 
 if __name__ == "__main__":

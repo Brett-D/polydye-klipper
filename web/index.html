@@ -157,14 +157,95 @@
 
     <section class="card">
       <h2>Calibration</h2>
-      <p class="hint">These steps print real ink, so they need a cartridge in a mounted holder. The printed patterns
-        will come in a later version; the Ink position nudges above already work for lining the ink up by eye.</p>
+      <h3>Fire test <span class="sub">live ink on paper</span></h3>
+      <p class="hint">Prints a stripe of every nozzle for each template and fire pulse, side by side, so you can see
+        which settings put ink down. Tape paper on the bed and fit the cartridge first. The test homes if needed,
+        lowers the nozzle to Z and puts the template and pulse back afterwards. Stripes run along the pass axis.</p>
+      <form id="fire-form" class="compact">
+        <label>First stripe X (mm)<input name="x" type="number" step="any" value="80"></label>
+        <label>Y (mm)<input name="y" type="number" step="any" value="60"></label>
+        <label>Z (mm)<input name="z" type="number" step="any" min="0.2" value="0.5"></label>
+        <label>Spacing (mm)<input name="spacing" type="number" step="any" min="1" value="20"></label>
+        <label class="wide">Stripes (template:pulse words, &hellip;)
+          <input name="stripes" value="color_b:6,color_b:8,color_b:10,color_a:6,color_a:10"></label>
+      </form>
+      <table class="table" id="fire-legend"></table>
+      <div class="buttons">
+        <button id="fire-btn" class="danger">Print fire test&hellip;</button>
+      </div>
+      <h3>Spit test <span class="sub">live ink, no motion</span></h3>
+      <p class="hint">Fires every nozzle 1000 times a second for a few seconds without moving. Hold a folded paper
+        towel under the cartridge, against the nozzles: a working cartridge leaves a coloured patch. It is also a
+        steady load for a USB-C power meter on the board's power input (J4): compare the current with the
+        cartridge in and out to see whether the nozzle heaters draw anything.</p>
+      <form id="spit-form" class="compact">
+        <label>Seconds<input name="seconds" type="number" step="0.5" min="0.5" max="10" value="2"></label>
+        <label>Template
+          <select name="template">
+            <option value="">Current</option>
+            <option value="color_a">color_a</option><option value="color_b">color_b</option>
+            <option value="black_a">black_a</option><option value="black_b">black_b</option>
+          </select>
+        </label>
+        <label>Fire pulse (words)<input name="pulse" type="number" step="1" min="6" max="12" placeholder="current"></label>
+      </form>
+      <div class="buttons">
+        <button id="spit-btn" class="danger">Spit test&hellip;</button>
+      </div>
+      <p class="hint hidden" id="diag-old">The spit test and the signal check need newer board firmware: update it
+        under Board firmware.</p>
+      <h3>Next steps</h3>
       <ol class="steps">
         <li><b>Nozzle check</b>: print every nozzle once to find blocked ones, with both templates (a and b).</li>
         <li><b>Cartridge offset</b>: print ink marks next to a plastic reference and nudge X and Y until they line up.</li>
         <li><b>Direction alignment</b>: print in both directions and nudge Reverse passes until the passes line up.</li>
-        <li><b>Pulse length</b>: tune the fire pulse for even drops at this board's voltage.</li>
       </ol>
+    </section>
+
+    <section class="card">
+      <h2>Signal check <span class="sub">cartridge out, multimeter</span></h2>
+      <p class="hint">Finds where each cartridge signal arrives, to check the chain from the daughter board through
+        the FFC and the interface board to the cartridge pads. The page holds one line HIGH at a time; it should
+        read its rail voltage at exactly one pogo pin and about 0 V everywhere else.</p>
+      <ol class="steps">
+        <li><b>Keep the cartridge out</b> for the whole check.</li>
+        <li><b>Power off.</b> Slide the interface board out of the holder with its FFC still connected, and lay it
+          face down, so the pogo pins' solder joints on its back face up. Power on again.</li>
+        <li><b>Meter</b> on DC volts, black lead on pin 8 (GND) of either CD4504 on the daughter board.</li>
+        <li><b>Start</b> turns the boost on in dry run (nothing fires). Then press <b>High</b> on a signal, find the
+          joint that reads the expected voltage, and note it: the pogo's label, or its cluster (9 or 7 pins) and
+          position counted from the FPC end. A line goes back to LOW after 5 minutes by itself.</li>
+        <li><b>Finish</b> puts every line LOW and the boost off. Then check the fire lines and ground below, with the
+          power off, and save the results.</li>
+      </ol>
+      <div class="buttons">
+        <label class="check"><input type="checkbox" id="sig-cart-out"> The cartridge is out</label>
+        <button id="sig-start">Start (boost on, dry run)</button>
+        <button id="sig-low">All lines LOW</button>
+        <button id="sig-finish">Finish (all LOW, boost off)</button>
+        <span id="sig-state" class="v"></span>
+      </div>
+      <table class="table">
+        <thead><tr><th>Signal</th><th></th><th>Expect at its joint</th><th>Cartridge pad (contact side, Sprite_tm's photo)</th>
+          <th>Joint / pogo found</th><th>Reading (V)</th></tr></thead>
+        <tbody id="sig-rows"></tbody>
+      </table>
+      <h3>Fire lines and ground <span class="sub">power off, continuity</span></h3>
+      <p class="hint">PWRA and PWRB carry the nozzle heater pulses and are never held on. Turn the power off and set
+        the meter to continuity. Beep from the drain of the AO3401 (marked &ldquo;3401&rdquo;) in each pulse limiter
+        on the daughter board to the joints: on a SOT-23 the drain is pin 3, the single pin on its own side. PWRA
+        comes from the F3 limiter, PWRB from the F5 limiter. Then beep CD4504 pin 8 to the joints: two of them are
+        GND.</p>
+      <table class="table">
+        <thead><tr><th>Signal</th><th>Beep from</th><th>Cartridge pad</th><th>Joint / pogo found</th><th>Beeps?</th></tr></thead>
+        <tbody id="sig-power-rows"></tbody>
+      </table>
+      <div class="buttons">
+        <button id="sig-save" class="primary">Save results to polydye_signal_check.txt</button>
+        <button id="sig-clear">Clear results</button>
+      </div>
+      <p class="hint">Results are kept in this browser until you clear them. Saving writes them to the Klipper config
+        folder (Mainsail: Machine), where they can be shared.</p>
     </section>
 
     <section class="card">
