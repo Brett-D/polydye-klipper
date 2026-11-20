@@ -418,13 +418,16 @@ function queueCfg(op) {
 $('settings').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const form = ev.target;
-  const values = {};
-  for (const key of FIELDS) values[key] = form.elements[key].value.trim();
-  values.cartridge_template = values.cartridge_template || null;
-  values.pulse_words = values.pulse_words || null;
   try {
-    // Re-read first: the file may have been edited elsewhere since the page loaded.
-    await queueCfg(async () => uploadCfg(applySettings(await fetchCfg(), values)));
+    await queueCfg(async () => {
+      // Read the form only now: a Store queued before this Save may just have refreshed the offset inputs.
+      const values = {};
+      for (const key of FIELDS) values[key] = form.elements[key].value.trim();
+      values.cartridge_template = values.cartridge_template || null;
+      values.pulse_words = values.pulse_words || null;
+      // Re-read first: the file may have been edited elsewhere since the page loaded.
+      await uploadCfg(applySettings(await fetchCfg(), values));
+    });
     log('saved polydye.cfg');
     $('restart-btn').classList.remove('hidden');
   } catch (e) {
