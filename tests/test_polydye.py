@@ -306,12 +306,13 @@ class FakeBoard:
     def __init__(self):
         self.boost = self.live = False
         self.template, self.pulse, self.clock = 'color_a', 8, 'ours'
+        self.measured = None
         self.sent = []
 
     def status(self):
         return {'boost': self.boost, 'live': self.live, 'running': False, 'queued': 0, 'faults': 0,
                 'cartridge_template': self.template, 'pulse_words': self.pulse, 'pulse_us': self.pulse * .3,
-                'bus_clock': self.clock, 'bus_hz': 3333333, 'bus_hz_measured': None}
+                'bus_clock': self.clock, 'bus_hz': 3333333, 'bus_hz_measured': self.measured}
 
 
 class TestCleanup(unittest.TestCase):
@@ -461,7 +462,8 @@ class TestCleanup(unittest.TestCase):
 
     def test_sparse_spit_sends_pattern_2_and_reports_the_pulse_it_used(self):
         pd, board = self.make(fail_on="NOTHING")
-        pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append(('spit', args[1], args[2])))
+        pd.spit_cmd = types.SimpleNamespace(send=lambda args: (board.sent.append(('spit', args[1], args[2])),
+                                                               setattr(board, 'measured', 3300000)))
         gcmd = self.gcmd(SECONDS=8., PULSE=9, PATTERN='sparse', CONFIRM=1)
         replies = []
         gcmd.respond_info = replies.append
@@ -470,16 +472,21 @@ class TestCleanup(unittest.TestCase):
         self.assertIn("8000 sparse (one nozzle per fire pulse) columns", replies[0])
         self.assertIn("done (faults=0): fired with cartridge template color_a, fire pulse 9 words", replies[-1])
         self.assertIn("now back to cartridge template color_a, fire pulse 8 words", replies[-1])
+        # The rate measured during the spit is reported once, with the settings it fired with.
+        self.assertEqual(replies[-1].count("measured 3.300 MHz"), 1)
+        self.assertLess(replies[-1].index("measured"), replies[-1].index("now back to"))
         self.assertEqual((board.boost, board.live, board.pulse), (False, False, 8))
 
     def test_spit_done_without_changes_names_the_settings_once(self):
         pd, board = self.make(fail_on="NOTHING")
-        pd.spit_cmd = types.SimpleNamespace(send=lambda args: None)
+        # The board measures the bus rate of the columns it sends: a new reading isn't a change of settings.
+        pd.spit_cmd = types.SimpleNamespace(send=lambda args: setattr(board, 'measured', 3300000))
         gcmd = self.gcmd(SECONDS=1., PATTERN='all', CONFIRM=1)
         replies = []
         gcmd.respond_info = replies.append
         pd.cmd_POLYDYE_SPIT(gcmd)
         self.assertIn("fired with cartridge template color_a, fire pulse 8 words", replies[-1])
+        self.assertIn("last column measured 3.300 MHz", replies[-1])
         self.assertNotIn("back to", replies[-1])
 
     def test_sparse_spit_needs_board_firmware_with_it(self):

@@ -960,7 +960,7 @@ class PolyDye:
         if limit:
             raise gcmd.error("POLYDYE_SPIT: %s" % (limit,))
         columns = max(1, int(round(seconds * SPIT_HZ)))
-        used = None
+        used = {}
         try:
             self.mode_cmd.send([self.oid, 0, 0])
             self._wait_off_and_idle()
@@ -972,9 +972,9 @@ class PolyDye:
             st = self._fresh_status()
             if not st['live']:
                 raise gcmd.error("POLYDYE_SPIT: the board didn't turn live ink on (disarmed on its console?)")
-            used = cartridge_text(st)
+            used = st
             gcmd.respond_info("PolyDye spit test: %d %s columns at %d Hz, %s"
-                              % (columns, TEST_PATTERN_TEXT[pattern], SPIT_HZ, used))
+                              % (columns, TEST_PATTERN_TEXT[pattern], SPIT_HZ, cartridge_text(st)))
             # The board starts it no sooner than 0.1 s after the boost came on.
             self.spit_cmd.send([self.oid, columns, TEST_PATTERNS.index(pattern)])
             end = reactor.monotonic() + seconds + 5.
@@ -989,9 +989,13 @@ class PolyDye:
         finally:
             self._restore_after_test(before)
         st = self._fresh_status()
-        restored = cartridge_text(st)
-        gcmd.respond_info("PolyDye spit test done (faults=%d): fired with %s%s"
-                          % (st['faults'], used, "; now back to %s" % (restored,) if restored != used else ""))
+        # The bus rate the board measured is that of the spit's last column: it goes with the settings it fired with.
+        # Compare the settings, not the text, to tell whether they were put back to something else.
+        settings = ('cartridge_template', 'pulse_words', 'bus_clock')
+        restored = [st.get(key) for key in settings] != [used.get(key) for key in settings]
+        gcmd.respond_info("PolyDye spit test done (faults=%d): fired with %s%s" % (
+            st['faults'], cartridge_text(dict(used, bus_hz_measured=st.get('bus_hz_measured'))),
+            "; now back to %s" % (cartridge_text(dict(st, bus_hz_measured=None)),) if restored else ""))
 
     def _restore_after_test(self, before):
         """Always turn PolyDye off and put the template, pulse and clock back, even after an error (which is re-raised by
