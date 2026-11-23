@@ -311,19 +311,18 @@ def init_pulse_clock(pulse_words, bus_clock, has_clock):
 
     The board refuses any moment where the pulse would be over the limit, and after a Klipper RESTART it still has the
     previous pulse and clock, whichever they are. So the clock goes to ours first: it's the fastest, so any pulse
-    within the limit at some clock is within it there. Then the pulse, then a slower clock if one is set. A slower clock
-    without pulse_words gets its shortest pulse of at least 1.8 us (6 words at stock, 3 at half). With pulse_words but
-    no bus_clock, the clock goes back to ours (the board's default) so the pulse is checked against the clock it was set
-    for.
+    within the limit at some clock is within it there. Then the pulse, then a slower clock if one is set. A bus_clock
+    without pulse_words gets its shortest pulse of at least 1.8 us (6 words at ours and stock, the board's default; 3 at
+    half), so a pulse left from another clock (4 words from half would be 1.2 us at ours) isn't kept. With pulse_words
+    but no bus_clock, the clock goes back to ours (the board's default) so the pulse is checked against the clock it was
+    set for.
     """
     clock = (bus_clock or ('ours' if pulse_words is not None else None)) if has_clock else None
     if clock is None:
         return [] if pulse_words is None else [(pulse_words, None)]
-    if pulse_words is None and clock != 'ours':
+    if pulse_words is None:
         pulse_words = min_pulse_words(clock)
-    steps = [(None, 'ours')]
-    if pulse_words is not None:
-        steps.append((pulse_words, None))
+    steps = [(None, 'ours'), (pulse_words, None)]
     if clock != 'ours':
         steps.append((None, clock))
     return steps
@@ -366,8 +365,8 @@ class PolyDye:
             if self.cartridge_template not in TEMPLATES:
                 raise config.error("[polydye] cartridge_template must be one of: %s" % (", ".join(TEMPLATES),))
         # F3/F5 fire pulse in bus words (0.3 us at our clock, 0.6 us at half); unset leaves the board's own (6 = 1.8 us,
-        # Sprite_tm's value), or 3 words (1.8 us) at the half clock. Longer pulses put more energy into each drop, e.g.
-        # when the boost rails are below the cartridge's nominal voltage.
+        # Sprite_tm's value), or with bus_clock set, 1.8 us at that clock (6 words, 3 at half). Longer pulses put more
+        # energy into each drop, e.g. when the boost rails are below the cartridge's nominal voltage.
         self.pulse_words = config.getint('pulse_words', None, minval=PULSE_MIN, maxval=PULSE_MAX)
         # Cartridge bus clock: ours (3.333 MHz), the stock PolyDye firmware's setup (2.857 MHz) or half ours (1.667
         # MHz); unset leaves the board's own (ours). Needs board firmware with polydye_set_clock, and for half with

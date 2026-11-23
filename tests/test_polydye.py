@@ -281,19 +281,25 @@ class InitOrder(unittest.TestCase):
         self.assertEqual(f(4, 'half', True), [(None, 'ours'), (4, None), (None, 'half')])
         self.assertEqual(f(None, 'half', True), [(None, 'ours'), (3, None), (None, 'half')])
         self.assertEqual(f(9, 'ours', True), [(None, 'ours'), (9, None)])
+        # A clock without pulse_words gets its 1.8 us pulse: a board left at half with 4 words would otherwise keep
+        # them at ours after a RESTART (1.2 us).
+        self.assertEqual(f(None, 'ours', True), [(None, 'ours'), (6, None)])
         self.assertEqual(f(9, None, True), [(None, 'ours'), (9, None)])
         self.assertEqual(f(None, None, True), [])
         self.assertEqual(f(9, None, False), [(9, None)])  # board firmware without the clock choice
 
     def test_no_step_is_over_the_limit_from_any_starting_point(self):
         for pulse, clock in ((9, 'ours'), (8, 'stock'), (None, 'stock'), (9, None), (6, 'ours'), (4, 'half'),
-                             (3, 'half'), (None, 'half')):
+                             (3, 'half'), (None, 'half'), (None, 'ours')):
             for start in ((9, 'ours'), (8, 'stock'), (6, 'ours'), (6, 'stock'), (4, 'half'), (3, 'half')):
                 words, now = start
                 for step_words, step_clock in polydye.init_pulse_clock(pulse, clock, True):
                     words = step_words if step_words is not None else words
                     now = step_clock or now
                     self.assertIsNone(polydye.pulse_limit_error(words, now), (pulse, clock, start))
+                # And it ends at the clock asked for, with a pulse of 1.8-2.9 us there.
+                self.assertEqual(now, clock or 'ours', (pulse, clock, start))
+                self.assertIsNone(polydye.pulse_range_error(words, now), (pulse, clock, start))
 
 
 class SendOrder(unittest.TestCase):

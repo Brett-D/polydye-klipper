@@ -195,8 +195,9 @@ pass data for a black cartridge. It needs board firmware with template support (
 newer); with older firmware Klipper refuses to start and asks you to update the board or remove the option.
 
 `pulse_words` sets how long each nozzle's heater is fired, in bus words: 0.3 µs each with our clock, 0.35 µs with the
-stock one, 0.6 µs with half. 6 words (1.8 µs) is Sprite_tm's value and the board's default; with `bus_clock: half` the
-default is 3 words (1.8 µs). A setting must be at least 1.8 µs at its clock. A longer pulse puts more energy into each
+stock one, 0.6 µs with half. 6 words (1.8 µs) is Sprite_tm's value and the board's default. With `bus_clock` set and
+`pulse_words` unset, Klipper sends 1.8 µs at that clock: 6 words, or 3 with half. A setting must be at least 1.8 µs at
+its clock. A longer pulse puts more energy into each
 drop, for when the board's boost rails are below the cartridge's nominal voltage. Klipper sends it on every connect,
 and the board's safety check limits every pulse to it. It needs the same board firmware as `cartridge_template`.
 
