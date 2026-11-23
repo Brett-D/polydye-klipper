@@ -230,6 +230,30 @@ class TestPassData(unittest.TestCase):
         with self.assertRaises(ValueError):
             polydye.test_pass_data('stripes', 5)
 
+    def test_sparse_enables_one_nozzle_per_fire_pulse_and_covers_every_nozzle(self):
+        n = polydye.SPARSE_COLUMNS
+        data, total = polydye.test_pass_data('sparse', 2 * n)
+        self.assertEqual(total, 2 * n)
+        size = polydye.NOZDATA_SIZE
+        cols = [data[i * size:(i + 1) * size] for i in range(total)]
+        seen = bytearray(size)
+        for k, col in enumerate(cols):
+            for packet in range(14):
+                lines = [col[14 * c + packet] for c in range(3)]
+                # F3 fires the bits 0-3 of a packet, F5 the bits 4-7: one nozzle each.
+                self.assertEqual(sum(bin(b & 0x0f).count('1') for b in lines), 1, (k, packet))
+                self.assertEqual(sum(bin(b & 0xf0).count('1') for b in lines), 1, (k, packet))
+            if k < n:
+                self.assertFalse(any(s & b for s, b in zip(seen, col)), k)
+                seen = bytearray(s | b for s, b in zip(seen, col))
+            else:
+                self.assertEqual(col, cols[k - n])
+        self.assertEqual(bytes(seen), b"\xff" * size)
+        # Column 4: D2 (4 % 3), bits 1 and 5 ((4 // 3) % 4 = 1) in every packet, as the board firmware makes it.
+        self.assertEqual(polydye.sparse_column(4), b"\x00" * 14 + b"\x22" * 14 + b"\x00" * 14)
+        data, total = polydye.test_pass_data('sparse', 2, 3)
+        self.assertEqual((data, total), (polydye.sparse_column(0) * 3 + polydye.sparse_column(1) * 3, 6))
+
 
 class InitOrder(unittest.TestCase):
     """The settings sent on every connect never pass through an over-limit combination."""
@@ -298,6 +322,7 @@ class TestCleanup(unittest.TestCase):
         pd = object.__new__(polydye.PolyDye)
         pd.oid, pd.pass_axis = 0, 'y'
         pd.query_cartridge_cmd = object()
+        pd.spit_patterns = len(polydye.TEST_PATTERNS)
 
         def mode(args):
             board.boost, board.live = bool(args[1]), bool(args[2])
@@ -433,6 +458,47 @@ class TestCleanup(unittest.TestCase):
         self.assertIn(('spit', 1500, 1), board.sent)
         self.assertLess(board.sent.index("POLYDYE_CARTRIDGE PULSE=7 CLOCK=stock"), board.sent.index(('mode', 1, 1)))
         self.assertEqual((board.boost, board.live, board.pulse, board.clock), (False, False, 8, 'ours'))
+
+    def test_sparse_spit_sends_pattern_2_and_reports_the_pulse_it_used(self):
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append(('spit', args[1], args[2])))
+        gcmd = self.gcmd(SECONDS=8., PULSE=9, PATTERN='sparse', CONFIRM=1)
+        replies = []
+        gcmd.respond_info = replies.append
+        pd.cmd_POLYDYE_SPIT(gcmd)
+        self.assertIn(('spit', 8000, 2), board.sent)
+        self.assertIn("8000 sparse (one nozzle per fire pulse) columns", replies[0])
+        self.assertIn("done (faults=0): fired with cartridge template color_a, fire pulse 9 words", replies[-1])
+        self.assertIn("now back to cartridge template color_a, fire pulse 8 words", replies[-1])
+        self.assertEqual((board.boost, board.live, board.pulse), (False, False, 8))
+
+    def test_spit_done_without_changes_names_the_settings_once(self):
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_cmd = types.SimpleNamespace(send=lambda args: None)
+        gcmd = self.gcmd(SECONDS=1., PATTERN='all', CONFIRM=1)
+        replies = []
+        gcmd.respond_info = replies.append
+        pd.cmd_POLYDYE_SPIT(gcmd)
+        self.assertIn("fired with cartridge template color_a, fire pulse 8 words", replies[-1])
+        self.assertNotIn("back to", replies[-1])
+
+    def test_sparse_spit_needs_board_firmware_with_it(self):
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_patterns = polydye.SPIT_PATTERNS_OLD  # no POLYDYE_SPIT_PATTERNS constant
+        pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append('spit'))
+        with self.assertRaisesRegex(RuntimeError, "PATTERN=sparse needs newer PolyDye board firmware"):
+            pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=8., PULSE=9, PATTERN='sparse', CONFIRM=1))
+        self.assertEqual(board.sent, [])
+        pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., PATTERN='mid', CONFIRM=1))
+        self.assertIn('spit', board.sent)
+
+    def test_fire_test_uploads_sparse_on_any_board_firmware(self):
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_patterns = polydye.SPIT_PATTERNS_OLD
+        pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="black_b:8", X=80., Y=60., SPACING=20., COLUMNS=600,
+                                           UPLOAD=1, LAYER=0, PASS=0, PATTERN='sparse'))
+        self.assertIn("POLYDYE_UPLOAD_TEST_PASS LAYER=0 PASS=0 COLUMNS=600 PATTERN=sparse", board.sent)
+        self.assertEqual((board.boost, board.template, board.pulse), (False, 'color_a', 8))
 
 
 if __name__ == "__main__":
