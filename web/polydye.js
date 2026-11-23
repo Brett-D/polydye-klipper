@@ -372,16 +372,28 @@ async function loadSettings() {
   render();
 }
 
-// Longest pulse within the live-ink limit at a clock: 9 words with ours, 8 with stock.
+// Longest pulse within the live-ink limit at a clock: 9 words with ours, 8 with stock, 4 at half.
 function maxPulseWords(clock) {
   return Math.min(12, Math.floor((PULSE_MAX_US * CLOCK_HZ[clock || 'ours']) / 1e6 + 1e-9));
 }
 
-// The pulse field's maximum follows the clock chosen next to it.
+// Shortest pulse of at least Sprite_tm's 1.8 µs at a clock: 6 words with ours and stock, 3 at half.
+function minPulseWords(clock) {
+  return Math.max(3, Math.ceil((PULSE_MIN_US * CLOCK_HZ[clock || 'ours']) / 1e6 - 1e-6));
+}
+
+// The pulse field's range follows the clock chosen next to it.
 function syncPulseMax() {
   const form = $('settings');
-  form.elements.pulse_words.max = String(maxPulseWords(form.elements.bus_clock.value));
+  const clock = form.elements.bus_clock.value || 'ours';
+  form.elements.pulse_words.min = String(minPulseWords(clock));
+  form.elements.pulse_words.max = String(maxPulseWords(clock));
+  form.elements.pulse_words.placeholder = clock === 'half' ? '3 (1.8 µs)' : '6 (board default)';
 }
+
+// Bus clocks the board offers (the add-on's bus_clocks): board firmware before the half clock has ours and stock.
+const halfClockOk = () => ((state.printer.polydye || {}).bus_clocks || []).includes('half');
+const HALF_OLD = 'The half clock needs newer board firmware: Update to bundled firmware under Board firmware.';
 
 // values: key -> string to set ('' leaves the line alone) or null to comment the setting out.
 function applySettings(textIn, values) {
@@ -445,13 +457,12 @@ $('settings').addEventListener('submit', async (ev) => {
       values.cartridge_template = values.cartridge_template || null;
       values.pulse_words = values.pulse_words || null;
       values.bus_clock = values.bus_clock || null;
-      // Klipper refuses to start with a pulse over the limit at the saved clock, so don't save one.
+      // Klipper refuses to start with a pulse outside 1.8-2.9 µs at the saved clock, so don't save one.
       const clock = values.bus_clock || 'ours';
       const words = Number(values.pulse_words);
-      if (values.pulse_words && !pulseOk(words, clock)) {
-        throw new Error(`fire pulse ${words} words is ${pulseUs(words, clock).toFixed(2)} µs with the ${clock} `
-          + `clock; the limit is ${PULSE_MAX_US} µs (at most ${maxPulseWords(clock)} words)`);
-      }
+      if (values.pulse_words && !pulseOk(words, clock)) throw new Error(pulseRangeText(words, clock));
+      // ... or with a clock the board doesn't have.
+      if (clock === 'half' && state.board && !halfClockOk()) throw new Error(HALF_OLD);
       // Re-read first: the file may have been edited elsewhere since the page loaded.
       await uploadCfg(applySettings(await fetchCfg(), values));
     });
@@ -600,10 +611,15 @@ const CHIP_LEGS = {
 };
 const SPIT_HZ = 1000;
 // Bus rates (one word of fire pulse = 1 / rate). The stock setup measures 2.82-2.83 MHz on the board: 2.857 MHz.
-const CLOCK_HZ = { ours: 3333333, stock: 2857142 };
+// Half is half ours, for slow level shifters.
+const CLOCK_HZ = { ours: 3333333, stock: 2857142, half: 1666666 };
 const PULSE_MAX_US = 2.9;  // live-ink limit, whatever the clock (polydye.py PULSE_MAX_US)
+const PULSE_MIN_US = 1.8;  // shortest pulse to ask for, whatever the clock: Sprite_tm's (polydye.py REF_US)
 const pulseUs = (words, clock) => (words * 1e6) / CLOCK_HZ[clock];
-const pulseOk = (words, clock) => words >= 6 && words <= 12 && pulseUs(words, clock) <= PULSE_MAX_US + 1e-9;
+const pulseOk = (words, clock) => words >= minPulseWords(clock) && words <= maxPulseWords(clock);
+const pulseRangeText = (words, clock) => `fire pulse ${words} words is ${pulseUs(words, clock).toFixed(2)} µs with `
+  + `the ${clock} clock; use ${minPulseWords(clock)}-${maxPulseWords(clock)} words there `
+  + `(${PULSE_MIN_US}-${PULSE_MAX_US} µs)`;
 // Fire test defaults, like POLYDYE_FIRE_TEST's: the A/B matrix of our timing and the stock firmware's, or, for board
 // firmware without the stock options, five template/pulse pairs. Used until the stripes are edited.
 const FIRE_STRIPES = 'color_b:6:ours,color_b_late:6:ours,color_b:6:stock,color_b_late:6:stock,'
@@ -810,9 +826,11 @@ function fireValues() {
     x: num('x', 70), y: num('y', 60), z: num('z', 0.5), spacing: num('spacing', 18), stripes,
     pattern: f.pattern.value,
     valid: stripes.length > 0 && stripes.every((s) => {
-      const m = s.match(/^(color_a|color_b|black_a|black_b|color_b_late):(\d+)(:(ours|stock))?$/i);
-      return m && pulseOk(Number(m[2]), (m[4] || current).toLowerCase());
+      const m = s.match(/^(color_a|color_b|black_a|black_b|color_b_late):(\d+)(:(ours|stock|half))?$/i);
+      const clock = m && (m[4] || current).toLowerCase();
+      return m && pulseOk(Number(m[2]), clock) && (clock !== 'half' || halfClockOk());
     }),
+    half: stripes.some((s) => /:half$/i.test(s)),
   };
 }
 
@@ -822,9 +840,10 @@ function renderFireLegend(axis) {
   table.textContent = '';
   if (!v.valid) {
     const tr = document.createElement('tr');
-    tr.append(cell('Each stripe is template:pulse or template:pulse:clock, e.g. color_b:8 or color_b_late:8:stock, '
-      + `with a clock of ours or stock and a pulse of 6 words or more and at most ${PULSE_MAX_US} µs: `
-      + '9 words with our clock, 8 with the stock one.'));
+    tr.append(cell('Each stripe is template:pulse or template:pulse:clock, e.g. color_b:8, color_b_late:8:stock or '
+      + `color_b:4:half, with a clock of ours, stock or half and a pulse of ${PULSE_MIN_US} to ${PULSE_MAX_US} µs: `
+      + '6-9 words with our clock, 6-8 with the stock one, 3-4 at half.'
+      + `${v.half && state.board && !halfClockOk() ? ` ${HALF_OLD}` : ''}`));
     table.append(tr);
     return;
   }
@@ -867,10 +886,9 @@ $('spit-btn').addEventListener('click', () => {
   const pulse = parseInt(f.pulse.value, 10);
   const pd = state.printer.polydye || {};
   const clock = f.clock.value || pd.bus_clock || 'ours';
-  const words = pulse >= 6 ? pulse : pd.pulse_words;
+  const words = pulse >= 3 ? pulse : pd.pulse_words;
   if (words && !pulseOk(words, clock)) {
-    log(`! spit test: ${words} words is ${pulseUs(words, clock).toFixed(2)} µs at the ${clock} clock; `
-      + `the limit is ${PULSE_MAX_US} µs`);
+    log(`! spit test: ${pulseRangeText(words, clock)}${pulse >= 3 ? '' : ': enter a fire pulse'}`);
     return;
   }
   const rate = `${SPIT_HZ} times a second for ${seconds} s`;
@@ -883,7 +901,7 @@ $('spit-btn').addEventListener('click', () => {
     + `against the nozzles. ${which}`);
   if (!ok) return;
   gcode(`POLYDYE_SPIT SECONDS=${seconds}${f.template.value ? ` TEMPLATE=${f.template.value}` : ''}`
-    + `${pulse >= 6 && pulse <= 12 ? ` PULSE=${pulse}` : ''}${f.clock.value ? ` CLOCK=${f.clock.value}` : ''}`
+    + `${pulse >= 3 && pulse <= 12 ? ` PULSE=${pulse}` : ''}${f.clock.value ? ` CLOCK=${f.clock.value}` : ''}`
     + ` PATTERN=${f.pattern.value} CONFIRM=1`);
 });
 
@@ -897,11 +915,20 @@ function renderDiagnostics(pd, printing) {
     $('fire-form').elements.stripes.value = 'bus_clock' in pd ? FIRE_STRIPES : FIRE_STRIPES_BASIC;
   }
   $('fire-btn').disabled = !known || !pd.cartridge_template || busy || !fireValues().valid;
-  // Board firmware before the sparse pattern can't spit it; the fire test sends its columns itself.
-  const sparseOld = diag && $('spit-form').elements.pattern.value === 'sparse'
-    && !(pd.spit_patterns || []).includes('sparse');
-  $('spit-sparse-old').classList.toggle('hidden', !sparseOld);
-  $('spit-btn').disabled = !diag || busy || sparseOld;
+  // Board firmware before the sparse pattern can't spit it (the fire test sends its columns itself), and board
+  // firmware before the half clock can't run it.
+  const spit = $('spit-form').elements;
+  const sparseOld = diag && spit.pattern.value === 'sparse' && !(pd.spit_patterns || []).includes('sparse');
+  const halfOld = diag && spit.clock.value === 'half' && !halfClockOk();
+  const oldText = [];
+  if (sparseOld) {
+    oldText.push('The sparse spit test needs newer board firmware: Update to bundled firmware under Board firmware. '
+      + "The fire test's sparse stripes work with this one.");
+  }
+  if (halfOld) oldText.push(HALF_OLD);
+  $('spit-fw-old').textContent = oldText.join(' ');
+  $('spit-fw-old').classList.toggle('hidden', !oldText.length);
+  $('spit-btn').disabled = !diag || busy || sparseOld || halfOld;
   const cartOut = $('sig-cart-out').checked;
   const level = pd.level || null;
   $('sig-start').disabled = !diag || busy || !cartOut || !!pd.live;
