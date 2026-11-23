@@ -49,8 +49,13 @@ FIRE_TEST_STRIPES = ("color_b:6:ours,color_b_late:6:ours,color_b:6:stock,color_b
 FIRE_TEST_STRIPES_BASIC = "color_b:6,color_b:8,color_b:9,color_a:6,color_a:9"
 # polydye_spit: the board's POLYDYE_SPIT_HZ, and POLYDYE_SPIT_MAX columns
 SPIT_HZ, SPIT_MAX_S = 1000, 10.
-# Test patterns: every nozzle, or positions 14-90 of each colour (what the stock firmware fires).
-TEST_PATTERNS = ('all', 'mid')
+# Test patterns: every nozzle, positions 14-90 of each colour (what the stock firmware fires), or sparse: one nozzle per
+# F3/F5 fire pulse, rotating so that SPARSE_COLUMNS columns fire every nozzle once (see sparse_column). The spit test
+# sends the index; board firmware without the POLYDYE_SPIT_PATTERNS constant has the first SPIT_PATTERNS_OLD.
+TEST_PATTERNS = ('all', 'mid', 'sparse')
+TEST_PATTERN_TEXT = {'all': "all-nozzle", 'mid': "positions 14-90", 'sparse': "sparse (one nozzle per fire pulse)"}
+SPIT_PATTERNS_OLD = 2
+SPARSE_COLUMNS = 12
 MID_POSITIONS = range(14, 91)
 # The board refuses live ink within 0.1 s of the boost turning on; POLYDYE_ENABLE keeps the next moves this far out.
 BOOST_SETTLE = 0.15
@@ -245,6 +250,19 @@ def color_column(positions):
     return bytes(col)
 
 
+def sparse_column(k):
+    """Column k of the sparse pattern, as the board firmware's printcart_pattern_sparse makes it for the spit test: in
+    each of the 14 packets, data line k % 3 (D1, D2, D3) fires bit b = (k // 3) % 4 and bit b + 4. The board pulses F3
+    only for a packet with a bit 0-3 set and F5 for bits 4-7, so each F3 and each F5 pulse has exactly one nozzle
+    enabled, where a solid column puts up to 12 on one pulse. SPARSE_COLUMNS columns fire every nozzle exactly once.
+    Raw nozzle bytes, so it works for colour and black cartridges alike."""
+    col = bytearray(NOZDATA_SIZE)
+    line, bit = k % 3, (k // 3) % 4
+    for packet in range(14):
+        col[14 * line + packet] = (1 << bit) | (1 << (bit + 4))
+    return bytes(col)
+
+
 def stripe_positions(axis, x, y, spacing, count):
     """Bed (X, Y) of each fire-test stripe's first column: stripes run along the pass axis, side by side across it."""
     if axis == 'y':
@@ -260,8 +278,10 @@ def test_pass_data(pattern, columns, repeat=1):
         cols = [full if i % 2 == 0 else empty for i in range(columns)]
     elif pattern in ('all', 'none', 'mid'):
         cols = [{'all': full, 'none': empty, 'mid': color_column(MID_POSITIONS)}[pattern]] * columns
+    elif pattern == 'sparse':
+        cols = [sparse_column(i) for i in range(columns)]
     else:
-        raise ValueError("PATTERN must be alternate, all, none or mid")
+        raise ValueError("PATTERN must be alternate, all, none, mid or sparse")
     return b"".join(col * repeat for col in cols), columns * repeat
 
 
@@ -340,6 +360,7 @@ class PolyDye:
         self.schedule_cmd = self.mode_cmd = self.cancel_cmd = None
         self.set_template_cmd = self.set_pulse_cmd = self.query_cartridge_cmd = None
         self.set_level_cmd = self.query_level_cmd = self.spit_cmd = None
+        self.spit_patterns = 0
         self.set_clock_cmd = self.query_clock_cmd = None
         self.last_status = {}
         self.last_pass = None
@@ -380,6 +401,9 @@ class PolyDye:
             self.query_level_cmd = self.mcu.lookup_query_command("polydye_query_level oid=%c", LEVEL, oid=self.oid,
                                                                  cq=cq)
             self.spit_cmd = self.mcu.lookup_command("polydye_spit oid=%c columns=%hu pattern=%c", cq=cq)
+            # The sparse pattern came later, with this constant.
+            self.spit_patterns = min(len(TEST_PATTERNS), int(self.mcu.get_constants().get('POLYDYE_SPIT_PATTERNS',
+                                                                                          SPIT_PATTERNS_OLD)))
         # color_b_late and the bus clock choice came with the stock-firmware comparison.
         if self.mcu.try_lookup_command("polydye_query_clock oid=%c") is not None:
             self.set_clock_cmd = self.mcu.lookup_command("polydye_set_clock oid=%c stock=%c", cq=cq)
@@ -717,8 +741,8 @@ class PolyDye:
         if clock is not None and not clock_first:
             self.set_clock_cmd.send([self.oid, CLOCKS.index(clock)])
 
-    cmd_POLYDYE_UPLOAD_TEST_PASS_help = ("Upload a test pattern pass (PATTERN=alternate|all|none|mid, each column REPEAT "
-                                         "times) to the PolyDye board; not during a print")
+    cmd_POLYDYE_UPLOAD_TEST_PASS_help = ("Upload a test pattern pass (PATTERN=alternate|all|none|mid|sparse, each "
+                                         "column REPEAT times) to the PolyDye board; not during a print")
 
     def cmd_POLYDYE_UPLOAD_TEST_PASS(self, gcmd):
         layer = gcmd.get_int('LAYER', 0, minval=0, maxval=65535)
@@ -810,9 +834,9 @@ class PolyDye:
             reactor.pause(reactor.monotonic() + 0.1)
 
     cmd_POLYDYE_FIRE_TEST_help = ("LIVE INK on paper: one stripe per TEMPLATE:PULSE[:CLOCK] in STRIPES, side by side "
-                                  "from X, Y, SPACING mm apart, at Z if given, PATTERN=all|mid; restores the template, "
-                                  "pulse, clock and G-code state afterwards. UPLOAD=0 prints the pass already stored as "
-                                  "LAYER, PASS instead")
+                                  "from X, Y, SPACING mm apart, at Z if given, PATTERN=all|mid|sparse; restores the "
+                                  "template, pulse, clock and G-code state afterwards. UPLOAD=0 prints the pass "
+                                  "already stored as LAYER, PASS instead")
 
     def cmd_POLYDYE_FIRE_TEST(self, gcmd):
         if self.query_cartridge_cmd is None:
@@ -828,7 +852,7 @@ class PolyDye:
                              "update it from the PolyDye page (Board firmware)")
         pattern = gcmd.get('PATTERN', 'all').lower()
         if pattern not in TEST_PATTERNS:
-            raise gcmd.error("POLYDYE_FIRE_TEST: PATTERN must be all or mid")
+            raise gcmd.error("POLYDYE_FIRE_TEST: PATTERN must be all, mid or sparse")
         x = gcmd.get_float('X', 70.)
         y = gcmd.get_float('Y', 60.)
         z = gcmd.get_float('Z', None, minval=0.2)
@@ -894,9 +918,9 @@ class PolyDye:
                     logging.exception("polydye: fire test couldn't restore the G-code state")
         gcmd.respond_info("PolyDye fire test done; %s" % (cartridge_text(self._fresh_status()),))
 
-    cmd_POLYDYE_SPIT_help = ("LIVE INK, no motion: fire every nozzle (PATTERN=all) or positions 14-90 (mid) for "
-                             "SECONDS (max 10) at 1 kHz into a paper towel held under the cartridge, optionally with "
-                             "TEMPLATE, PULSE and CLOCK; needs CONFIRM=1")
+    cmd_POLYDYE_SPIT_help = ("LIVE INK, no motion: fire every nozzle (PATTERN=all), positions 14-90 (mid) or one "
+                             "nozzle per fire pulse in turn (sparse) for SECONDS (max 10) at 1 kHz into a paper towel "
+                             "held under the cartridge, optionally with TEMPLATE, PULSE and CLOCK; needs CONFIRM=1")
 
     def cmd_POLYDYE_SPIT(self, gcmd):
         if self.spit_cmd is None:
@@ -916,7 +940,11 @@ class PolyDye:
                 raise gcmd.error("POLYDYE_SPIT: CLOCK must be ours or stock")
         pattern = gcmd.get('PATTERN', 'all').lower()
         if pattern not in TEST_PATTERNS:
-            raise gcmd.error("POLYDYE_SPIT: PATTERN must be all or mid")
+            raise gcmd.error("POLYDYE_SPIT: PATTERN must be all, mid or sparse")
+        if TEST_PATTERNS.index(pattern) >= self.spit_patterns:
+            raise gcmd.error("POLYDYE_SPIT: PATTERN=%s needs newer PolyDye board firmware; update it from the PolyDye "
+                             "page (Board firmware: Update to bundled firmware). POLYDYE_FIRE_TEST PATTERN=%s works "
+                             "with this one" % (pattern, pattern))
         if gcmd.get_int('CONFIRM', 0) != 1:
             raise gcmd.error("POLYDYE_SPIT fires every nozzle with live ink: hold a folded paper towel under the "
                              "cartridge, then run it again with CONFIRM=1")
@@ -932,6 +960,7 @@ class PolyDye:
         if limit:
             raise gcmd.error("POLYDYE_SPIT: %s" % (limit,))
         columns = max(1, int(round(seconds * SPIT_HZ)))
+        used = {}
         try:
             self.mode_cmd.send([self.oid, 0, 0])
             self._wait_off_and_idle()
@@ -943,9 +972,9 @@ class PolyDye:
             st = self._fresh_status()
             if not st['live']:
                 raise gcmd.error("POLYDYE_SPIT: the board didn't turn live ink on (disarmed on its console?)")
+            used = st
             gcmd.respond_info("PolyDye spit test: %d %s columns at %d Hz, %s"
-                              % (columns, "all-nozzle" if pattern == 'all' else "positions 14-90", SPIT_HZ,
-                                 cartridge_text(st)))
+                              % (columns, TEST_PATTERN_TEXT[pattern], SPIT_HZ, cartridge_text(st)))
             # The board starts it no sooner than 0.1 s after the boost came on.
             self.spit_cmd.send([self.oid, columns, TEST_PATTERNS.index(pattern)])
             end = reactor.monotonic() + seconds + 5.
@@ -960,7 +989,13 @@ class PolyDye:
         finally:
             self._restore_after_test(before)
         st = self._fresh_status()
-        gcmd.respond_info("PolyDye spit test done (faults=%d); %s" % (st['faults'], cartridge_text(st)))
+        # The bus rate the board measured is that of the spit's last column: it goes with the settings it fired with.
+        # Compare the settings, not the text, to tell whether they were put back to something else.
+        settings = ('cartridge_template', 'pulse_words', 'bus_clock')
+        restored = [st.get(key) for key in settings] != [used.get(key) for key in settings]
+        gcmd.respond_info("PolyDye spit test done (faults=%d): fired with %s%s" % (
+            st['faults'], cartridge_text(dict(used, bus_hz_measured=st.get('bus_hz_measured'))),
+            "; now back to %s" % (cartridge_text(dict(st, bus_hz_measured=None)),) if restored else ""))
 
     def _restore_after_test(self, before):
         """Always turn PolyDye off and put the template, pulse and clock back, even after an error (which is re-raised by
@@ -979,7 +1014,8 @@ class PolyDye:
 
     def get_status(self, eventtime):
         return dict(self.last_status, last_pass=self.last_pass, pass_axis=self.pass_axis, offset_x=self.offset_x,
-                    offset_y=self.offset_y, direction_trim=self.direction_trim)
+                    offset_y=self.offset_y, direction_trim=self.direction_trim,
+                    spit_patterns=list(TEST_PATTERNS[:self.spit_patterns]))
 
 
 def load_config(config):

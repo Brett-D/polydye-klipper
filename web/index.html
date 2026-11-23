@@ -182,7 +182,10 @@
         <label>Z (mm)<input name="z" type="number" step="any" min="0.2" value="0.5"></label>
         <label>Spacing (mm)<input name="spacing" type="number" step="any" min="1" value="18"></label>
         <label>Nozzles
-          <select name="pattern"><option value="all">all</option><option value="mid">positions 14-90 (as stock)</option></select>
+          <select name="pattern">
+            <option value="all">all</option><option value="mid">positions 14-90 (as stock)</option>
+            <option value="sparse">sparse: one per fire pulse</option>
+          </select>
         </label>
         <label class="wide">Stripes (template:pulse words[:clock], &hellip;)
           <input name="stripes" value="color_b:6:ours,color_b_late:6:ours,color_b:6:stock,color_b_late:6:stock,color_b:9:ours,color_b_late:9:ours,color_b:8:stock,color_b_late:8:stock"></label>
@@ -195,7 +198,9 @@
       <p class="hint">Fires every nozzle 1000 times a second for a few seconds without moving. Hold a folded paper
         towel under the cartridge, against the nozzles: a working cartridge leaves a coloured patch. It is also a
         steady load for a USB-C power meter on the board's power input (J4): compare the current with the
-        cartridge in and out to see whether the nozzle heaters draw anything.</p>
+        cartridge in and out to see whether the nozzle heaters draw anything. Sparse fires one nozzle per fire
+        pulse instead of up to 12, going through every nozzle in turn, in case a full column starves the
+        heaters' supply.</p>
       <form id="spit-form" class="compact">
         <label>Seconds<input name="seconds" type="number" step="0.5" min="0.5" max="10" value="2"></label>
         <label>Template
@@ -211,12 +216,17 @@
           <select name="clock"><option value="">Current</option><option value="ours">ours</option><option value="stock">stock</option></select>
         </label>
         <label>Nozzles
-          <select name="pattern"><option value="all">all</option><option value="mid">positions 14-90 (as stock)</option></select>
+          <select name="pattern">
+            <option value="all">all</option><option value="mid">positions 14-90 (as stock)</option>
+            <option value="sparse">sparse: one per fire pulse</option>
+          </select>
         </label>
       </form>
       <div class="buttons">
         <button id="spit-btn" class="danger">Spit test&hellip;</button>
       </div>
+      <p class="hint hidden" id="spit-sparse-old">The sparse spit test needs newer board firmware: Update to bundled
+        firmware under Board firmware. The fire test's sparse stripes work with this one.</p>
       <p class="hint hidden" id="diag-old">The spit test, the signal check and the stock timing options need newer
         board firmware: update it under Board firmware.</p>
       <h3>Next steps</h3>

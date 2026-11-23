@@ -848,6 +848,7 @@ $('fire-form').addEventListener('input', (ev) => {
 });
 $('fire-form').addEventListener('submit', (ev) => ev.preventDefault());
 $('spit-form').addEventListener('submit', (ev) => ev.preventDefault());
+$('spit-form').addEventListener('change', () => render());
 
 $('fire-btn').addEventListener('click', () => {
   const v = fireValues();
@@ -872,9 +873,14 @@ $('spit-btn').addEventListener('click', () => {
       + `the limit is ${PULSE_MAX_US} µs`);
     return;
   }
-  const which = f.pattern.value === 'mid' ? 'Nozzle positions 14-90 fire' : 'Every nozzle fires';
+  const rate = `${SPIT_HZ} times a second for ${seconds} s`;
+  const which = {
+    mid: `Nozzle positions 14-90 fire ${rate}.`,
+    sparse: `${SPIT_HZ} columns a second for ${seconds} s, each firing one nozzle per fire pulse, a different one `
+      + 'each column, so every nozzle fires in turn.',
+  }[f.pattern.value] || `Every nozzle fires ${rate}.`;
   const ok = window.confirm(`Spit test: LIVE INK, no motion.\n\nHold a folded paper towel under the cartridge, `
-    + `against the nozzles. ${which} ${SPIT_HZ} times a second for ${seconds} s.`);
+    + `against the nozzles. ${which}`);
   if (!ok) return;
   gcode(`POLYDYE_SPIT SECONDS=${seconds}${f.template.value ? ` TEMPLATE=${f.template.value}` : ''}`
     + `${pulse >= 6 && pulse <= 12 ? ` PULSE=${pulse}` : ''}${f.clock.value ? ` CLOCK=${f.clock.value}` : ''}`
@@ -891,7 +897,11 @@ function renderDiagnostics(pd, printing) {
     $('fire-form').elements.stripes.value = 'bus_clock' in pd ? FIRE_STRIPES : FIRE_STRIPES_BASIC;
   }
   $('fire-btn').disabled = !known || !pd.cartridge_template || busy || !fireValues().valid;
-  $('spit-btn').disabled = !diag || busy;
+  // Board firmware before the sparse pattern can't spit it; the fire test sends its columns itself.
+  const sparseOld = diag && $('spit-form').elements.pattern.value === 'sparse'
+    && !(pd.spit_patterns || []).includes('sparse');
+  $('spit-sparse-old').classList.toggle('hidden', !sparseOld);
+  $('spit-btn').disabled = !diag || busy || sparseOld;
   const cartOut = $('sig-cart-out').checked;
   const level = pd.level || null;
   $('sig-start').disabled = !diag || busy || !cartOut || !!pd.live;
