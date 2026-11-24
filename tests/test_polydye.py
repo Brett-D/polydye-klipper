@@ -1025,6 +1025,12 @@ class TestCleanup(unittest.TestCase):
 
     def test_fire_test_defaults_to_the_stock_firmware(self):
         pd, board = self.make(fail_on="NOTHING")
+        # The stock pattern is for colour templates: a black stripe is refused before anything moves or prints.
+        for stripes in ("color_b:6:ours,black_b:6:ours", "black_a:6"):
+            with self.assertRaisesRegex(RuntimeError, "PATTERN=stock is for a colour cartridge template, not black"):
+                pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES=stripes, X=80., Y=60., SPACING=20., COLUMNS=600,
+                                                   UPLOAD=1, LAYER=0, PASS=0))
+        self.assertEqual(board.sent, [])
         pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(X=80., Y=60., SPACING=20., COLUMNS=600, UPLOAD=1, LAYER=0, PASS=0))
         self.assertIn("POLYDYE_CARTRIDGE TEMPLATE=color_b_late PULSE=6 CLOCK=stock", board.sent)
         self.assertIn("POLYDYE_UPLOAD_TEST_PASS LAYER=0 PASS=0 COLUMNS=300 PATTERN=stock DENSITY=24.90234375 REPEAT=2 "

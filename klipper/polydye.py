@@ -1092,8 +1092,8 @@ class PolyDye:
 
     cmd_POLYDYE_CARTRIDGE_help = ("Set the cartridge waveform template (TEMPLATE=color_a|color_b|black_a|black_b|"
                                   "color_b_late|deskjet), fire pulse (PULSE in words: 6-9 at our clock, 6-8 at stock, 3-4 at "
-                                  "half) and bus clock (CLOCK=ours|stock|half) until the next restart; PolyDye must be "
-                                  "off and idle")
+                                  "half) and bus clock (CLOCK=ours|stock|half) until the next restart; live ink must be "
+                                  "off and the board idle")
 
     def cmd_POLYDYE_CARTRIDGE(self, gcmd):
         if self.query_cartridge_cmd is None:
@@ -1311,6 +1311,13 @@ class PolyDye:
         upload = gcmd.get_int('UPLOAD', 1, minval=0, maxval=1)
         layer = gcmd.get_int('LAYER', 0, minval=0, maxval=65535)
         pass_num = gcmd.get_int('PASS', 0, minval=0, maxval=65535)
+        # mid and stock are colour patterns: refuse a black stripe before anything moves or prints (a stored pass,
+        # UPLOAD=0, is checked against its own cartridge type below).
+        if upload and pattern in ('mid', 'stock'):
+            black = [tpl for tpl, _, _ in stripes if tpl.startswith('black')]
+            if black:
+                raise gcmd.error("POLYDYE_FIRE_TEST: PATTERN=%s is for a colour cartridge template, not %s; use "
+                                 "PATTERN=all or sparse for black stripes" % (pattern, ", ".join(black)))
         # A head warm-up right before each stripe (POLYDYE_WARM with the stripe's template and clock, after its
         # upload), so the head is hot when the pass starts: only travel and run-up come in between.
         warm = gcmd.get_float('WARM', 0., minval=0., maxval=WARM_MAX_S)
