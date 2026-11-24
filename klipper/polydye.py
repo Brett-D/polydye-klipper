@@ -85,6 +85,7 @@ SPIT_EXT_MAX_COLUMNS = int(SPIT_EXT_MAX_S * SPIT_HZ)
 # WARM_MAX_COLUMNS columns.
 WARM_OLD_S, WARM_OLD_WORDS, WARM_OLD_US, WARM_MAX_COLUMNS = 10., 2, 0.75, 65535
 WARM_SHORT_US = 0.75
+WARM_MAX_S = 30.  # the longest warm-up any board firmware takes (POLYDYE_WARM_MAX_MS); older firmware's is WARM_OLD_S
 # A spit test with PERIOD_US (board firmware with polydye_spit_run) keeps the board's column limits: at most
 # SPIT_MAX_COLUMNS (SPIT_EXT_MAX_COLUMNS extended), so a shorter period means a shorter spit. The period must be at
 # least the column's time on the bus plus PERIOD_MARGIN_US (the board's printcart_min_period_us()): 14 packets of the
@@ -550,8 +551,9 @@ def test_pass_data(pattern, columns, repeat=1, random=None):
     if pattern == 'stock':
         r = dict(random or STOCK_RANDOM, repeat=repeat)
         plan = random_plan(r)
-        total = columns * repeat
-        return b"".join(random_column(i, r, plan) for i in range(total)), total
+        # Random column k is column k // repeat of the pattern: work each one out once and repeat its bytes.
+        cols = [random_column(i * repeat, r, plan) for i in range(columns)]
+        return b"".join(col * repeat for col in cols), columns * repeat
     if pattern == 'alternate':
         cols = [full if i % 2 == 0 else empty for i in range(columns)]
     elif pattern in ('all', 'none', 'mid'):
@@ -1435,15 +1437,21 @@ class PolyDye:
             raise gcmd.error("POLYDYE_SPIT: EXTENDED=1 needs newer PolyDye board firmware; update it from the PolyDye "
                              "page (Board firmware: Update to bundled firmware)")
         if warm_only:
-            warm = gcmd.get_float('SECONDS', 2., above=0., maxval=self.warm_max_s)
+            warm = gcmd.get_float('SECONDS', 2., above=0., maxval=WARM_MAX_S)
             seconds, period = 0., None
         else:
             seconds = gcmd.get_float('SECONDS', 2., above=0., maxval=SPIT_MAX_S)
             if extended and seconds > SPIT_EXT_MAX_S:
                 raise gcmd.error("POLYDYE_SPIT: an EXTENDED=1 spit test lasts at most %g s (SECONDS=%g)"
                                  % (SPIT_EXT_MAX_S, seconds))
-            warm = gcmd.get_float('WARM', 0., minval=0., maxval=self.warm_max_s)
+            warm = gcmd.get_float('WARM', 0., minval=0., maxval=WARM_MAX_S)
             period = gcmd.get_int('PERIOD_US', None, minval=1, maxval=65535)
+        if warm > self.warm_max_s + 1e-9:
+            if self.warm_duty_ppm is None:
+                raise gcmd.error("%s: a %g s warm-up needs newer PolyDye board firmware, which warms up for up to %g "
+                                 "s; update it from the PolyDye page (Board firmware: Update to bundled firmware). This "
+                                 "one warms up for at most %g s" % (cmd, warm, WARM_MAX_S, self.warm_max_s))
+            raise gcmd.error("%s: a warm-up lasts at most %g s" % (cmd, self.warm_max_s))
         for option, wanted in (("PERIOD_US", period is not None), ("WARM" if not warm_only else "it", warm > 0)):
             if wanted and self.spit_run_cmd is None:
                 raise gcmd.error("%s: %s needs newer PolyDye board firmware; update it from the PolyDye page (Board "

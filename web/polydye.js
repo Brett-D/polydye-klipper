@@ -646,6 +646,7 @@ const KNOBS = [
   ['last', 'LAST', 0, 111, true], ['per_pulse', 'PER_PULSE', 0, 12, true],
 ];
 const WARM_OLD_US = 0.75;  // warm-up pulse limit of board firmware without the warm-up duty limit (polydye.py)
+const WARM_OLD_S = 10;     // and its longest warm-up
 
 // A number field's value: { empty } when blank, { bad } when it isn't a number in min..max (whole if asked).
 function numField(el, min, max, whole) {
@@ -1035,8 +1036,9 @@ function renderDiagnostics(pd, printing) {
   const randomOld = diag && !stockOld && spit.pattern.value === 'stock' && knobsGiven(spit) && !pd.spit_random;
   const warmWords = parseInt(spit.warm_pulse.value, 10);
   const warmClock = spit.clock.value || (spit.pattern.value === 'stock' ? 'stock' : pd.bus_clock || 'ours');
-  const warmOld = diag && !stockOld && parseFloat(spit.warm.value) > 0 && warmWords > 0 && !pd.warm_duty_ppm
-    && pulseUs(warmWords, warmClock) > WARM_OLD_US + 1e-9;
+  const warmOld = diag && !stockOld && parseFloat(spit.warm.value) > 0 && !pd.warm_duty_ppm
+    && ((warmWords > 0 && pulseUs(warmWords, warmClock) > WARM_OLD_US + 1e-9)
+      || parseFloat(spit.warm.value) > (pd.warm_max_s || WARM_OLD_S) + 1e-9);
   showKnobs();
   const oldText = [];
   if (sparseOld) {
@@ -1054,8 +1056,8 @@ function renderDiagnostics(pd, printing) {
       + 'under Board firmware. The fire test takes them with this one.');
   }
   if (warmOld) {
-    oldText.push(`Warm-up pulses longer than ${WARM_OLD_US} µs need newer board firmware: Update to bundled firmware `
-      + 'under Board firmware.');
+    oldText.push(`Warm-up pulses longer than ${WARM_OLD_US} µs and warm-ups longer than ${WARM_OLD_S} s need newer `
+      + 'board firmware: Update to bundled firmware under Board firmware.');
   }
   $('spit-fw-old').textContent = oldText.join(' ');
   $('spit-fw-old').classList.toggle('hidden', !oldText.length);

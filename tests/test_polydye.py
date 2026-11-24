@@ -781,6 +781,10 @@ class TestCleanup(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "WARM_PULSE=12 is 3.60 us at the ours clock; a warm-up pulse is at "
                                                   "most 0.75 us"):
             self.spit(SECONDS=1., PATTERN='all', WARM=2., WARM_PULSE=12)
+        # Longer than its 10 s too; newer firmware takes 30 s.
+        with self.assertRaisesRegex(RuntimeError, "a 20 s warm-up needs newer PolyDye board firmware, which warms up "
+                                                  "for up to 30 s.*at most 10 s"):
+            self.spit(SECONDS=1., PATTERN='all', WARM=20.)
         with self.assertRaisesRegex(RuntimeError, "warm-up period must be at least 168 us"):
             self.spit(SECONDS=1., PATTERN='all', WARM=1., WARM_PERIOD_US=150)
         _, _, sent = self.spit(SECONDS=1., PATTERN='all', WARM=1., WARM_PULSE=1, WARM_PERIOD_US=500)
