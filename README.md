@@ -13,6 +13,15 @@ tells it exactly when each ink pass starts. No extra wiring to the printer's mai
 
 The board needs the PolyDye firmware with the Klipper link (phase 3 or later).
 
+**Stock baseline.** By default PolyDye drives the cartridge the way the stock PolyDye firmware does, under Klipper:
+the `color_b_late` waveform with a 6-word (2.10 µs) pulse at the stock bus clock (2.857 MHz, set once when the board
+starts), stock's drive strengths and nozzle order, the stock firmware's random pattern (a random 24.9 % of positions
+14–85, each column twice) in the spit and fire tests, a column every ~504–508 µs, and the boost left on between
+tests (live ink off) as stock keeps it on from boot. A shutdown, Klipper going away, `POLYDYE_DISABLE` or 30 minutes
+unused turn it off. Everything else (other patterns, knobs, warm-ups, other templates and clocks, `EXTENDED`) is an
+opt-in experiment checked against that baseline. This needs this add-on's bundled board firmware; leave
+`cartridge_template`, `pulse_words`, `bus_clock`, `dpi` and `pass_speed` unset in `polydye.cfg` to get it.
+
 Licence: GPLv3.
 
 ## Install
@@ -86,7 +95,7 @@ does. It shows:
   them into `polydye.cfg` and **Back to stored values** undoes the nudges.
 - **Calibration:**
   - **Fire test** (live ink on paper, with a confirmation): one stripe per template, fire pulse and bus clock, side by
-    side, with a table of where each stripe goes (`PD_FIRE_TEST`). The default stripes are an A/B matrix of our timing
+    side, with a table of where each stripe goes (`PD_FIRE_TEST`). The default is one stripe of the stock firmware's settings and pattern; earlier defaults were an A/B matrix of our timing
     and the stock PolyDye firmware's: color_b vs color_b_late, our clock vs the stock one, at pulse 6 and the longest
     allowed (9 words with our clock, 8 with the stock one).
   - **Spit test** (live ink, no motion, with a confirmation): every nozzle (or positions 14–90) fires 1000 times a
@@ -100,6 +109,9 @@ does. It shows:
   - Both tests can also run at the **half bus clock** (1.667 MHz, `CLOCK=half` or `:half` stripes, with a 3 or 4-word
     pulse): the same waveform with twice the time for every edge, in case the level shifters are too slow under the
     cartridge's load. It needs current board firmware (Update to bundled firmware).
+  - Both tests have the **like stock** pattern with its knobs (density, repeat, colours, first and last position,
+    heaters per pulse; shown when it is picked), and the spit test a **warm-up first** (seconds, pulse, period) that
+    runs in the same board run right before the spit.
 - **Signal check** (cartridge out, multimeter): a guided check of where each cartridge signal arrives. The page
   holds one line HIGH at a time (`POLYDYE_LEVEL`) and shows the voltage to expect. You probe at one of two places:
   - **CD4504 output legs** on the daughter board, black lead on pin 8: the page shows the leg each line should
@@ -232,11 +244,11 @@ offset_x: 58.6        # cartridge nozzle-row centre minus hotend nozzle, mm (bed
 offset_y: -8.7
 # Optional:
 #direction_trim: 0    # mm: moves the ink of reverse (DIR=-1) passes along the pass axis to meet forward passes
-#cartridge_template:  # color_a, color_b, black_a, black_b, color_b_late or deskjet; default: the board's own (color_b)
-#pulse_words:         # fire pulse in bus words, 1.8-2.9 us: 6-9 with our clock, 6-8 with stock, 3-4 with half; default: 6
-#bus_clock:           # ours (3.333 MHz), stock (2.857 MHz) or half (1.667 MHz); default: the board's own (ours)
-#dpi: 600             # dots per inch along the pass
-#pass_speed: 50       # mm/s
+#cartridge_template:  # color_b_late, black_a, black_b (or color_a, color_b, deskjet); default: the board's own (color_b_late)
+#pulse_words:         # fire pulse in bus words, 1.8-2.9 us: 6-8 with stock, 6-9 with our clock, 3-4 with half; default: 6
+#bus_clock:           # stock (2.857 MHz), ours (3.333 MHz) or half (1.667 MHz); default: the board's own (stock)
+#dpi: 847             # bus columns per inch along the pass (stock: 3,333 per 100 mm, each image column twice)
+#pass_speed: 59.5     # mm/s (stock's F3570: a column every 504 us at 847)
 #travel_speed: 150    # mm/s, moves to the start of each pass
 #extra_run_up: 1.0    # mm added to the computed run-up
 #settle_time:         # s; default: the input shaper's impulse length for the pass axis
@@ -341,11 +353,12 @@ If anything would print a pass wrongly, Klipper stops with a readable reason, fo
 | `POLYDYE_STATUS` | Board status: boost, live, passes printed and queued, worst column lateness, faults, stored passes, cartridge template, fire pulse; and the offsets and direction trim in use |
 | `POLYDYE_NUDGE [X=] [Y=] [TRIM=]` | Moves where the ink lands by `X`, `Y` mm on the bed, and the ink of reverse passes by `TRIM` mm along the pass axis (each at most ±5 mm), from the next pass on. Changes `offset_x`/`offset_y` (in the opposite direction: the offset is where the cartridge is) and `direction_trim` until the next restart |
 | `POLYDYE_OFFSET [X=] [Y=] [TRIM=]` | Sets `offset_x`, `offset_y` and `direction_trim` until the next restart; without arguments, shows them |
-| `POLYDYE_CARTRIDGE [TEMPLATE=color_a\|color_b\|black_a\|black_b\|color_b_late\|deskjet] [PULSE=3..9] [CLOCK=ours\|stock\|half]` | Switches the board's waveform template, fire pulse and bus clock until the next restart (to compare them at the nozzle check); without arguments, shows them. Only with PolyDye off and no passes queued |
-| `POLYDYE_UPLOAD_TEST_PASS [LAYER=0] [PASS=0] [COLUMNS=600] [PATTERN=alternate\|all\|none\|mid\|sparse] [REPEAT=1]` | Uploads a test pass over the board's data port. `mid` fires nozzle positions 14–90 of every colour (what the stock firmware fires; colour cartridges only); `sparse` fires one nozzle per fire pulse, a different one each column (12 columns go through them all); `REPEAT` sends each column that many times in a row, so the pass has `COLUMNS` × `REPEAT` columns (at most 65535). Not during a print: it briefly blocks Klipper while it sends |
-| `POLYDYE_FIRE_TEST [X=70] [Y=60] [Z=] [SPACING=18] [STRIPES=…] [PATTERN=all\|mid\|sparse] [COLUMNS=600] [UPLOAD=1] [LAYER=0] [PASS=0]` | **Live ink.** Prints one stripe per `TEMPLATE:PULSE[:CLOCK]` in `STRIPES` (`CLOCK` ours, stock or half, e.g. `color_b:4:half`): a pass of `COLUMNS` columns along the pass axis, the stripes `SPACING` mm apart across it, the first at `X`, `Y`. A stripe without a clock uses the one in effect. The default is the A/B matrix `color_b` / `color_b_late` × `ours` / `stock` × pulse 6 / the longest allowed (9 words with our clock, 8 with the stock one; with older board firmware: `color_b:6,color_b:8,color_b:9,color_a:6,color_a:9`). `UPLOAD=0` prints the pass already stored as `LAYER`, `PASS` instead. Moves to `Z` first if given. Refused during a print, also a paused one. Turns PolyDye off and puts the template, pulse, clock and G-code state back afterwards, also after an error. Doesn't home (`PD_FIRE_TEST` does) |
-| `POLYDYE_SPIT [SECONDS=2] [TEMPLATE=] [PULSE=] [CLOCK=ours\|stock\|half] [PATTERN=all\|mid\|sparse\|stock] [PERIOD_US=1000] [WARM=0] [WARM_PULSE=1\|2] [WARM_PERIOD_US=] [EXTENDED=1] CONFIRM=1` | **Live ink, no motion.** Fires every nozzle (or positions 14–90, or `sparse`: one nozzle per fire pulse in turn, which needs board firmware with it, or `stock`: like the stock firmware, see below) at 1 kHz, or a column every `PERIOD_US`, for `SECONDS` (at most 10, and at most 10000 columns) into a paper towel held under the cartridge, through the same waveform and safety checks as a pass, starting at least 0.1 s after the boost came on. Refused without `CONFIRM=1`, during a print (also a paused one) or with passes queued. Turns PolyDye off and puts the template, pulse and clock back afterwards. `WARM` warms the head first (see below). **`EXTENDED=1` is experimental and can burn out nozzles** (see below) |
-| `POLYDYE_WARM [SECONDS=2] [WARM_PULSE=1\|2] [WARM_PERIOD_US=] [TEMPLATE=] [CLOCK=] CONFIRM=1` | **Experimental, heaters on, no motion.** The head warm-up of `POLYDYE_SPIT WARM=` on its own (see below), at most 10 s |
+| `POLYDYE_CARTRIDGE [TEMPLATE=color_a\|color_b\|black_a\|black_b\|color_b_late\|deskjet] [PULSE=3..9] [CLOCK=ours\|stock\|half]` | Switches the board's waveform template, fire pulse and bus clock until the next restart (to compare them at the nozzle check); without arguments, shows them. Only with live ink off and no passes queued (with older board firmware, the boost off too) |
+| `POLYDYE_UPLOAD_TEST_PASS [LAYER=0] [PASS=0] [COLUMNS=600] [PATTERN=alternate\|all\|none\|mid\|sparse\|stock] [REPEAT=1] [DENSITY=] [COLORS=] [FIRST=] [LAST=] [PER_PULSE=]` | Uploads a test pass over the board's data port. `mid` fires nozzle positions 14–90 of every colour (what the stock firmware fires; colour cartridges only); `sparse` fires one nozzle per fire pulse, a different one each column (12 columns go through them all); `stock` is the stock firmware's random pattern with its knobs (below; `REPEAT` defaults to 2 there, at most 16; colour cartridges only); `REPEAT` sends each column that many times in a row, so the pass has `COLUMNS` × `REPEAT` columns (at most 65535). Not during a print: it briefly blocks Klipper while it sends |
+| `POLYDYE_FIRE_TEST [X=70] [Y=60] [Z=] [SPACING=18] [STRIPES=…] [PATTERN=all\|mid\|sparse\|stock] [DENSITY=] [REPEAT=] [COLORS=] [FIRST=] [LAST=] [PER_PULSE=] [WARM=0] [WARM_PULSE=] [WARM_PERIOD_US=] [COLUMNS=600] [UPLOAD=1] [LAYER=0] [PASS=0]` | **Live ink.** Prints one stripe per `TEMPLATE:PULSE[:CLOCK]` in `STRIPES` (`CLOCK` ours, stock or half, e.g. `color_b:4:half`): a pass of `COLUMNS` columns along the pass axis, the stripes `SPACING` mm apart across it, the first at `X`, `Y`. A stripe without a clock uses the one in effect. The default is one stripe with the stock firmware's settings, `color_b_late:6:stock` (with older board firmware: `color_b:6,color_b:8,color_b:9,color_a:6,color_a:9`). `PATTERN=stock` (the default) prints the stock firmware's random pattern, the one that ejects ink on a cold head, with the spit test's knobs (below), on any board firmware: the add-on makes the columns. `WARM` warms the head for that many seconds right before each stripe (`POLYDYE_WARM` with the stripe's template and clock, after its upload, so only the travel and run-up come in between; board firmware with the warm-up). `UPLOAD=0` prints the pass already stored as `LAYER`, `PASS` instead. Moves to `Z` first if given. Refused during a print, also a paused one, and with a black stripe for `PATTERN=stock` or `mid` (colour patterns) before anything moves. Afterwards, also after an error, turns live ink off (and the boost too with older board firmware; with this add-on's bundled firmware the boost stays on, as stock keeps it, until `POLYDYE_DISABLE`, a shutdown or 30 min unused; see "Stock baseline") and puts the template, pulse, clock and G-code state back. Doesn't home (`PD_FIRE_TEST` does) |
+| `POLYDYE_SPIT [SECONDS=2] [TEMPLATE=] [PULSE=] [CLOCK=ours\|stock\|half] [PATTERN=all\|mid\|sparse\|stock] [DENSITY=] [REPEAT=] [COLORS=] [FIRST=] [LAST=] [PER_PULSE=] [PERIOD_US=1000] [WARM=0] [WARM_PULSE=] [WARM_PERIOD_US=] [EXTENDED=1] CONFIRM=1` | **Live ink, no motion.** Fires like the stock firmware (`PATTERN=stock`, the default, with its knobs, see below) a column every 508 µs, or every nozzle (`all`), positions 14–90 (`mid`) or one nozzle per fire pulse in turn (`sparse`) at 1 kHz, or a column every `PERIOD_US`, for `SECONDS` (at most 10, and at most 10000 columns) into a paper towel held under the cartridge, through the same waveform and safety checks as a pass, starting at least 0.1 s after the boost came on. Refused without `CONFIRM=1`, during a print (also a paused one) or with passes queued. Turns live ink off afterwards (and the boost too with older board firmware; see "Stock baseline") and puts the template, pulse and clock back. `WARM` warms the head first, in the same board run (see below). **`EXTENDED=1` is experimental and can burn out nozzles** (see below) |
+| `POLYDYE_WARM [SECONDS=2] [WARM_PULSE=] [WARM_PERIOD_US=] [TEMPLATE=] [CLOCK=] CONFIRM=1` | **Experimental, heaters on, no motion.** The head warm-up of `POLYDYE_SPIT WARM=` on its own (see below), at most 30 s |
+| `POLYDYE_CLOCK_TEST [COUNT=20]` | **No ink, no motion.** Switches the bus clock between ours and stock `COUNT` times (at most 500) and has the board measure it after every switch, as it does before a live run; reports the range measured for each clock, how many times the board set the clock up again after a measurement was off and any switch that stayed wrong (an error). PolyDye must be off; puts the clock and pulse back. Needs board firmware with the clock check (see "Bus clock check") |
 | `POLYDYE_LEVEL LINE=D1\|D2\|D3\|CSYNC\|S1..S5\|DCLK [STATE=high\|low\|off]` | Signal check, **cartridge out**: holds one cartridge line at its rail voltage (`high`) or 0 V for a multimeter; `STATE=off` puts every line LOW. Needs `POLYDYE_ENABLE LIVE=0` first and nothing queued. The fire lines are never held. A line goes back to LOW after 5 minutes, or when a pass is scheduled or PolyDye turns off |
 
 Macros (Mainsail's Macros panel, while the board is plugged in):
@@ -355,7 +368,7 @@ Macros (Mainsail's Macros panel, while the board is plugged in):
 | `PD_STATUS` | `POLYDYE_STATUS` |
 | `PD_DRY_RUN_TEST [X=100] [Y=40]` | Homes if needed, lifts Z to 20 mm, uploads a test pass and prints it in both directions without ink, then reports status. The printer moves; nothing fires |
 | `PD_OFF` | Drops queued passes, then turns live output and the boost off |
-| `PD_FIRE_TEST [X=70] [Y=60] [Z=0.5] [SPACING=18] [PATTERN=all\|mid\|sparse] [STRIPES=…]` | **Live ink.** Refused during a print (also a paused one) before anything moves. Homes if needed, then runs `POLYDYE_FIRE_TEST` at `Z` |
+| `PD_FIRE_TEST [X=70] [Y=60] [Z=0.5] [SPACING=18] [PATTERN=all\|mid\|sparse\|stock] [STRIPES=…] [COLUMNS=] [DENSITY=] [REPEAT=] [COLORS=] [FIRST=] [LAST=] [PER_PULSE=] [WARM=] [WARM_PULSE=] [WARM_PERIOD_US=]` | **Live ink.** Refused during a print (also a paused one) before anything moves. Homes if needed, then runs `POLYDYE_FIRE_TEST` at `Z`; the knobs mean `PATTERN=stock` unless you give another |
 | `POLYDYE_WIPE [X=245] [LENGTH=25] [STROKES=3] [SPEED=50] [Z_HOP=1]` | Wipes the cartridge on a damp sponge at the right end of the X gantry: lifts Z by `Z_HOP`, moves to `X` (G-code coordinates; 245 suits the PolyDye mount and keeps clear of the parts at the end of the gantry), strokes `STROKES` times between `X` and `X - LENGTH` at `SPEED` mm/s, then returns. It refuses an `X` at or beyond the X axis maximum (your hard stop) before homing or moving. Homes first if needed |
 
 The macros are loaded before `polydye.cfg`, so you can change their defaults there instead of editing the add-on
@@ -374,7 +387,9 @@ remaining}` in seconds, or `null` (missing with older board firmware); and `bus_
 `bus_hz` (nominal) and `bus_hz_measured` (from the last column the board sent, `null` before one), missing with older
 board firmware. `pulse_us` follows the clock (2.857 MHz for stock, also with board firmware that reports 5.714).
 `bus_clocks` lists the clocks the board firmware offers, `templates` its templates and `spit_patterns` the spit test's
-patterns (`stock` with board firmware that also takes `PERIOD_US`). It also has `last_pass`, `pass_axis`, `offset_x`, `offset_y` and `direction_trim`, the
+patterns (`stock` with board firmware that also takes `PERIOD_US`); `spit_random` says whether the spit test takes the
+stock pattern's knobs, and `warm_max_us`, `warm_max_s` and `warm_duty_ppm` are the board's warm-up limits (`null` duty:
+older firmware, 0.75 µs pulses at most). It also has `last_pass`, `pass_axis`, `offset_x`, `offset_y` and `direction_trim`, the
 values in use including nudges.
 
 ### Stock-emulation spit test
@@ -398,26 +413,93 @@ POLYDYE_SPIT SECONDS=3 PATTERN=stock PERIOD_US=508 CONFIRM=1
 POLYDYE_SPIT SECONDS=2 PATTERN=stock PERIOD_US=254 CONFIRM=1
 ```
 
+#### The stock pattern's knobs
+
+On 7601ba6 only the stock pattern ejected ink (template, clock, period and a pulse of 1.8–3.6 µs made no difference;
+`sparse`, `mid` and `all` never did), so it has knobs for finding out why. Each is optional and starts from the stock
+pattern's value; any of them means `PATTERN=stock`:
+
+- `DENSITY`: the % of positions that fire in each column (stock 24.9).
+- `REPEAT`: each random column goes out that many times in a row, 1–16 (stock 2: the same nozzles fire again one period
+  later).
+- `COLORS`: any of `c`, `m` and `y` (stock `cmy`).
+- `FIRST`, `LAST`: the range of Sprite_tm's colour positions, 0–111 (stock 14–85).
+- `PER_PULSE`: exactly that many random heaters on every F3 and F5 fire pulse (1–12; all of the eligible ones if fewer),
+  instead of `DENSITY`. Stock averages 2.2 heaters per pulse; `all` fires 12 and `sparse` 1, never the same nozzle twice
+  in a row.
+
+The spit test needs board firmware with the knobs (this add-on's bundled firmware); `POLYDYE_FIRE_TEST` and test passes
+make the same columns in the add-on, on any board firmware.
+
+```
+POLYDYE_SPIT SECONDS=3 PERIOD_US=508 PER_PULSE=1 CONFIRM=1
+POLYDYE_SPIT SECONDS=3 PERIOD_US=508 DENSITY=25 REPEAT=1 CONFIRM=1
+POLYDYE_SPIT SECONDS=3 PERIOD_US=508 COLORS=m CONFIRM=1
+PD_FIRE_TEST STRIPES=color_b_late:6:stock,deskjet:6:ours DENSITY=25 REPEAT=2
+PD_FIRE_TEST PATTERN=stock STRIPES=color_b_late:6,color_b_late:8 X=130 Y=100 Z=1.0 WARM=10 WARM_PULSE=8 WARM_PERIOD_US=508
+```
+
+On paper the stock pattern needs a hot head too (4 of 4 bold three-colour spits after a warm-up, hit-or-miss without):
+`WARM` on the fire test warms the head right before each stripe. 8 words every 508 µs is 2.8 µs at the stock clock,
+0.55 % heater duty.
+
 ### Experimental: head warm-up
 
-`POLYDYE_SPIT ... WARM=5` warms the cartridge's head for 5 s (at most 10) right before the spit, the way HP's printers
-warm the head before printing: every nozzle fires with a pulse far too short to boil ink, as fast as the column allows,
-and the spit's first column follows the last warm-up column with no gap (the board runs both in one go).
-`POLYDYE_WARM SECONDS=5 CONFIRM=1` does the warm-up alone.
+`POLYDYE_SPIT ... WARM=20` warms the cartridge's head for 20 s (at most 30) right before the spit: every nozzle fires
+as fast as the column and the heaters' duty limit allow, and the spit's first column follows the last warm-up column
+with no gap (the board runs both in one go, so the head doesn't cool in between). `POLYDYE_WARM SECONDS=5 CONFIRM=1`
+does the warm-up alone. With 12 heaters on every fire pulse an all-nozzle column heats the head rather than spits at the
+PolyDye's 12.6 V: 21 s of `TEMPLATE=deskjet PULSE=9 PATTERN=all PERIOD_US=508` (2.7 µs) never ejected on its own, but
+straight after it the stock pattern gave a big blob in all three colours, where a cold head gave cyan only. The head
+cools back within 4–13 minutes.
 
-- `WARM_PULSE` is 1 or 2 bus words, at most 0.75 µs: 0.3 or 0.6 µs with our clock, 0.35 or 0.7 µs with the stock one,
-  0.6 µs (1 word only) with half. The default is the longer one the clock allows. Sprite_tm's ink pulse is 1.8 µs at
-  16 V; 0.6 µs at the PolyDye's 12.6 V is about 21 % of its energy.
-- `WARM_PERIOD_US` defaults to the fastest the column allows, the column's time on the bus plus 20 µs: 168 µs for
-  color_b and the stock firmware's templates with our clock, 151 µs for deskjet, 192 µs with the stock clock. A longer
-  period warms more gently.
+- `WARM_PULSE` is in bus words, up to the live limit of 2.9 µs at the clock (9 words with ours, 8 with the stock one, 4
+  at half). The default is the longest within 0.75 µs, far too short to boil ink, the way HP's printers warm the head:
+  2 words (0.6 µs) with our clock, 1 at half. Older board firmware takes at most 0.75 µs and refuses longer ones with
+  the update hint.
+- The heaters' duty, pulse / period, is at most 0.58 % (2.9 µs every 500 µs). `WARM_PERIOD_US` defaults to the fastest
+  that and the column allow: the column's time on the bus plus 20 µs for a short pulse (168 µs for color_b with our clock,
+  151 µs for deskjet), 466 µs for 2.7 µs, 483 µs for 2.8 µs.
+- The warm-up uses the spit's template and clock (one run, one clock): give the spit `TEMPLATE` and `CLOCK` to warm with
+  them. The stock pattern ejects at any of them, so the first example below runs at deskjet and our clock throughout.
 - The messages give the warm-up's total: per nozzle, the heating time and the energy in reference pulses, and the
-  heaters' duty (about 0.4 % at 0.6 µs every 151 µs, against 0.48 % for an `EXTENDED=1` spit at 4.8 µs and 1 kHz).
+  heaters' duty.
 - It works with any spit test, `EXTENDED=1` too, and needs board firmware with it (this add-on's bundled firmware).
 
 ```
+POLYDYE_SPIT SECONDS=3 PATTERN=stock TEMPLATE=deskjet CLOCK=ours PULSE=6 PERIOD_US=508 WARM=20 WARM_PULSE=9 WARM_PERIOD_US=508 CONFIRM=1
+POLYDYE_SPIT SECONDS=3 PATTERN=stock PERIOD_US=508 WARM=20 WARM_PULSE=8 WARM_PERIOD_US=508 CONFIRM=1
 POLYDYE_SPIT SECONDS=3 TEMPLATE=deskjet PULSE=12 PATTERN=sparse EXTENDED=1 WARM=5 CONFIRM=1
 ```
+
+### Bus clock check
+
+On 2026-11-25 the stock bus clock measured 16.8–18.5 MHz instead of 2.857 MHz, intermittently after a switch from our
+clock, stayed wrong until the board was power-cycled, and nothing fired at it. Board firmware with the check (this
+add-on's bundled firmware) sets every clock up from scratch, measures the clock before every live run with the cartridge
+lines detached (setting it up again, up to three times, if it is off), and fires nothing if it is still more than 5 %
+fast or 8 % slow: Klipper shuts down with "the cartridge bus
+clock measured more than 5 % off its setting; nothing fired", and the add-on adds what it measured, e.g. `bus clock
+measured 18.491 MHz (stock clock 2.857 MHz, +547.2 %): WRONG, outside the board's +5/-8 % clock check, so it fires
+nothing at it`. It also holds every live column to those bounds. A spit test or warm-up says the clock its columns go
+out at while it runs, and the add-on adds the board's last measurement to any driver fault. `POLYDYE_CLOCK_TEST
+COUNT=100` checks 100 switches each way without ink. If the clock is refused twice in a row after `FIRMWARE_RESTART`,
+power-cycle the board (unplug its USB).
+
+### What the board says about a run
+
+Each spit test and warm-up ends with the board's account of it, e.g. `PolyDye board: 36113 columns sent, worst lateness
+2.3 us, slowest column preparation 104.1 us`. The preparation is the board rendering a column and checking it for safety
+before it goes out; it has to stay below the column period.
+
+If the cartridge driver stops a run (a spit test, a warm-up, a pass or the fire test), Klipper shuts down with the fault
+it was, e.g. `MCU 'polydye' shutdown: polydye: cartridge driver fault: a column wasn't ready at its time (columns
+prepared too slowly)`, and the add-on adds the board's account: the columns sent, the warm-up columns not sent, the
+column times missed with no column ready or the bus still busy, the worst lateness and the slowest preparation. Use
+`FIRMWARE_RESTART` to carry on. A spit test (no motion, so no position to keep) doesn't stop for a missed column time:
+the column goes at the next one and the account counts it. This needs board firmware with it (this add-on's bundled
+firmware). Older firmware says only "cartridge driver fault", and up to 7601ba6 it couldn't prepare columns fast enough
+for a warm-up or a column period of 254 µs, so those stopped with that fault.
 
 ### Experimental: extended spit test
 

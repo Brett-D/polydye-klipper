@@ -120,9 +120,21 @@ class FireTest(unittest.TestCase):
         # The Z move and the G-code state are POLYDYE_FIRE_TEST's, so they're restored even if it fails.
         self.assertEqual(lines, ["G28", "POLYDYE_FIRE_TEST X=90.0 Y=60.0 Z=0.5 SPACING=18.0 PATTERN=mid "
                                         "STRIPES=color_a:6,color_b_late:10:stock"])
-        # Without STRIPES, POLYDYE_FIRE_TEST picks its default for the board's firmware.
+        # Without STRIPES, POLYDYE_FIRE_TEST picks its default for the board's firmware; the pattern is stock's.
         lines = run(self.macros, "PD_FIRE_TEST", homed="xyz")
-        self.assertEqual(lines, ["POLYDYE_FIRE_TEST X=70.0 Y=60.0 Z=0.5 SPACING=18.0 PATTERN=all"])
+        self.assertEqual(lines, ["POLYDYE_FIRE_TEST X=70.0 Y=60.0 Z=0.5 SPACING=18.0 PATTERN=stock"])
+
+    def test_passes_the_random_pattern_knobs(self):
+        # The knobs go with the stock pattern, the default (POLYDYE_FIRE_TEST refuses them with another).
+        lines = run(self.macros, "PD_FIRE_TEST", "DENSITY=50 COLORS=m PER_PULSE=2 COLUMNS=300", homed="xyz")
+        self.assertEqual(lines, ["POLYDYE_FIRE_TEST X=70.0 Y=60.0 Z=0.5 SPACING=18.0 PATTERN=stock COLUMNS=300 "
+                                 "DENSITY=50 COLORS=m PER_PULSE=2"])
+        lines = run(self.macros, "PD_FIRE_TEST", "PATTERN=Stock REPEAT=3 FIRST=20 LAST=40", homed="xyz")
+        self.assertEqual(lines, ["POLYDYE_FIRE_TEST X=70.0 Y=60.0 Z=0.5 SPACING=18.0 PATTERN=stock REPEAT=3 "
+                                 "FIRST=20 LAST=40"])
+        lines = run(self.macros, "PD_FIRE_TEST", "PATTERN=all WARM=10 WARM_PULSE=8 WARM_PERIOD_US=508", homed="xyz")
+        self.assertEqual(lines, ["POLYDYE_FIRE_TEST X=70.0 Y=60.0 Z=0.5 SPACING=18.0 PATTERN=all WARM=10 "
+                                 "WARM_PULSE=8 WARM_PERIOD_US=508"])
 
     def test_refuses_during_a_print_before_homing(self):
         for state in ("printing", "paused"):
