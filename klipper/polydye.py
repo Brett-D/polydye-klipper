@@ -19,10 +19,12 @@ STATUS = ("polydye_status oid=%c flags=%c queued=%c passes=%u late_max=%u"
           " faults=%u store_count=%hu store_free=%u")
 CARTRIDGE = "polydye_cartridge oid=%c template=%c pulse=%c"
 LEVEL = "polydye_level oid=%c line=%c state=%c remaining=%hu"
-# Cartridge waveform templates in polydye_set_template numbering: Sprite_tm's four, then color_b_late (color_b with
-# the stock PolyDye firmware's timing), which needs board firmware with polydye_set_clock.
-TEMPLATES = ('color_a', 'color_b', 'black_a', 'black_b', 'color_b_late')
-NEW_TEMPLATES = ('color_b_late',)
+# Cartridge waveform templates in polydye_set_template numbering: Sprite_tm's four, then PolyDye's color_b_late (color_b
+# with the stock PolyDye firmware's timing) and deskjet (colour, an HP DeskJet 2130's timing). Board firmware offers the
+# first TEMPLATES_BASIC with the cartridge commands, the first TEMPLATES_OLD with polydye_set_clock, and from the
+# POLYDYE_TEMPLATES constant on as many as that says.
+TEMPLATES = ('color_a', 'color_b', 'black_a', 'black_b', 'color_b_late', 'deskjet')
+TEMPLATES_BASIC, TEMPLATES_OLD = 4, 5
 CLOCK = "polydye_clock oid=%c stock=%c nominal_hz=%u measured_hz=%u"
 # Bus clocks in polydye_set_clock numbering: ours (POLYDYE_BUS_HZ), the stock firmware's setup, and half ours. The
 # stock setup's divider of 1 acts as 2 on the board (measured 2.82-2.83 MHz), so it runs at 2.857 MHz, not the 5.714 MHz
@@ -56,6 +58,10 @@ FIRE_TEST_STRIPES = ("color_b:6:ours,color_b_late:6:ours,color_b:6:stock,color_b
 FIRE_TEST_STRIPES_BASIC = "color_b:6,color_b:8,color_b:9,color_a:6,color_a:9"
 # polydye_spit: the board's POLYDYE_SPIT_HZ, and POLYDYE_SPIT_MAX columns
 SPIT_HZ, SPIT_MAX_S = 1000, 10.
+# EXPERIMENTAL extended spit test (POLYDYE_SPIT EXTENDED=1; board firmware with polydye_spit_ext): a fire pulse of up to
+# PULSE_MAX_EXT_US (the board's POLYDYE_PULSE_MAX_EXT_NS) for that spit only, at most SPIT_EXT_MAX_S long (its
+# POLYDYE_SPIT_EXT_MAX columns). It can burn out nozzles. The configured pulse, passes and the fire test keep PULSE_MAX_US.
+PULSE_MAX_EXT_US, SPIT_EXT_MAX_S = 4.0, 3.
 # Test patterns: every nozzle, positions 14-90 of each colour (what the stock firmware fires), or sparse: one nozzle per
 # F3/F5 fire pulse, rotating so that SPARSE_COLUMNS columns fire every nozzle once (see sparse_column). The spit test
 # sends the index; board firmware without the POLYDYE_SPIT_PATTERNS constant has the first SPIT_PATTERNS_OLD.
@@ -244,6 +250,22 @@ def min_pulse_words(clock):
     return max(PULSE_MIN, int(math.ceil(REF_US * CLOCK_HZ[clock or 'ours'] / 1e6 - 1e-6)))
 
 
+def max_ext_pulse_words(clock):
+    """Longest extended-spit pulse in bus words within PULSE_MAX_EXT_US at a clock: 13 at ours, 11 at stock, 6 at
+    half."""
+    return int(PULSE_MAX_EXT_US * CLOCK_HZ[clock or 'ours'] / 1e6 + 1e-9)
+
+
+def ext_pulse_range_error(words, clock):
+    """None, or why `words` at `clock` isn't an extended-spit pulse: over PULSE_MAX_EXT_US, or under 1.8 us."""
+    clock = clock or 'ours'
+    if min_pulse_words(clock) <= words <= max_ext_pulse_words(clock):
+        return None
+    return ("extended fire pulse %d words is %.2f us at the %s bus clock; use %d-%d words there (%.1f-%.1f us)"
+            % (words, pulse_us(words, clock), clock, min_pulse_words(clock), max_ext_pulse_words(clock), REF_US,
+               PULSE_MAX_EXT_US))
+
+
 def pulse_limit_error(words, clock):
     """None, or why `words` at `clock` is longer than the live-ink limit."""
     clock = clock or 'ours'
@@ -394,8 +416,10 @@ class PolyDye:
         self.set_template_cmd = self.set_pulse_cmd = self.query_cartridge_cmd = None
         self.set_level_cmd = self.query_level_cmd = self.spit_cmd = None
         self.spit_patterns = 0
+        self.spit_ext_cmd = None  # the extended spit test, on board firmware that has it
         self.set_clock_cmd = self.query_clock_cmd = None
         self.clock_count = 0  # bus clocks the board offers (CLOCKS[:clock_count]); 0: no clock choice
+        self.template_count = 0  # templates the board offers (TEMPLATES[:template_count]); 0: no template choice
         self.board_soft_reset = None  # does Klipper's reset keep the board on USB? None until connected
         self.last_status = {}
         self.last_pass = None
@@ -445,6 +469,10 @@ class PolyDye:
             # The sparse pattern came later, with this constant.
             self.spit_patterns = min(len(TEST_PATTERNS), int(self.mcu.get_constants().get('POLYDYE_SPIT_PATTERNS',
                                                                                           SPIT_PATTERNS_OLD)))
+            # The extended spit test came later still.
+            if self.mcu.try_lookup_command("polydye_spit_ext oid=%c columns=%hu pattern=%c words=%c") is not None:
+                self.spit_ext_cmd = self.mcu.lookup_command("polydye_spit_ext oid=%c columns=%hu pattern=%c words=%c",
+                                                            cq=cq)
         # color_b_late and the bus clock choice came with the stock-firmware comparison.
         if self.mcu.try_lookup_command("polydye_query_clock oid=%c") is not None:
             self.set_clock_cmd = self.mcu.lookup_command("polydye_set_clock oid=%c stock=%c", cq=cq)
@@ -457,13 +485,10 @@ class PolyDye:
                 raise self.printer.config_error(
                     "[polydye] bus_clock: %s needs newer PolyDye board firmware. Update it from the PolyDye page (Board "
                     "firmware: Update to bundled firmware), or change it in polydye.cfg." % (self.bus_clock,))
-        else:
-            for option, value in (('cartridge_template', self.cartridge_template in NEW_TEMPLATES),
-                                  ('bus_clock', self.bus_clock is not None)):
-                if value:
-                    raise self.printer.config_error(
-                        "[polydye] %s: %s needs newer PolyDye board firmware. Update it from the PolyDye page (Board "
-                        "firmware), or change it in polydye.cfg." % (option, getattr(self, option)))
+        elif self.bus_clock is not None:
+            raise self.printer.config_error(
+                "[polydye] bus_clock: %s needs newer PolyDye board firmware. Update it from the PolyDye page (Board "
+                "firmware), or change it in polydye.cfg." % (self.bus_clock,))
         # Board firmware before the cartridge commands still works, just without a template or pulse choice.
         if self.mcu.try_lookup_command("polydye_query_cartridge oid=%c") is None:
             for option, value in (('cartridge_template', self.cartridge_template), ('pulse_words', self.pulse_words)):
@@ -476,6 +501,14 @@ class PolyDye:
         self.set_pulse_cmd = self.mcu.lookup_command("polydye_set_pulse oid=%c words=%c", cq=cq)
         self.query_cartridge_cmd = self.mcu.lookup_query_command("polydye_query_cartridge oid=%c", CARTRIDGE,
                                                                  oid=self.oid, cq=cq)
+        # color_b_late came with the clock choice, then deskjet with the POLYDYE_TEMPLATES constant.
+        self.template_count = min(len(TEMPLATES), int(self.mcu.get_constants().get(
+            'POLYDYE_TEMPLATES', TEMPLATES_OLD if self.set_clock_cmd is not None else TEMPLATES_BASIC)))
+        if self.cartridge_template is not None and TEMPLATES.index(self.cartridge_template) >= self.template_count:
+            raise self.printer.config_error(
+                "[polydye] cartridge_template: %s needs newer PolyDye board firmware. Update it from the PolyDye page "
+                "(Board firmware: Update to bundled firmware), or change it in polydye.cfg."
+                % (self.cartridge_template,))
         # Sent on every connect: the board forgets both when it restarts.
         if self.cartridge_template is not None:
             self.mcu.add_config_cmd("polydye_set_template oid=%d template=%d"
@@ -734,7 +767,7 @@ class PolyDye:
         self._respond_offsets(gcmd)
 
     cmd_POLYDYE_CARTRIDGE_help = ("Set the cartridge waveform template (TEMPLATE=color_a|color_b|black_a|black_b|"
-                                  "color_b_late), fire pulse (PULSE in words: 6-9 at our clock, 6-8 at stock, 3-4 at "
+                                  "color_b_late|deskjet), fire pulse (PULSE in words: 6-9 at our clock, 6-8 at stock, 3-4 at "
                                   "half) and bus clock (CLOCK=ours|stock|half) until the next restart; PolyDye must be "
                                   "off and idle")
 
@@ -753,9 +786,10 @@ class PolyDye:
             clock = clock.lower()
             if clock not in CLOCKS:
                 raise gcmd.error("POLYDYE_CARTRIDGE: CLOCK must be ours, stock or half")
-        if self.set_clock_cmd is None and (clock is not None or name in NEW_TEMPLATES):
-            raise gcmd.error("POLYDYE_CARTRIDGE: %s needs newer PolyDye board firmware; update it from the PolyDye "
-                             "page (Board firmware)" % ("CLOCK" if clock is not None else name,))
+        if self.set_clock_cmd is None and clock is not None:
+            raise gcmd.error("POLYDYE_CARTRIDGE: CLOCK needs newer PolyDye board firmware; update it from the PolyDye "
+                             "page (Board firmware)")
+        self._check_template(gcmd, "POLYDYE_CARTRIDGE", name)
         self._check_clock(gcmd, "POLYDYE_CARTRIDGE", clock)
         if name is not None or pulse is not None or clock is not None:
             # The board refuses a change while powered or busy by shutting down; check first for a plain error.
@@ -778,6 +812,13 @@ class PolyDye:
         st = self._fresh_status()
         gcmd.respond_info("PolyDye %s (set cartridge_template, pulse_words and bus_clock in polydye.cfg to keep them "
                           "after a restart)" % (cartridge_text(st),))
+
+    def _check_template(self, gcmd, name, template):
+        """Refuses a template the board firmware doesn't have (color_b_late came with the clock choice, deskjet
+        later)."""
+        if template is not None and TEMPLATES.index(template) >= self.template_count:
+            raise gcmd.error("%s: TEMPLATE=%s needs newer PolyDye board firmware; update it from the PolyDye page "
+                             "(Board firmware: Update to bundled firmware)" % (name, template))
 
     def _check_clock(self, gcmd, name, clock):
         """Refuses a bus clock the board firmware doesn't have (the half clock came after the others)."""
@@ -905,10 +946,11 @@ class PolyDye:
                                              else FIRE_TEST_STRIPES_BASIC))
         except ValueError as e:
             raise gcmd.error("POLYDYE_FIRE_TEST: STRIPES: %s" % (e,))
-        if self.set_clock_cmd is None and any(clock or tpl in NEW_TEMPLATES for tpl, _, clock in stripes):
-            raise gcmd.error("POLYDYE_FIRE_TEST: color_b_late and the clock need newer PolyDye board firmware; "
-                             "update it from the PolyDye page (Board firmware)")
-        for _, _, clock in stripes:
+        if self.set_clock_cmd is None and any(clock for _, _, clock in stripes):
+            raise gcmd.error("POLYDYE_FIRE_TEST: the clock needs newer PolyDye board firmware; update it from the "
+                             "PolyDye page (Board firmware)")
+        for tpl, _, clock in stripes:
+            self._check_template(gcmd, "POLYDYE_FIRE_TEST", tpl)
             self._check_clock(gcmd, "POLYDYE_FIRE_TEST", clock)
         pattern = gcmd.get('PATTERN', 'all').lower()
         if pattern not in TEST_PATTERNS:
@@ -981,19 +1023,31 @@ class PolyDye:
     cmd_POLYDYE_SPIT_help = ("LIVE INK, no motion: fire every nozzle (PATTERN=all), positions 14-90 (mid) or one "
                              "nozzle per fire pulse in turn (sparse) for SECONDS (max 10) at 1 kHz into a paper towel "
                              "held under the cartridge, optionally with TEMPLATE, PULSE and CLOCK=ours|stock|half; "
-                             "needs CONFIRM=1")
+                             "needs CONFIRM=1. EXPERIMENTAL, can burn out nozzles: EXTENDED=1 allows a PULSE of up to "
+                             "4.0 us for at most 3 s")
 
     def cmd_POLYDYE_SPIT(self, gcmd):
         if self.spit_cmd is None:
             raise gcmd.error("POLYDYE_SPIT: the PolyDye board firmware is too old; update it from the PolyDye page "
                              "(Board firmware)")
+        extended = gcmd.get_int('EXTENDED', 0, minval=0, maxval=1) == 1
+        if extended and self.spit_ext_cmd is None:
+            raise gcmd.error("POLYDYE_SPIT: EXTENDED=1 needs newer PolyDye board firmware; update it from the PolyDye "
+                             "page (Board firmware: Update to bundled firmware)")
         seconds = gcmd.get_float('SECONDS', 2., above=0., maxval=SPIT_MAX_S)
+        if extended and seconds > SPIT_EXT_MAX_S:
+            raise gcmd.error("POLYDYE_SPIT: an EXTENDED=1 spit test lasts at most %g s (SECONDS=%g)"
+                             % (SPIT_EXT_MAX_S, seconds))
         name = gcmd.get('TEMPLATE', None)
         if name is not None:
             name = name.lower()
             if name not in TEMPLATES:
                 raise gcmd.error("POLYDYE_SPIT: TEMPLATE must be one of %s" % (", ".join(TEMPLATES),))
-        pulse = gcmd.get_int('PULSE', None, minval=PULSE_MIN, maxval=PULSE_MAX)
+            self._check_template(gcmd, "POLYDYE_SPIT", name)
+        # With EXTENDED=1 the range depends on the clock: ext_pulse_range_error() below explains it.
+        pulse = gcmd.get_int('PULSE', None, minval=PULSE_MIN, maxval=None if extended else PULSE_MAX)
+        if extended and pulse is None:
+            raise gcmd.error("POLYDYE_SPIT: EXTENDED=1 needs PULSE, the extended fire pulse in bus words")
         clock = gcmd.get('CLOCK', None)
         if clock is not None:
             clock = clock.lower()
@@ -1018,28 +1072,45 @@ class PolyDye:
             raise gcmd.error("POLYDYE_SPIT: wait for queued passes to finish")
         self._check_current_pulse(gcmd, "POLYDYE_SPIT", st)
         before = (st['cartridge_template'], st['pulse_words'], st.get('bus_clock'))
-        check = pulse_range_error if pulse is not None or clock is not None else pulse_limit_error
-        limit = check(pulse if pulse is not None else st['pulse_words'], clock or before[2])
+        if extended:
+            limit = ext_pulse_range_error(pulse, clock or before[2])
+        else:
+            check = pulse_range_error if pulse is not None or clock is not None else pulse_limit_error
+            limit = check(pulse if pulse is not None else st['pulse_words'], clock or before[2])
         if limit:
             raise gcmd.error("POLYDYE_SPIT: %s" % (limit,))
+        # An extended spit sends its pulse with the spit and leaves the configured one alone, unless a new clock needs
+        # a different one within the normal limit (1.8 us there).
+        cart_pulse = pulse
+        if extended:
+            cart_pulse = min_pulse_words(clock) if clock is not None and pulse_range_error(before[1], clock) else None
         columns = max(1, int(round(seconds * SPIT_HZ)))
-        used = {}
+        used = board = {}
         try:
             self.mode_cmd.send([self.oid, 0, 0])
             self._wait_off_and_idle()
-            if name is not None or pulse is not None or clock is not None:
+            if name is not None or cart_pulse is not None or clock is not None:
                 self.printer.lookup_object('gcode').run_script_from_command(
                     "POLYDYE_CARTRIDGE" + (" TEMPLATE=%s" % (name,) if name else "")
-                    + (" PULSE=%d" % (pulse,) if pulse else "") + (" CLOCK=%s" % (clock,) if clock else ""))
+                    + (" PULSE=%d" % (cart_pulse,) if cart_pulse else "") + (" CLOCK=%s" % (clock,) if clock else ""))
             self.mode_cmd.send([self.oid, 1, 1])
             st = self._fresh_status()
             if not st['live']:
                 raise gcmd.error("POLYDYE_SPIT: the board didn't turn live ink on (disarmed on its console?)")
-            used = st
-            gcmd.respond_info("PolyDye spit test: %d %s columns at %d Hz, %s"
-                              % (columns, TEST_PATTERN_TEXT[pattern], SPIT_HZ, cartridge_text(st)))
-            # The board starts it no sooner than 0.1 s after the boost came on.
-            self.spit_cmd.send([self.oid, columns, TEST_PATTERNS.index(pattern)])
+            used = board = st
+            if extended:
+                used = dict(st, pulse_words=pulse, pulse_us=round(pulse_us(pulse, st.get('bus_clock')), 2))
+                gcmd.respond_info("PolyDye EXTENDED spit test (experimental, can burn out nozzles): %d %s columns at "
+                                  "%d Hz, %s; the configured pulse stays %d words"
+                                  % (columns, TEST_PATTERN_TEXT[pattern], SPIT_HZ, cartridge_text(used),
+                                     st['pulse_words']))
+                # The board starts it no sooner than 0.1 s after the boost came on.
+                self.spit_ext_cmd.send([self.oid, columns, TEST_PATTERNS.index(pattern), pulse])
+            else:
+                gcmd.respond_info("PolyDye spit test: %d %s columns at %d Hz, %s"
+                                  % (columns, TEST_PATTERN_TEXT[pattern], SPIT_HZ, cartridge_text(st)))
+                # The board starts it no sooner than 0.1 s after the boost came on.
+                self.spit_cmd.send([self.oid, columns, TEST_PATTERNS.index(pattern)])
             end = reactor.monotonic() + seconds + 5.
             while True:
                 reactor.pause(reactor.monotonic() + 0.2)
@@ -1055,9 +1126,10 @@ class PolyDye:
         # The bus rate the board measured is that of the spit's last column: it goes with the settings it fired with.
         # Compare the settings, not the text, to tell whether they were put back to something else.
         settings = ('cartridge_template', 'pulse_words', 'bus_clock')
-        restored = [st.get(key) for key in settings] != [used.get(key) for key in settings]
-        gcmd.respond_info("PolyDye spit test done (faults=%d): fired with %s%s" % (
-            st['faults'], cartridge_text(dict(used, bus_hz_measured=st.get('bus_hz_measured'))),
+        restored = [st.get(key) for key in settings] != [board.get(key) for key in settings]
+        gcmd.respond_info("PolyDye spit test done (faults=%d): fired %swith %s%s" % (
+            st['faults'], "EXTENDED " if extended else "",
+            cartridge_text(dict(used, bus_hz_measured=st.get('bus_hz_measured'))),
             "; now back to %s" % (cartridge_text(dict(st, bus_hz_measured=None)),) if restored else ""))
 
     def _restore_after_test(self, before):
@@ -1079,7 +1151,8 @@ class PolyDye:
         return dict(self.last_status, last_pass=self.last_pass, pass_axis=self.pass_axis, offset_x=self.offset_x,
                     offset_y=self.offset_y, direction_trim=self.direction_trim,
                     spit_patterns=list(TEST_PATTERNS[:self.spit_patterns]),
-                    bus_clocks=list(CLOCKS[:self.clock_count]), board_soft_reset=self.board_soft_reset)
+                    bus_clocks=list(CLOCKS[:self.clock_count]), templates=list(TEMPLATES[:self.template_count]),
+                    board_soft_reset=self.board_soft_reset)
 
 
 def load_config(config):
