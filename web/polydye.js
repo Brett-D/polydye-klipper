@@ -908,10 +908,12 @@ $('spit-btn').addEventListener('click', () => {
   const words = pulse >= 3 ? pulse : (stock ? minPulseWords(clock) : pd.pulse_words);
   const periodText = f.period.value.trim();
   const period = periodText ? Number(periodText) : 0;
+  // A number field reports text it can't parse as an empty value; badInput tells that apart from an empty field.
+  const badPeriod = !!(f.period.validity && f.period.validity.badInput);
   // Only whole µs in the board's range; an empty field is the default (1000 µs).
-  if (periodText && !(/^\d+$/.test(periodText) && period >= 1 && period <= 65535)) {
-    log(`! spit test: the column period must be a whole number of µs from 1 to 65535 (or empty for 1000), not `
-      + `"${periodText}"`);
+  if (badPeriod || (periodText && !(/^\d+$/.test(periodText) && period >= 1 && period <= 65535))) {
+    log('! spit test: the column period must be a whole number of µs from 1 to 65535 (or empty for 1000)'
+      + `${periodText ? `, not "${periodText}"` : ''}`);
     return;
   }
   if (words && !pulseOk(words, clock)) {
