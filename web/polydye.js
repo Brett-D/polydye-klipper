@@ -403,6 +403,9 @@ function syncPulseMax() {
 // Bus clocks the board offers (the add-on's bus_clocks): board firmware before the half clock has ours and stock.
 const halfClockOk = () => ((state.printer.polydye || {}).bus_clocks || []).includes('half');
 const HALF_OLD = 'The half clock needs newer board firmware: Update to bundled firmware under Board firmware.';
+// Templates the board offers (the add-on's templates): board firmware before deskjet has the first five.
+const deskjetOk = () => ((state.printer.polydye || {}).templates || []).includes('deskjet');
+const DESKJET_OLD = 'The deskjet template needs newer board firmware: Update to bundled firmware under Board firmware.';
 
 // values: key -> string to set ('' leaves the line alone) or null to comment the setting out.
 function applySettings(textIn, values) {
@@ -472,6 +475,8 @@ $('settings').addEventListener('submit', async (ev) => {
       if (values.pulse_words && !pulseOk(words, clock)) throw new Error(pulseRangeText(words, clock));
       // ... or with a clock the board doesn't have.
       if (clock === 'half' && state.board && !halfClockOk()) throw new Error(HALF_OLD);
+      // ... or a template it doesn't have.
+      if (values.cartridge_template === 'deskjet' && state.board && !deskjetOk()) throw new Error(DESKJET_OLD);
       // Re-read first: the file may have been edited elsewhere since the page loaded.
       await uploadCfg(applySettings(await fetchCfg(), values));
     });
@@ -835,11 +840,13 @@ function fireValues() {
     x: num('x', 70), y: num('y', 60), z: num('z', 0.5), spacing: num('spacing', 18), stripes,
     pattern: f.pattern.value,
     valid: stripes.length > 0 && stripes.every((s) => {
-      const m = s.match(/^(color_a|color_b|black_a|black_b|color_b_late):(\d+)(:(ours|stock|half))?$/i);
+      const m = s.match(/^(color_a|color_b|black_a|black_b|color_b_late|deskjet):(\d+)(:(ours|stock|half))?$/i);
       const clock = m && (m[4] || current).toLowerCase();
-      return m && pulseOk(Number(m[2]), clock) && (clock !== 'half' || halfClockOk());
+      return m && pulseOk(Number(m[2]), clock) && (clock !== 'half' || halfClockOk())
+        && (m[1].toLowerCase() !== 'deskjet' || deskjetOk());
     }),
     half: stripes.some((s) => /:half$/i.test(s)),
+    deskjet: stripes.some((s) => /^deskjet:/i.test(s)),
   };
 }
 
@@ -849,10 +856,11 @@ function renderFireLegend(axis) {
   table.textContent = '';
   if (!v.valid) {
     const tr = document.createElement('tr');
-    tr.append(cell('Each stripe is template:pulse or template:pulse:clock, e.g. color_b:8, color_b_late:8:stock or '
-      + `color_b:4:half, with a clock of ours, stock or half and a pulse of ${PULSE_MIN_US} to ${PULSE_MAX_US} µs: `
-      + '6-9 words with our clock, 6-8 with the stock one, 3-4 at half.'
-      + `${v.half && state.board && !halfClockOk() ? ` ${HALF_OLD}` : ''}`));
+    tr.append(cell('Each stripe is template:pulse or template:pulse:clock, e.g. color_b:8, color_b_late:8:stock, '
+      + `deskjet:6 or color_b:4:half, with a clock of ours, stock or half and a pulse of ${PULSE_MIN_US} to `
+      + `${PULSE_MAX_US} µs: 6-9 words with our clock, 6-8 with the stock one, 3-4 at half.`
+      + `${v.half && state.board && !halfClockOk() ? ` ${HALF_OLD}` : ''}`
+      + `${v.deskjet && state.board && !deskjetOk() ? ` ${DESKJET_OLD}` : ''}`));
     table.append(tr);
     return;
   }
@@ -929,15 +937,17 @@ function renderDiagnostics(pd, printing) {
   const spit = $('spit-form').elements;
   const sparseOld = diag && spit.pattern.value === 'sparse' && !(pd.spit_patterns || []).includes('sparse');
   const halfOld = diag && spit.clock.value === 'half' && !halfClockOk();
+  const deskjetOld = diag && spit.template.value === 'deskjet' && !deskjetOk();
   const oldText = [];
   if (sparseOld) {
     oldText.push('The sparse spit test needs newer board firmware: Update to bundled firmware under Board firmware. '
       + "The fire test's sparse stripes work with this one.");
   }
   if (halfOld) oldText.push(HALF_OLD);
+  if (deskjetOld) oldText.push(DESKJET_OLD);
   $('spit-fw-old').textContent = oldText.join(' ');
   $('spit-fw-old').classList.toggle('hidden', !oldText.length);
-  $('spit-btn').disabled = !diag || busy || sparseOld || halfOld;
+  $('spit-btn').disabled = !diag || busy || sparseOld || halfOld || deskjetOld;
   const cartOut = $('sig-cart-out').checked;
   const level = pd.level || null;
   $('sig-start').disabled = !diag || busy || !cartOut || !!pd.live;

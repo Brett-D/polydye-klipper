@@ -74,6 +74,7 @@
             <option value="color_a">color_a</option><option value="color_b">color_b</option>
             <option value="black_a">black_a</option><option value="black_b">black_b</option>
             <option value="color_b_late">color_b_late (stock timing)</option>
+            <option value="deskjet">deskjet (HP DeskJet timing)</option>
           </select>
         </label>
         <label>Bus clock
@@ -95,7 +96,9 @@
         <p class="hint">Offsets are the cartridge nozzle-row centre minus the hotend nozzle, in bed coordinates.
           Direction trim moves the ink of reverse passes along the pass axis. The cartridge template is the nozzle
           waveform: a and b are two variants for each cartridge type, so try both at the nozzle check;
-          color_b_late is color_b with the stock PolyDye firmware's timing. The bus clock &ldquo;stock&rdquo; copies
+          color_b_late is color_b with the stock PolyDye firmware's timing, and deskjet (colour) copies the timing of
+          a real HP 63 printer, a DeskJet 2130, so the data lines never change at a clock edge; it needs current
+          board firmware. The bus clock &ldquo;stock&rdquo; copies
           the stock firmware's bus setup, which runs at 2.857 MHz, so each pulse word lasts 0.35 µs instead of 0.3.
           &ldquo;Half&rdquo; runs the same waveform at half our clock, 1.667 MHz, so every edge has twice the time to
           settle through the level shifters; each pulse word lasts 0.6 µs, so the fire pulse is 3 or 4 words there,
@@ -214,7 +217,8 @@
         cartridge in and out to see whether the nozzle heaters draw anything. Sparse fires one nozzle per fire
         pulse instead of up to 12, going through every nozzle in turn, in case a full column starves the
         heaters' supply. The bus clock &ldquo;half&rdquo; (1.667 MHz) gives the level shifters twice the time for every
-        edge; use a 3 or 4-word pulse with it (1.8 or 2.4 µs).</p>
+        edge; use a 3 or 4-word pulse with it (1.8 or 2.4 µs). The deskjet template copies a real HP DeskJet's
+        timing.</p>
       <form id="spit-form" class="compact">
         <label>Seconds<input name="seconds" type="number" step="0.5" min="0.5" max="10" value="2"></label>
         <label>Template
@@ -223,6 +227,7 @@
             <option value="color_a">color_a</option><option value="color_b">color_b</option>
             <option value="black_a">black_a</option><option value="black_b">black_b</option>
             <option value="color_b_late">color_b_late</option>
+            <option value="deskjet">deskjet</option>
           </select>
         </label>
         <label>Fire pulse (words)<input name="pulse" type="number" step="1" min="3" max="9" placeholder="current"></label>
