@@ -322,7 +322,7 @@ def confirm_after_reboot(port, version, partition, log=print, confirm=True, time
     gone_by = time.time() + min(10., timeout)
     while port_present(port) and time.time() < gone_by:
         time.sleep(0.2)
-    hello = None
+    hello, rolled_back = None, False
     while time.time() < deadline:
         time.sleep(1.)
         if not port_present(port):
@@ -334,6 +334,7 @@ def confirm_after_reboot(port, version, partition, log=print, confirm=True, time
         try:
             hello = board.hello()
             if hello["firmware"] != version or (partition and hello.get("partition") != partition):
+                rolled_back = True
                 break
             if not confirm:
                 say(log, "the board runs %s, NOT confirmed: it goes back to the previous firmware within %d s"
@@ -348,6 +349,10 @@ def confirm_after_reboot(port, version, partition, log=print, confirm=True, time
             board.close()
     if hello is None:
         raise BoardError("the board didn't come back after the update; check its USB cable and power")
+    if not rolled_back:
+        # Running the new firmware, still unconfirmed: it goes back to the previous one by itself.
+        raise BoardError("the board runs %s but didn't take the confirmation; it goes back to the previous firmware "
+                         "within two minutes" % (version,))
     raise RolledBack("the new firmware didn't start properly; the board went back to %s (%s)"
                      % (hello["firmware"], hello.get("partition")))
 

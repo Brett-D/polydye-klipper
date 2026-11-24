@@ -179,10 +179,28 @@ restart the Klipper service. From the Pi, stop Klipper first and sync: `sync && 
 the command-line update above, then `sync && sudo systemctl start klipper`. The board's restart can still freeze the
 Pi that one time, but no files are lost.
 
-**Optional, not changed by PolyDye:** the reported cure is the Pi's other USB driver, `dwc2`: add
-`dtoverlay=dwc2,dr_mode=host` to `/boot/firmware/config.txt` (`/boot/config.txt` on older systems) and reboot. It
-uses more CPU and can be slower for some USB devices; on a Pi 3 B the wired Ethernet hangs off USB too. Remove the
-line to go back. Another commonly tried setting is `dwc_otg.fiq_fsm_enable=0` in `cmdline.txt`.
+**Recommended on a Raspberry Pi 3 (optional; PolyDye's installer never changes the Pi's boot setup).** Verified on a
+Pi 3 B with Debian 13 and kernel 6.18:
+
+1. Turn off the `dwc_otg` driver's FIQ state machine. Back up `/boot/firmware/cmdline.txt` (`/boot/cmdline.txt` on
+   older systems), then add ` dwc_otg.fiq_fsm_enable=0` to the end of its single line, on that same line:
+   ```
+   sudo cp /boot/firmware/cmdline.txt /boot/firmware/cmdline.txt.bak
+   sudo sed -i '1 s/$/ dwc_otg.fiq_fsm_enable=0/' /boot/firmware/cmdline.txt
+   ```
+   Reboot. Check: `cat /sys/module/dwc_otg/parameters/fiq_fsm_enable` prints `N`.
+2. Let the hardware watchdog reboot a frozen Pi: create `/etc/systemd/system.conf.d/watchdog.conf` with
+   ```
+   [Manager]
+   RuntimeWatchdogSec=15
+   ```
+   then reboot (or `sudo systemctl daemon-reexec`). Check: `systemctl show -p RuntimeWatchdogUSec` prints
+   `RuntimeWatchdogUSec=15s`. A freeze then reboots the Pi within about 15 s instead of needing a power-cycle.
+
+If freezes continue, the fallback is the Pi's other USB driver, `dwc2`: add `dtoverlay=dwc2,dr_mode=host` to
+`/boot/firmware/config.txt` (`/boot/config.txt` on older systems) and reboot. It may handle full-speed devices behind
+the Pi 3's internal USB hub less well (the PolyDye board and many printer boards are full-speed); remove the line to
+go back. To undo step 1, restore the backup of `cmdline.txt`.
 
 ## Configuration
 

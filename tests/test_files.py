@@ -15,7 +15,9 @@ from contextlib import redirect_stdout
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 import polydye_files  # noqa: E402
 
-GIT = ["git", "-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "core.autocrlf=false"]
+# A crash leaves the times git recorded; the tests' rewrites can't keep the change time, so git ignores it.
+GIT = ["git", "-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "core.autocrlf=false",
+       "-c", "core.trustctime=false"]
 FIRMWARE = b"\xe9" + b"\x00" * 100 + b"firmware"
 
 

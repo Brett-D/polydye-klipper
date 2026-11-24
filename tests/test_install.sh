@@ -98,7 +98,8 @@ zero_fill() {
 check 'grep -qx "\[mcu polydye\]" "$T/config/polydye-active.cfg" && ! grep -q DAMAGED "$T/toggle4.log"' \
     "board plugged in, files intact: PolyDye on"
 zero_fill web/polydye.css
-check '[ -z "$(git -C "$A" status --porcelain)" ]' "git status misses a zero-filled file"
+# A crash leaves the times git recorded; this rewrite can't keep the change time, so git is told to ignore it.
+check '[ -z "$(git -c core.trustctime=false -C "$A" status --porcelain)" ]' "git status misses a zero-filled file"
 "$A/scripts/polydye-toggle.sh" "$T/config" "$T/klipper" > "$T/toggle5.log" 2>&1
 check 'grep -q "ADD-ON FILES DAMAGED: web/polydye.css" "$T/toggle5.log" && [ -f "$T/config/polydye-active.cfg" ]' \
     "a damaged page file is reported; PolyDye stays on"

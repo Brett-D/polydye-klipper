@@ -58,7 +58,7 @@ class UpdateFirmware(unittest.TestCase):
 
 
 class ConfirmAfterReboot(unittest.TestCase):
-    def confirm(self, hello, present=(True, False, True), timeout=180.):
+    def confirm(self, hello, present=(True, False, True), timeout=180., refuse=False):
         """The board still there, gone, then back; it answers HELLO with `hello`. Returns (result, requests)."""
         present, requests = iter(present), []
 
@@ -71,6 +71,8 @@ class ConfirmAfterReboot(unittest.TestCase):
 
             def request(self, ftype, *args, **kw):
                 requests.append(ftype)
+                if refuse:
+                    raise polydye_upload.BoardError("timed out waiting for the board")
 
             def close(self):
                 pass
@@ -92,6 +94,13 @@ class ConfirmAfterReboot(unittest.TestCase):
         self.assertIsInstance(err, polydye_upload.RolledBack)
         self.assertIn("went back to cd4926d (ota_0)", str(err))
         self.assertEqual(requests, [])
+
+    def test_new_firmware_that_wont_take_the_confirmation_isnt_rolled_back(self):
+        # Still running the unconfirmed image when time runs out: it can still roll back (and leave USB) later.
+        err, requests = self.confirm({"firmware": "9ba5def", "partition": "ota_1"}, timeout=0.05, refuse=True)
+        self.assertNotIsInstance(err, polydye_upload.RolledBack)
+        self.assertIn("didn't take the confirmation", str(err))
+        self.assertIn(polydye_upload.T_FW_CONFIRM, requests)
 
     def test_not_back(self):
         err, _ = self.confirm({}, present=[False] * 1000000, timeout=0.05)
