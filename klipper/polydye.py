@@ -8,6 +8,7 @@
 import json
 import logging
 import math
+import os
 import struct
 import zlib
 
@@ -342,6 +343,10 @@ class PolyDye:
     def __init__(self, config):
         self.printer = printer = config.get_printer()
         mcu_name = config.get('mcu', 'polydye')
+        # Everything pending goes to the SD card before Klipper connects to its MCUs, which can restart the PolyDye
+        # board: a Raspberry Pi 3 has frozen when the board left USB and came back, and files written just before (an
+        # update of this add-on) were lost. The Klipper service's start hook (polydye-toggle.sh) syncs too.
+        os.sync()
         self.mcu = mcu_mod.get_printer_mcu(printer, mcu_name)
         self.oid = self.mcu.create_oid()
         self.mcu.register_config_callback(self._build_config)
@@ -391,6 +396,7 @@ class PolyDye:
         self.spit_patterns = 0
         self.set_clock_cmd = self.query_clock_cmd = None
         self.clock_count = 0  # bus clocks the board offers (CLOCKS[:clock_count]); 0: no clock choice
+        self.board_soft_reset = None  # does Klipper's reset keep the board on USB? None until connected
         self.last_status = {}
         self.last_pass = None
         self.querying = False
@@ -416,6 +422,12 @@ class PolyDye:
 
     def _build_config(self):
         self.mcu.add_config_cmd("config_polydye oid=%d" % (self.oid,))
+        # Older board firmware restarts the chip on Klipper's reset (FIRMWARE_RESTART, and Klipper's own restart when
+        # the configuration changed), so the board leaves USB and comes back.
+        self.board_soft_reset = 'POLYDYE_SOFT_RESET' in self.mcu.get_constants()
+        if not self.board_soft_reset:
+            logging.warning("polydye: this board firmware leaves USB and comes back whenever Klipper resets it, which "
+                            "has frozen Raspberry Pi 3s: update it (polydye-klipper README, \"Raspberry Pi 3\")")
         cq = self.mcu.alloc_command_queue()
         self.query_pass_cmd = self.mcu.lookup_query_command(
             "polydye_query_pass oid=%c layer=%hu pass=%hu", PASS_INFO, oid=self.oid, cq=cq)
@@ -1067,7 +1079,7 @@ class PolyDye:
         return dict(self.last_status, last_pass=self.last_pass, pass_axis=self.pass_axis, offset_x=self.offset_x,
                     offset_y=self.offset_y, direction_trim=self.direction_trim,
                     spit_patterns=list(TEST_PATTERNS[:self.spit_patterns]),
-                    bus_clocks=list(CLOCKS[:self.clock_count]))
+                    bus_clocks=list(CLOCKS[:self.clock_count]), board_soft_reset=self.board_soft_reset)
 
 
 def load_config(config):
