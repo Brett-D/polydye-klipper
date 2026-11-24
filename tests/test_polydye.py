@@ -878,6 +878,20 @@ class BuildConfig(unittest.TestCase):
         pd.last_status, pd.last_pass, pd.pass_axis, pd.offset_x, pd.offset_y, pd.direction_trim = {}, None, 'y', 0, 0, 0
         self.assertEqual(pd.get_status(0.)['templates'][-1], 'deskjet')
 
+    def test_extended_limit_follows_the_board(self):
+        # The board says how long an extended pulse may be; firmware with the extended spit but no constant has 4.0 us.
+        for constants, cap, words in (({'POLYDYE_PULSE_MAX_EXT_NS': 5000}, 5.0, (16, 14, 8)),
+                                      ({'POLYDYE_PULSE_MAX_EXT_NS': 4000}, 4.0, (13, 11, 6)),
+                                      ({}, 4.0, (13, 11, 6))):
+            pd, _ = self.build(constants, None, None)
+            self.assertIsNotNone(pd.spit_ext_cmd)
+            self.assertEqual(pd.pulse_max_ext_us, cap)
+            self.assertEqual(tuple(polydye.max_ext_pulse_words(c, pd.pulse_max_ext_us)
+                                   for c in ('ours', 'stock', 'half')), words)
+            self.assertIsNone(polydye.ext_pulse_range_error(words[0], 'ours', pd.pulse_max_ext_us))
+            self.assertIn("use 6-%d words there" % words[0],
+                          polydye.ext_pulse_range_error(words[0] + 1, 'ours', pd.pulse_max_ext_us))
+
     def test_half_clock_needs_newer_board_firmware(self):
         pd, error = self.build({}, 'half', 4)
         self.assertIn("bus_clock: half needs newer PolyDye board firmware", error)
