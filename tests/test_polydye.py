@@ -920,9 +920,9 @@ class TestCleanup(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(board.calls, ['ours'] + ['ours', 'stock'] * 3)
         self.assertEqual(replies, ["PolyDye clock test: 3 switches to each of ours and stock; ours clock (3.333 MHz) "
-                                   "measured 3.287-3.287 MHz; stock clock (2.857 MHz) measured 2.817-2.817 MHz. A first "
-                                   "measurement was off 0 times (the board set the clock up again); it stayed off 0 "
-                                   "times (a live run would have fired nothing). OK"])
+                                   "measured 3.287-3.287 MHz; stock clock (2.857 MHz) measured 2.817-2.817 MHz. The board "
+                                   "set the clock up again 0 times after a measurement was off; it stayed off 0 times "
+                                   "(a live run would have fired nothing). OK"])
         self.assertEqual((board.pulse, board.clock, board.boost), (9, 'ours', False))
         self.assertEqual(board.violations, [])
         # It fires nothing, so it never turns the boost on, also with board firmware that keeps it on after tests.

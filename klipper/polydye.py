@@ -1470,8 +1470,8 @@ class PolyDye:
             clock, CLOCK_HZ[clock] / 1e6, min(measured[clock]) / 1e6, max(measured[clock]) / 1e6)
             for clock in CLOCKS if measured[clock])
         resets, refused = last['resets'] - first['resets'], last['refused'] - first['refused']
-        text = ("PolyDye clock test: %d switches to each of %s; %s. A first measurement was off %d time%s (the board set "
-                "the clock up again); it stayed off %d time%s (a live run would have fired nothing)"
+        text = ("PolyDye clock test: %d switches to each of %s; %s. The board set the clock up again %d time%s after "
+                "a measurement was off; it stayed off %d time%s (a live run would have fired nothing)"
                 % (count, " and ".join(clocks), ranges, resets, "" if resets == 1 else "s", refused,
                    "" if refused == 1 else "s"))
         if wrong:
