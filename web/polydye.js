@@ -634,10 +634,9 @@ const pulseOk = (words, clock) => words >= minPulseWords(clock) && words <= maxP
 const pulseRangeText = (words, clock) => `fire pulse ${words} words is ${pulseUs(words, clock).toFixed(2)} µs with `
   + `the ${clock} clock; use ${minPulseWords(clock)}-${maxPulseWords(clock)} words there `
   + `(${PULSE_MIN_US}-${PULSE_MAX_US} µs)`;
-// Fire test defaults, like POLYDYE_FIRE_TEST's: the A/B matrix of our timing and the stock firmware's, or, for board
-// firmware without the stock options, five template/pulse pairs. Used until the stripes are edited.
-const FIRE_STRIPES = 'color_b:6:ours,color_b_late:6:ours,color_b:6:stock,color_b_late:6:stock,'
-  + 'color_b:9:ours,color_b_late:9:ours,color_b:8:stock,color_b_late:8:stock';
+// Fire test defaults, like POLYDYE_FIRE_TEST's: one stripe of the stock firmware's settings, or, for board firmware
+// without the stock options, five template/pulse pairs. Used until the stripes are edited.
+const FIRE_STRIPES = 'color_b_late:6:stock';
 const FIRE_STRIPES_BASIC = 'color_b:6,color_b:8,color_b:9,color_a:6,color_a:9';
 let fireStripesEdited = false;
 // The random pattern's knobs (PATTERN=stock): form field, G-code parameter, range, whole numbers only.
@@ -684,6 +683,26 @@ function knobParams(f) {
 }
 
 const knobsGiven = (f) => KNOBS.some(([name]) => f[name].value.trim() !== '') || f.colors.value.trim() !== '';
+
+// A form's warm-up fields as G-code parameters (WARM, WARM_PULSE, WARM_PERIOD_US; nothing without a warm-up), or an
+// error.
+function warmParams(f) {
+  const warm = numField(f.warm, 0, 30, false);
+  const pulse = numField(f.warm_pulse, 1, 12, true);
+  const period = numField(f.warm_period, 1, 65535, true);
+  if (warm.bad || pulse.bad || period.bad) {
+    return { error: 'the warm-up is 0-30 s, its pulse 1-12 words and its period 1-65535 µs (or leave them empty)' };
+  }
+  const seconds = warm.empty ? 0 : warm.v;
+  if (!seconds) return { text: '', seconds: 0, error: '' };
+  return {
+    text: ` WARM=${seconds}${pulse.empty ? '' : ` WARM_PULSE=${pulse.v}`}`
+      + `${period.empty ? '' : ` WARM_PERIOD_US=${period.v}`}`,
+    seconds,
+    pulse: pulse.empty ? 0 : pulse.v,
+    error: '',
+  };
+}
 
 // The knob fields only go with the stock pattern.
 function showKnobs() {
@@ -934,7 +953,7 @@ $('fire-form').addEventListener('input', (ev) => {
   if (ev.target.name === 'stripes') fireStripesEdited = true;
   renderFireLegend((state.printer.polydye || {}).pass_axis);
 });
-$('fire-form').addEventListener('change', () => showKnobs());
+$('fire-form').addEventListener('change', () => render());
 $('fire-form').addEventListener('submit', (ev) => ev.preventDefault());
 $('spit-form').addEventListener('submit', (ev) => ev.preventDefault());
 $('spit-form').addEventListener('change', () => render());
@@ -943,15 +962,17 @@ $('fire-btn').addEventListener('click', () => {
   const v = fireValues();
   if (!v.valid) return;
   const knobs = v.pattern === 'stock' ? knobParams($('fire-form').elements) : { text: '' };
-  if (knobs.error) {
-    log(`! fire test: ${knobs.error}`);
+  const warm = warmParams($('fire-form').elements);
+  if (knobs.error || warm.error) {
+    log(`! fire test: ${knobs.error || warm.error}`);
     return;
   }
   const ok = window.confirm(`Print the fire test with LIVE INK?\n\nPaper taped on the bed, cartridge fitted. It homes `
     + `if needed, lowers the nozzle to Z ${v.z} mm and prints ${v.stripes.length} stripes, the first at X ${v.x}, `
-    + `Y ${v.y}. The template and pulse go back to what they were afterwards.`);
+    + `Y ${v.y}${warm.seconds ? `, each after a ${warm.seconds} s head warm-up` : ''}. The template and pulse go back `
+    + 'to what they were afterwards.');
   if (!ok) return;
-  gcode(`PD_FIRE_TEST X=${v.x} Y=${v.y} Z=${v.z} SPACING=${v.spacing} PATTERN=${v.pattern}${knobs.text} `
+  gcode(`PD_FIRE_TEST X=${v.x} Y=${v.y} Z=${v.z} SPACING=${v.spacing} PATTERN=${v.pattern}${knobs.text}${warm.text} `
     + `STRIPES=${v.stripes.join(',')}`);
 });
 
@@ -979,22 +1000,17 @@ $('spit-btn').addEventListener('click', () => {
     return;
   }
   const knobs = stock ? knobParams(f) : { text: '' };
-  if (knobs.error) {
-    log(`! spit test: ${knobs.error}`);
+  const warm = warmParams(f);
+  if (knobs.error || warm.error) {
+    log(`! spit test: ${knobs.error || warm.error}`);
     return;
   }
-  const warm = numField(f.warm, 0, 30, false);
-  const warmPulse = numField(f.warm_pulse, 1, 12, true);
-  const warmPeriod = numField(f.warm_period, 1, 65535, true);
-  if (warm.bad || warmPulse.bad || warmPeriod.bad) {
-    log('! spit test: the warm-up is 0-30 s, its pulse 1-12 words and its period 1-65535 µs (or leave them empty)');
-    return;
-  }
-  const warmS = warm.empty ? 0 : warm.v;
-  const warmParams = warmS > 0 ? ` WARM=${warmS}${warmPulse.empty ? '' : ` WARM_PULSE=${warmPulse.v}`}`
-    + `${warmPeriod.empty ? '' : ` WARM_PERIOD_US=${warmPeriod.v}`}` : '';
-  const each = period > 0 ? `a column every ${period} µs` : `${SPIT_HZ} columns a second`;
-  const rate = period > 0 ? `every ${period} µs for ${seconds} s` : `${SPIT_HZ} times a second for ${seconds} s`;
+  const warmS = warm.seconds;
+  const warmParamText = warm.text;
+  // The stock pattern's default period is the stock firmware's, 508 µs; the others' 1000 µs.
+  const every = period > 0 ? period : (stock ? 508 : 0);
+  const each = every > 0 ? `a column every ${every} µs` : `${SPIT_HZ} columns a second`;
+  const rate = every > 0 ? `every ${every} µs for ${seconds} s` : `${SPIT_HZ} times a second for ${seconds} s`;
   const which = {
     mid: `Nozzle positions 14-90 fire ${rate}.`,
     sparse: `${each} for ${seconds} s, each firing one nozzle per fire pulse, a different one `
@@ -1004,13 +1020,13 @@ $('spit-btn').addEventListener('click', () => {
       + `${each} for ${seconds} s.`,
   }[f.pattern.value] || `Every nozzle fires ${rate}.`;
   const first = warmS > 0 ? `First a ${warmS} s warm-up fires every nozzle with `
-    + `${warmPulse.empty ? 'short pulses' : `${warmPulse.v}-word pulses`}, then, in the same run: ` : '';
+    + `${warm.pulse ? `${warm.pulse}-word pulses` : 'short pulses'}, then, in the same run: ` : '';
   const ok = window.confirm(`Spit test: LIVE INK, no motion.\n\nHold a folded paper towel under the cartridge, `
     + `against the nozzles. ${first}${which}`);
   if (!ok) return;
   gcode(`POLYDYE_SPIT SECONDS=${seconds}${f.template.value ? ` TEMPLATE=${f.template.value}` : ''}`
     + `${pulse >= 3 && pulse <= 12 ? ` PULSE=${pulse}` : ''}${f.clock.value ? ` CLOCK=${f.clock.value}` : ''}`
-    + ` PATTERN=${f.pattern.value}${knobs.text}${period > 0 ? ` PERIOD_US=${period}` : ''}${warmParams} CONFIRM=1`);
+    + ` PATTERN=${f.pattern.value}${knobs.text}${period > 0 ? ` PERIOD_US=${period}` : ''}${warmParamText} CONFIRM=1`);
 });
 
 function renderDiagnostics(pd, printing) {
@@ -1022,7 +1038,9 @@ function renderDiagnostics(pd, printing) {
   if (known && !fireStripesEdited) {
     $('fire-form').elements.stripes.value = 'bus_clock' in pd ? FIRE_STRIPES : FIRE_STRIPES_BASIC;
   }
-  $('fire-btn').disabled = !known || !pd.cartridge_template || busy || !fireValues().valid;
+  $('fire-btn').disabled = !known || !pd.cartridge_template || busy || !fireValues().valid
+    // A warm-up per stripe came with the spit test's stock pattern and column period.
+    || (parseFloat($('fire-form').elements.warm.value) > 0 && !(pd.spit_patterns || []).includes('stock'));
   // Board firmware before the sparse pattern can't spit it (the fire test sends its columns itself), and board
   // firmware before the half clock can't run it.
   const spit = $('spit-form').elements;

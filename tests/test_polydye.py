@@ -382,6 +382,7 @@ class TestCleanup(unittest.TestCase):
         pd.warm_duty_ppm = None
         pd.query_clock_cmd = pd.bus_hz_check = None
         pd.check_clock_cmd = None
+        pd.boost_idle_s = None  # board firmware that turns PolyDye off after a test
         pd.pulse_max_ext_us = polydye.PULSE_MAX_EXT_US
 
         def mode(args):
@@ -717,8 +718,9 @@ class TestCleanup(unittest.TestCase):
         board, replies, sent = self.spit(PATTERN='stock', TEMPLATE='deskjet', CLOCK='half')
         # 1.8 us at the half clock is 3 words.
         self.assertIn("POLYDYE_CARTRIDGE TEMPLATE=deskjet PULSE=3 CLOCK=half", board.sent)
-        self.assertEqual(sent, [('spit', 2000, 3)])
-        self.assertIn("columns at 1000 Hz", replies[0])
+        # The stock firmware's column period unless given.
+        self.assertEqual(sent, [('run', 3937, 3, 0, 508, 0, 0, 0)])
+        self.assertIn("columns every 508 us (1969 Hz)", replies[0])
         with self.assertRaisesRegex(RuntimeError, "PATTERN=stock is for a colour cartridge template"):
             self.spit(PATTERN='stock', TEMPLATE='black_b')
 
@@ -817,7 +819,7 @@ class TestCleanup(unittest.TestCase):
         self.assertIn("5906 random: 1 heater on every fire pulse of positions 14-85 of cyan/magenta/yellow, each "
                       "column twice columns every 508 us", replies[0])
         _, replies, sent = self.spit(SECONDS=1., DENSITY=50., COLORS='M', FIRST=20, LAST=60, REPEAT=1)
-        self.assertEqual(sent, [('random', 512, 1, 2, 20, 60, 0), ('run', 1000, 4, 0, 1000, 0, 0, 0)])
+        self.assertEqual(sent, [('random', 512, 1, 2, 20, 60, 0), ('run', 1969, 4, 0, 508, 0, 0, 0)])
         self.assertIn("random: 50.0 % of positions 20-60 of magenta, each column once", replies[0])
         # With the warm-up and EXTENDED too, in the same board run.
         _, _, sent = self.spit(SECONDS=1., PULSE=12, EXTENDED=1, REPEAT=3, WARM=1., PERIOD_US=508)
@@ -950,6 +952,66 @@ class TestCleanup(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "go with PATTERN=stock"):
             pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:6", X=80., Y=60., SPACING=20., COLUMNS=600,
                                                UPLOAD=1, LAYER=0, PASS=0, PATTERN='all', COLORS='c'))
+
+    def test_fire_test_warms_the_head_before_each_stripe(self):
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_run_cmd = object()
+        pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b_late:6:stock,color_b_late:8:stock", X=130., Y=100.,
+                                           SPACING=20., COLUMNS=600, UPLOAD=1, LAYER=0, PASS=0, PATTERN='stock',
+                                           WARM=10., WARM_PULSE=8, WARM_PERIOD_US=508))
+        warm = "POLYDYE_WARM SECONDS=10 WARM_PULSE=8 WARM_PERIOD_US=508 CONFIRM=1"
+        steps = [s for s in board.sent if isinstance(s, str)
+                 and s.startswith(("POLYDYE_UPLOAD", "POLYDYE_WARM", "POLYDYE_ENABLE", "POLYDYE_PASS"))]
+        # After the stripe's settings and its upload, straight before live ink and the pass.
+        self.assertEqual([s.split()[0] for s in steps],
+                         ["POLYDYE_UPLOAD_TEST_PASS", "POLYDYE_WARM", "POLYDYE_ENABLE", "POLYDYE_PASS",
+                          "POLYDYE_WARM", "POLYDYE_ENABLE", "POLYDYE_PASS"])
+        self.assertEqual(steps[1], warm)
+        # Older board firmware: refused before anything moves.
+        pd, board = self.make(fail_on="NOTHING")
+        with self.assertRaisesRegex(RuntimeError, "WARM needs newer PolyDye board firmware"):
+            pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:6", X=80., Y=60., SPACING=20., COLUMNS=600,
+                                               UPLOAD=1, LAYER=0, PASS=0, WARM=5.))
+        self.assertEqual(board.sent, [])
+
+    def test_spit_defaults_to_the_stock_firmware(self):
+        # No PATTERN: the stock pattern with the stock firmware's template, clock, pulse and column period.
+        board, replies, sent = self.spit(SECONDS=1.)
+        self.assertIn("POLYDYE_CARTRIDGE TEMPLATE=color_b_late PULSE=6 CLOCK=stock", board.sent)
+        self.assertEqual(sent, [('run', 1969, 3, 0, 508, 0, 0, 0)])
+        # Board firmware without the stock pattern: every nozzle at 1 kHz, as before.
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_patterns = 3
+        _, _, sent = self.spit(pd, board, SECONDS=1.)
+        self.assertEqual(sent, [('spit', 1000, 0)])
+
+    def test_tests_keep_the_boost_on_with_newer_board_firmware(self):
+        # Board firmware with POLYDYE_BOOST_IDLE_S takes settings with the boost on, so a test leaves the boost on and
+        # only live ink off, as the stock firmware keeps the boost on from boot.
+        pd, board = self.make(fail_on="NOTHING")
+        pd.boost_idle_s = 1800
+        board.boost = True  # on from an earlier test
+        board, replies, sent = self.spit(pd, board, SECONDS=1.)
+        modes = [s for s in board.sent if isinstance(s, tuple) and s[0] == 'mode']
+        self.assertEqual(modes, [('mode', 1, 0), ('mode', 1, 1), ('mode', 1, 0)])
+        self.assertEqual((board.boost, board.live, board.template, board.pulse, board.clock),
+                         (True, False, 'color_a', 8, 'ours'))
+        pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(TEMPLATE='color_b'))
+        self.assertEqual((board.boost, board.template), (True, 'color_b'))
+        # POLYDYE_DISABLE still turns it all off; older board firmware wants it off for a settings change.
+        pd.cmd_POLYDYE_DISABLE(self.gcmd())
+        self.assertEqual((board.boost, board.live), (False, False))
+        pd.boost_idle_s, board.boost = None, True
+        with self.assertRaisesRegex(RuntimeError, "turn PolyDye off"):
+            pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(TEMPLATE='color_a'))
+
+    def test_fire_test_defaults_to_the_stock_firmware(self):
+        pd, board = self.make(fail_on="NOTHING")
+        pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(X=80., Y=60., SPACING=20., COLUMNS=600, UPLOAD=1, LAYER=0, PASS=0))
+        self.assertIn("POLYDYE_CARTRIDGE TEMPLATE=color_b_late PULSE=6 CLOCK=stock", board.sent)
+        self.assertIn("POLYDYE_UPLOAD_TEST_PASS LAYER=0 PASS=0 COLUMNS=300 PATTERN=stock DENSITY=24.90234375 REPEAT=2 "
+                      "COLORS=cmy FIRST=14 LAST=85 PER_PULSE=0", board.sent)
+        self.assertEqual(sum(1 for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_PASS")), 1)
 
     def test_column_times_match_the_board(self):
         # printcart_column_us() in the board firmware's host tests: 148 us for color_b at our clock, 295 us at half.
@@ -1138,6 +1200,7 @@ class BuildConfig(unittest.TestCase):
         pd.warm_max_words, pd.warm_max_us, pd.warm_max_s = polydye.WARM_OLD_WORDS, polydye.WARM_OLD_US, polydye.WARM_OLD_S
         pd.warm_duty_ppm = None
         pd.bus_hz_check = None
+        pd.boost_idle_s = None
         pd.pulse_max_ext_us = polydye.PULSE_MAX_EXT_US
         pd.printer = types.SimpleNamespace(config_error=ConfigError)
         sent = []

@@ -10,17 +10,21 @@ offset_y: -8.7
 # Moves the ink of reverse passes along the pass axis to line them up with forward passes (mm). The PolyDye page's
 # Ink position nudges set this and the offsets live; Store writes them here.
 #direction_trim: 0
-# Nozzle waveform: color_a or color_b for a colour cartridge, black_a or black_b for black; color_b_late is color_b
-# with the stock PolyDye firmware's timing. Unset keeps the board's default (color_b). Needs current board firmware.
-#cartridge_template: color_b
-# Fire pulse in bus words (0.3 us each with our clock, 0.35 us with stock), at most 2.9 us: 9 words with our clock,
-# 8 with stock. Unset keeps the board's default, 6 (1.8 us). Longer pulses fire harder.
+# Leave the cartridge settings unset for the stock PolyDye firmware's: the board starts with them (current board
+# firmware; older firmware started with color_b, 6 words, our clock), and these defaults copy the stock cadence.
+# Nozzle waveform: color_b_late (stock's, color_b with +1/+2-word retiming), black_a or black_b for black; color_a,
+# color_b and deskjet are experiments. Default: the board's own (color_b_late).
+#cartridge_template: color_b_late
+# Fire pulse in bus words (0.35 us each with the stock clock, 0.3 us with ours), at most 2.9 us. Default: 6 (2.10 us
+# with the stock clock, stock's).
 #pulse_words: 6
-# Cartridge bus clock: ours (3.333 MHz) or stock (the stock PolyDye firmware's setup, 2.857 MHz on the board).
-# Unset keeps the board's default (ours). Needs current board firmware.
-#bus_clock: ours
-#dpi: 600
-#pass_speed: 50
+# Cartridge bus clock: stock (the stock firmware's setup, 2.857 MHz), set once at boot. ours and half are experiments
+# (the board resets the bus and measures the clock before firing). Default: the board's own (stock).
+#bus_clock: stock
+# Bus columns per inch along the pass and the pass speed: stock's 3,333 columns per 100 mm (each 423 dpi image column
+# twice) at 59.5 mm/s, a column every 504 us.
+#dpi: 847
+#pass_speed: 59.5
 #travel_speed: 150
 #extra_run_up: 1.0
 
