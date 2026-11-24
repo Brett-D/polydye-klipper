@@ -183,9 +183,9 @@ class Stripes(unittest.TestCase):
             self.assertIsNone(polydye.pulse_limit_error(words, clock), (tpl, words, clock))
         self.assertEqual(max(w for _, w, c in matrix if c == 'ours'), polydye.max_pulse_words('ours'))
         self.assertEqual(max(w for _, w, c in matrix if c == 'stock'), polydye.max_pulse_words('stock'))
-        self.assertEqual(polydye.parse_stripes(" Black_A:12 , color_b_late:8:STOCK"),
-                         [('black_a', 12, None), ('color_b_late', 8, 'stock')])
-        for bad in ("", "color_c:6", "color_a", "color_a:x", "color_a:5", "color_a:13", "color_a:6:fast",
+        self.assertEqual(polydye.parse_stripes(" Black_A:12 , color_b_late:8:STOCK,color_b:4:Half"),
+                         [('black_a', 12, None), ('color_b_late', 8, 'stock'), ('color_b', 4, 'half')])
+        for bad in ("", "color_c:6", "color_a", "color_a:x", "color_a:2", "color_a:13", "color_a:6:fast",
                     "color_a:6:ours:x"):
             with self.assertRaises(ValueError):
                 polydye.parse_stripes(bad)
@@ -199,6 +199,21 @@ class Stripes(unittest.TestCase):
 
     def test_pulse_limit_is_in_microseconds(self):
         self.assertEqual((polydye.max_pulse_words('ours'), polydye.max_pulse_words('stock')), (9, 8))
+        # Half our clock: a word lasts 0.6 us, so 4 words (2.4 us) are the most within 2.9 us.
+        self.assertEqual(polydye.max_pulse_words('half'), 4)
+        self.assertAlmostEqual(polydye.pulse_us(3, 'half'), 1.8, places=3)
+        self.assertAlmostEqual(polydye.pulse_us(5, 'half'), 3.0, places=3)
+
+    def test_pulse_range_is_1_8_to_2_9_us_at_every_clock(self):
+        ranges = {'ours': (6, 9), 'stock': (6, 8), 'half': (3, 4)}
+        for clock, (lo, hi) in ranges.items():
+            self.assertEqual((polydye.min_pulse_words(clock), polydye.max_pulse_words(clock)), (lo, hi), clock)
+            for words in range(polydye.PULSE_MIN, polydye.PULSE_MAX + 1):
+                error = polydye.pulse_range_error(words, clock)
+                self.assertEqual(error is None, lo <= words <= hi, (clock, words, error))
+                self.assertEqual(polydye.pulse_limit_error(words, clock) is None, words <= hi, (clock, words))
+        self.assertIn("less than Sprite_tm's 1.8 us; use 6-9 words", polydye.pulse_range_error(5, 'ours'))
+        self.assertIn("at most 4 words there", polydye.pulse_range_error(5, 'half'))
         self.assertIsNone(polydye.pulse_limit_error(9, None))
         self.assertIn("2.9 us", polydye.pulse_limit_error(10, 'ours'))
         self.assertIn("at most 8 words", polydye.pulse_limit_error(9, 'stock'))
@@ -260,21 +275,31 @@ class InitOrder(unittest.TestCase):
 
     def test_order(self):
         f = polydye.init_pulse_clock
-        self.assertEqual(f(8, 'stock', True), [(8, None), (None, 'stock')])
-        self.assertEqual(f(None, 'stock', True), [(polydye.PULSE_MIN, None), (None, 'stock')])
+        # Through our clock (the fastest) first, then the pulse, then a slower clock.
+        self.assertEqual(f(8, 'stock', True), [(None, 'ours'), (8, None), (None, 'stock')])
+        self.assertEqual(f(None, 'stock', True), [(None, 'ours'), (6, None), (None, 'stock')])
+        self.assertEqual(f(4, 'half', True), [(None, 'ours'), (4, None), (None, 'half')])
+        self.assertEqual(f(None, 'half', True), [(None, 'ours'), (3, None), (None, 'half')])
         self.assertEqual(f(9, 'ours', True), [(None, 'ours'), (9, None)])
+        # A clock without pulse_words gets its 1.8 us pulse: a board left at half with 4 words would otherwise keep
+        # them at ours after a RESTART (1.2 us).
+        self.assertEqual(f(None, 'ours', True), [(None, 'ours'), (6, None)])
         self.assertEqual(f(9, None, True), [(None, 'ours'), (9, None)])
         self.assertEqual(f(None, None, True), [])
         self.assertEqual(f(9, None, False), [(9, None)])  # board firmware without the clock choice
 
     def test_no_step_is_over_the_limit_from_any_starting_point(self):
-        for pulse, clock in ((9, 'ours'), (8, 'stock'), (None, 'stock'), (9, None), (6, 'ours')):
-            for start in ((9, 'ours'), (8, 'stock'), (6, 'ours'), (6, 'stock')):
+        for pulse, clock in ((9, 'ours'), (8, 'stock'), (None, 'stock'), (9, None), (6, 'ours'), (4, 'half'),
+                             (3, 'half'), (None, 'half'), (None, 'ours')):
+            for start in ((9, 'ours'), (8, 'stock'), (6, 'ours'), (6, 'stock'), (4, 'half'), (3, 'half')):
                 words, now = start
                 for step_words, step_clock in polydye.init_pulse_clock(pulse, clock, True):
                     words = step_words if step_words is not None else words
                     now = step_clock or now
                     self.assertIsNone(polydye.pulse_limit_error(words, now), (pulse, clock, start))
+                # And it ends at the clock asked for, with a pulse of 1.8-2.9 us there.
+                self.assertEqual(now, clock or 'ours', (pulse, clock, start))
+                self.assertIsNone(polydye.pulse_range_error(words, now), (pulse, clock, start))
 
 
 class SendOrder(unittest.TestCase):
@@ -298,6 +323,23 @@ class SendOrder(unittest.TestCase):
                          [('clock', 'ours'), ('pulse', 9)])
         self.assertEqual(self.sends({'cartridge_template': 'color_b', 'bus_clock': 'ours'}, 'color_a', None, None),
                          ['template'])
+        # ours, 9 -> half, 4: 9 words at half would be 5.4 us. half, 4 -> ours, 9: the other way round.
+        self.assertEqual(self.sends({'cartridge_template': 'color_b', 'bus_clock': 'ours'}, None, 4, 'half'),
+                         [('pulse', 4), ('clock', 'half')])
+        self.assertEqual(self.sends({'cartridge_template': 'color_b', 'bus_clock': 'half'}, None, 9, 'ours'),
+                         [('clock', 'ours'), ('pulse', 9)])
+
+    def test_no_step_is_over_the_limit_between_any_two_settings(self):
+        settings = [(words, clock) for clock in polydye.CLOCKS
+                    for words in range(polydye.min_pulse_words(clock), polydye.max_pulse_words(clock) + 1)]
+        for start in settings:
+            for target in settings:
+                now = list(start)
+                for step in self.sends({'cartridge_template': 'color_b', 'pulse_words': start[0],
+                                        'bus_clock': start[1]}, None, target[0], target[1]):
+                    now[0 if step[0] == 'pulse' else 1] = step[1]
+                    self.assertIsNone(polydye.pulse_limit_error(*now), (start, target, step))
+                self.assertEqual(tuple(now), target)
 
 
 class FakeBoard:
@@ -308,6 +350,11 @@ class FakeBoard:
         self.template, self.pulse, self.clock = 'color_a', 8, 'ours'
         self.measured = None
         self.sent = []
+        self.violations = []  # moments where the board would have refused the pulse at the clock
+
+    def check(self):
+        if polydye.pulse_limit_error(self.pulse, self.clock):
+            self.violations.append((self.pulse, self.clock))
 
     def status(self):
         return {'boost': self.boost, 'live': self.live, 'running': False, 'queued': 0, 'faults': 0,
@@ -324,6 +371,7 @@ class TestCleanup(unittest.TestCase):
         pd.oid, pd.pass_axis = 0, 'y'
         pd.query_cartridge_cmd = object()
         pd.spit_patterns = len(polydye.TEST_PATTERNS)
+        pd.clock_count = len(polydye.CLOCKS)
 
         def mode(args):
             board.boost, board.live = bool(args[1]), bool(args[2])
@@ -332,9 +380,10 @@ class TestCleanup(unittest.TestCase):
         pd.set_template_cmd = types.SimpleNamespace(
             send=lambda args: (setattr(board, 'template', polydye.TEMPLATES[args[1]]), board.sent.append('tpl')))
         pd.set_pulse_cmd = types.SimpleNamespace(
-            send=lambda args: (setattr(board, 'pulse', args[1]), board.sent.append('pulse')))
+            send=lambda args: (setattr(board, 'pulse', args[1]), board.sent.append('pulse'), board.check()))
         pd.set_clock_cmd = types.SimpleNamespace(
-            send=lambda args: (setattr(board, 'clock', polydye.CLOCKS[args[1]]), board.sent.append('clock')))
+            send=lambda args: (setattr(board, 'clock', polydye.CLOCKS[args[1]]), board.sent.append('clock'),
+                               board.check()))
         pd._fresh_status = pd._query_status = board.status
 
         def run_script(script):
@@ -350,6 +399,7 @@ class TestCleanup(unittest.TestCase):
                         board.clock = value
                     else:
                         board.pulse = int(value)
+                board.check()
             elif script == "POLYDYE_ENABLE LIVE=1":
                 board.boost = board.live = True
             elif script == "POLYDYE_DISABLE":
@@ -499,6 +549,54 @@ class TestCleanup(unittest.TestCase):
         pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., PATTERN='mid', CONFIRM=1))
         self.assertIn('spit', board.sent)
 
+    def test_half_clock_spit_and_back_without_an_over_limit_step(self):
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append(('spit', args[1], args[2])))
+        pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=8., CLOCK='half', PULSE=4, PATTERN='all', CONFIRM=1))
+        self.assertIn("POLYDYE_CARTRIDGE PULSE=4 CLOCK=half", board.sent)
+        self.assertIn(('spit', 8000, 0), board.sent)
+        # Back to 8 words at our clock: the clock first, since 8 words at half would be 4.8 us.
+        after = board.sent[board.sent.index(('spit', 8000, 0)):]
+        self.assertLess(after.index('clock'), after.index('pulse'))
+        self.assertEqual((board.boost, board.pulse, board.clock), (False, 8, 'ours'))
+        self.assertEqual(board.violations, [])
+
+    def test_fire_test_half_clock_stripe(self):
+        pd, board = self.make(fail_on="NOTHING")
+        pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:4:half,color_b:9", X=80., Y=60., SPACING=20.,
+                                           COLUMNS=600, UPLOAD=1, LAYER=0, PASS=0, PATTERN='all'))
+        self.assertIn("POLYDYE_CARTRIDGE TEMPLATE=color_b PULSE=4 CLOCK=half", board.sent)
+        self.assertIn("POLYDYE_CARTRIDGE TEMPLATE=color_b PULSE=9 CLOCK=ours", board.sent)
+        self.assertEqual((board.boost, board.template, board.pulse, board.clock), (False, 'color_a', 8, 'ours'))
+        self.assertEqual(board.violations, [])
+
+    def test_half_clock_pulse_range_and_older_board_firmware(self):
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append('spit'))
+        # The board's 8 words at half would be 4.8 us; 5 words 3.0 us; 5 words at our clock only 1.5 us.
+        for params, message in ((dict(CLOCK='half'), "at most 4 words there"),
+                                (dict(CLOCK='half', PULSE=5), "at most 4 words there"),
+                                (dict(PULSE=5), "less than Sprite_tm's 1.8 us")):
+            with self.assertRaisesRegex(RuntimeError, message):
+                pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., PATTERN='all', CONFIRM=1, **params))
+        with self.assertRaisesRegex(RuntimeError, "at most 4 words there"):
+            pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:5:half", X=80., Y=60., SPACING=20., COLUMNS=600,
+                                               UPLOAD=1, LAYER=0, PASS=0, PATTERN='all'))
+        with self.assertRaisesRegex(RuntimeError, "at most 4 words there"):
+            pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(CLOCK='half'))
+        self.assertEqual(board.sent, [])
+        pd.clock_count = polydye.BUS_CLOCKS_OLD  # no POLYDYE_BUS_CLOCKS constant
+        for run in (lambda: pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., CLOCK='half', PULSE=4, PATTERN='all',
+                                                          CONFIRM=1)),
+                    lambda: pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:4:half", X=80., Y=60., SPACING=20.,
+                                                               COLUMNS=600, UPLOAD=1, LAYER=0, PASS=0,
+                                                               PATTERN='all')),
+                    lambda: pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(CLOCK='half', PULSE=4))):
+            with self.assertRaisesRegex(RuntimeError, "CLOCK=half needs newer PolyDye board firmware.*Update to "
+                                                      "bundled firmware"):
+                run()
+        self.assertEqual(board.sent, [])
+
     def test_fire_test_uploads_sparse_on_any_board_firmware(self):
         pd, board = self.make(fail_on="NOTHING")
         pd.spit_patterns = polydye.SPIT_PATTERNS_OLD
@@ -506,6 +604,42 @@ class TestCleanup(unittest.TestCase):
                                            UPLOAD=1, LAYER=0, PASS=0, PATTERN='sparse'))
         self.assertIn("POLYDYE_UPLOAD_TEST_PASS LAYER=0 PASS=0 COLUMNS=600 PATTERN=sparse", board.sent)
         self.assertEqual((board.boost, board.template, board.pulse), (False, 'color_a', 8))
+
+
+class BuildConfig(unittest.TestCase):
+    """The pulse and clock from polydye.cfg, sent on every connect."""
+
+    def build(self, constants, bus_clock, pulse_words):
+        class ConfigError(Exception):
+            pass
+        pd = object.__new__(polydye.PolyDye)
+        pd.oid, pd.cartridge_template, pd.bus_clock, pd.pulse_words = 0, None, bus_clock, pulse_words
+        pd.spit_patterns = pd.clock_count = 0
+        pd.printer = types.SimpleNamespace(config_error=ConfigError)
+        sent = []
+        pd.mcu = types.SimpleNamespace(
+            add_config_cmd=lambda cmd, is_init=False: sent.append(cmd), alloc_command_queue=lambda: None,
+            lookup_command=lambda *a, **kw: object(), lookup_query_command=lambda *a, **kw: object(),
+            try_lookup_command=lambda *a, **kw: object(), get_constants=lambda: dict(constants))
+        try:
+            pd._build_config()
+        except ConfigError as e:
+            return pd, str(e)
+        return pd, [cmd for cmd in sent if cmd.startswith(("polydye_set_pulse", "polydye_set_clock"))]
+
+    def test_half_clock_goes_through_ours_then_the_pulse(self):
+        pd, sent = self.build({'POLYDYE_BUS_CLOCKS': 3}, 'half', 4)
+        self.assertEqual(pd.clock_count, 3)
+        self.assertEqual(sent, ["polydye_set_clock oid=0 stock=0", "polydye_set_pulse oid=0 words=4",
+                                "polydye_set_clock oid=0 stock=2"])
+
+    def test_half_clock_needs_newer_board_firmware(self):
+        pd, error = self.build({}, 'half', 4)
+        self.assertIn("bus_clock: half needs newer PolyDye board firmware", error)
+        self.assertIn("Update to bundled firmware", error)
+        pd, sent = self.build({}, 'stock', 8)
+        self.assertEqual(pd.clock_count, polydye.BUS_CLOCKS_OLD)
+        self.assertEqual(sent[-1], "polydye_set_clock oid=0 stock=1")
 
 
 if __name__ == "__main__":

@@ -80,11 +80,12 @@
             <option value="">Board default (ours, 3.333 MHz)</option>
             <option value="ours">ours (3.333 MHz)</option>
             <option value="stock">stock (2.857 MHz)</option>
+            <option value="half">half (1.667 MHz)</option>
           </select>
         </label>
         <label>Resolution (dpi)<input name="dpi" type="number" step="1" min="1" placeholder="600"></label>
         <label>Pass speed (mm/s)<input name="pass_speed" type="number" step="0.1" min="1" placeholder="50"></label>
-        <label>Fire pulse (bus words)<input name="pulse_words" type="number" step="1" min="6" max="9"
+        <label>Fire pulse (bus words)<input name="pulse_words" type="number" step="1" min="3" max="9"
           placeholder="6 (board default)"></label>
         <div class="buttons">
           <button type="submit" class="primary">Save</button>
@@ -95,10 +96,14 @@
           waveform: a and b are two variants for each cartridge type, so try both at the nozzle check;
           color_b_late is color_b with the stock PolyDye firmware's timing. The bus clock &ldquo;stock&rdquo; copies
           the stock firmware's bus setup, which runs at 2.857 MHz, so each pulse word lasts 0.35 µs instead of 0.3.
+          &ldquo;Half&rdquo; runs the same waveform at half our clock, 1.667 MHz, so every edge has twice the time to
+          settle through the level shifters; each pulse word lasts 0.6 µs, so the fire pulse is 3 or 4 words there,
+          and the fastest pass is about half as fast (about 134 mm/s at 600 dpi). It needs current board firmware.
           A black template needs pass data made for a black cartridge. The fire pulse sets how long each nozzle is
           heated: longer pulses put more energy into each drop, for when the board's boost voltage is below the
-          cartridge's. Leave it empty for the board's 6 (1.8 µs). Live ink is limited to 2.9 µs, 100 % of the
-          reference heater energy at this board's 12.6 V: 9 words with our clock, 8 with the stock one. Saving edits
+          cartridge's. Leave it empty for the board's 6 (1.8 µs; 3 words at half). Live ink is limited to 2.9 µs,
+          100 % of the reference heater energy at this board's 12.6 V: 9 words with our clock, 8 with the stock one,
+          4 at half. Saving edits
           only the [polydye] section of
           polydye.cfg; Klipper applies it after a restart.</p>
       </form>
@@ -173,7 +178,9 @@
       <h3>Fire test <span class="sub">live ink on paper</span></h3>
       <p class="hint">Prints a stripe for each template, fire pulse and bus clock, side by side, so you can see which
         settings put ink down. The default stripes compare our timing with the stock PolyDye firmware's (color_b vs
-        color_b_late, our clock vs stock) at pulse 6 and the longest allowed (9 words, 8 with the stock clock). Tape paper on the bed and fit the cartridge first. The
+        color_b_late, our clock vs stock) at pulse 6 and the longest allowed (9 words, 8 with the stock clock); add
+        stripes such as color_b:3:half,color_b:4:half to try half the bus clock. Tape paper on the bed and fit the
+        cartridge first. The
         test homes if needed, lowers the nozzle to Z and puts the settings back afterwards. Stripes run along the
         pass axis.</p>
       <form id="fire-form" class="compact">
@@ -200,7 +207,8 @@
         steady load for a USB-C power meter on the board's power input (J4): compare the current with the
         cartridge in and out to see whether the nozzle heaters draw anything. Sparse fires one nozzle per fire
         pulse instead of up to 12, going through every nozzle in turn, in case a full column starves the
-        heaters' supply.</p>
+        heaters' supply. The bus clock &ldquo;half&rdquo; (1.667 MHz) gives the level shifters twice the time for every
+        edge; use a 3 or 4-word pulse with it (1.8 or 2.4 µs).</p>
       <form id="spit-form" class="compact">
         <label>Seconds<input name="seconds" type="number" step="0.5" min="0.5" max="10" value="2"></label>
         <label>Template
@@ -211,9 +219,12 @@
             <option value="color_b_late">color_b_late</option>
           </select>
         </label>
-        <label>Fire pulse (words)<input name="pulse" type="number" step="1" min="6" max="9" placeholder="current"></label>
+        <label>Fire pulse (words)<input name="pulse" type="number" step="1" min="3" max="9" placeholder="current"></label>
         <label>Bus clock
-          <select name="clock"><option value="">Current</option><option value="ours">ours</option><option value="stock">stock</option></select>
+          <select name="clock">
+            <option value="">Current</option><option value="ours">ours</option><option value="stock">stock</option>
+            <option value="half">half (1.667 MHz)</option>
+          </select>
         </label>
         <label>Nozzles
           <select name="pattern">
@@ -225,8 +236,7 @@
       <div class="buttons">
         <button id="spit-btn" class="danger">Spit test&hellip;</button>
       </div>
-      <p class="hint hidden" id="spit-sparse-old">The sparse spit test needs newer board firmware: Update to bundled
-        firmware under Board firmware. The fire test's sparse stripes work with this one.</p>
+      <p class="hint hidden" id="spit-fw-old"></p>
       <p class="hint hidden" id="diag-old">The spit test, the signal check and the stock timing options need newer
         board firmware: update it under Board firmware.</p>
       <h3>Next steps</h3>

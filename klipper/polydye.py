@@ -7,6 +7,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import json
 import logging
+import math
 import struct
 import zlib
 
@@ -22,17 +23,22 @@ LEVEL = "polydye_level oid=%c line=%c state=%c remaining=%hu"
 TEMPLATES = ('color_a', 'color_b', 'black_a', 'black_b', 'color_b_late')
 NEW_TEMPLATES = ('color_b_late',)
 CLOCK = "polydye_clock oid=%c stock=%c nominal_hz=%u measured_hz=%u"
-# Bus clocks: ours (POLYDYE_BUS_HZ) and the stock firmware's setup. The stock setup's divider of 1 acts as 2 on the
-# board (measured 2.82-2.83 MHz), so it runs at 2.857 MHz, not the 5.714 MHz it looks like on paper.
-CLOCKS = ('ours', 'stock')
-CLOCK_HZ = {'ours': 3333333., 'stock': 2857142.}
+# Bus clocks in polydye_set_clock numbering: ours (POLYDYE_BUS_HZ), the stock firmware's setup, and half ours. The
+# stock setup's divider of 1 acts as 2 on the board (measured 2.82-2.83 MHz), so it runs at 2.857 MHz, not the 5.714 MHz
+# it looks like on paper. Half (1.667 MHz) gives every template edge twice the time to settle; it needs board firmware
+# with the POLYDYE_BUS_CLOCKS constant (older firmware has the first BUS_CLOCKS_OLD).
+CLOCKS = ('ours', 'stock', 'half')
+CLOCK_HZ = {'ours': 3333333., 'stock': 2857142., 'half': 1666666.}
+BUS_CLOCKS_OLD = 2
 # Longest fire pulse for live ink, whatever the clock (the board's POLYDYE_PULSE_MAX_NS): 100 % of the heater energy
 # of Sprite_tm's 1.8 us at the cartridge's 16 V, at the 12.6 V the PolyDye high rail measures.
 PULSE_MAX_US = 2.9
 RAIL_V, REF_V, REF_US = 12.6, 16., 1.8
 # polydye_set_pulse range and the cartridge bus clock (one word of fire pulse = 1 / PULSE_WORD_HZ s): the board's
-# POLYDYE_PULSE_MIN, POLYDYE_PULSE_MAX and POLYDYE_BUS_HZ.
-PULSE_MIN, PULSE_MAX, PULSE_WORD_HZ = 6, 12, 3333333.
+# POLYDYE_PULSE_MIN (6 before the half clock), POLYDYE_PULSE_MAX and POLYDYE_BUS_HZ. A pulse asked for must also be at
+# least Sprite_tm's 1.8 us (REF_US) at its clock: 6 words at ours and stock, 3 at half (min_pulse_words). Shorter ones
+# are only sent on the way to the half clock, so that no step is over the limit.
+PULSE_MIN, PULSE_MAX, PULSE_WORD_HZ = 3, 12, 3333333.
 FLAG_BOOST, FLAG_LIVE, FLAG_RUNNING, FLAG_LEVEL = 1, 2, 4, 8
 # Signal check (polydye_set_level): the non-fire cartridge lines in bus-bit order, and their rail. The low-rail lines
 # go through the CD4504 on the reference design's "9 V" rail, the others through the one on its "16 V" rail.
@@ -210,7 +216,7 @@ def parse_stripes(text):
             raise ValueError("pulse %d is outside %d-%d words" % (words, PULSE_MIN, PULSE_MAX))
         clock = parts[2] if len(parts) == 3 else None
         if clock is not None and clock not in CLOCKS:
-            raise ValueError("clock '%s' must be ours or stock" % (clock,))
+            raise ValueError("clock '%s' must be ours, stock or half" % (clock,))
         stripes.append((parts[0], words, clock))
     if not stripes:
         raise ValueError("no stripes given")
@@ -228,8 +234,13 @@ def pulse_energy_pct(us):
 
 
 def max_pulse_words(clock):
-    """Longest pulse in bus words that stays within PULSE_MAX_US at a clock."""
+    """Longest pulse in bus words that stays within PULSE_MAX_US at a clock: 9 at ours, 8 at stock, 4 at half."""
     return min(PULSE_MAX, int(PULSE_MAX_US * CLOCK_HZ[clock or 'ours'] / 1e6 + 1e-9))
+
+
+def min_pulse_words(clock):
+    """Shortest pulse in bus words that is at least Sprite_tm's REF_US at a clock: 6 at ours and stock, 3 at half."""
+    return max(PULSE_MIN, int(math.ceil(REF_US * CLOCK_HZ[clock or 'ours'] / 1e6 - 1e-6)))
 
 
 def pulse_limit_error(words, clock):
@@ -239,6 +250,16 @@ def pulse_limit_error(words, clock):
         return None
     return ("fire pulse %d words is %.2f us at the %s bus clock; the limit is %.1f us (at most %d words there)"
             % (words, pulse_us(words, clock), clock, PULSE_MAX_US, max_pulse_words(clock)))
+
+
+def pulse_range_error(words, clock):
+    """None, or why `words` at `clock` isn't a pulse to ask for: over the live-ink limit, or under 1.8 us."""
+    clock = clock or 'ours'
+    if words < min_pulse_words(clock):
+        return ("fire pulse %d words is %.2f us at the %s bus clock, less than Sprite_tm's %.1f us; use %d-%d words "
+                "there" % (words, pulse_us(words, clock), clock, REF_US, min_pulse_words(clock),
+                           max_pulse_words(clock)))
+    return pulse_limit_error(words, clock)
 
 
 def color_column(positions):
@@ -289,16 +310,21 @@ def init_pulse_clock(pulse_words, bus_clock, has_clock):
     """The pulse and clock settings to send on connect, as (words, None) / (None, clock) steps in order.
 
     The board refuses any moment where the pulse would be over the limit, and after a Klipper RESTART it still has the
-    previous pulse and clock. The slower stock clock goes after a pulse that's within the limit there; our clock goes
-    first, since a pulse within the limit at the stock clock is within it at ours. With pulse_words but no bus_clock,
-    the clock goes back to ours (the board's default) so the pulse is checked against the clock it was set for.
+    previous pulse and clock, whichever they are. So the clock goes to ours first: it's the fastest, so any pulse
+    within the limit at some clock is within it there. Then the pulse, then a slower clock if one is set. A bus_clock
+    without pulse_words gets its shortest pulse of at least 1.8 us (6 words at ours and stock, the board's default; 3 at
+    half), so a pulse left from another clock (4 words from half would be 1.2 us at ours) isn't kept. With pulse_words
+    but no bus_clock, the clock goes back to ours (the board's default) so the pulse is checked against the clock it was
+    set for.
     """
     clock = (bus_clock or ('ours' if pulse_words is not None else None)) if has_clock else None
-    if clock == 'stock':
-        return [(pulse_words or PULSE_MIN, None), (None, 'stock')]
-    steps = [(None, 'ours')] if clock == 'ours' else []
-    if pulse_words is not None:
-        steps.append((pulse_words, None))
+    if clock is None:
+        return [] if pulse_words is None else [(pulse_words, None)]
+    if pulse_words is None:
+        pulse_words = min_pulse_words(clock)
+    steps = [(None, 'ours'), (pulse_words, None)]
+    if clock != 'ours':
+        steps.append((None, clock))
     return steps
 
 
@@ -338,18 +364,20 @@ class PolyDye:
             self.cartridge_template = self.cartridge_template.strip().lower()
             if self.cartridge_template not in TEMPLATES:
                 raise config.error("[polydye] cartridge_template must be one of: %s" % (", ".join(TEMPLATES),))
-        # F3/F5 fire pulse in bus words of 0.3 us; unset leaves the board's own (6 = 1.8 us, Sprite_tm's value). Longer
-        # pulses put more energy into each drop, e.g. when the boost rails are below the cartridge's nominal voltage.
+        # F3/F5 fire pulse in bus words (0.3 us at our clock, 0.6 us at half); unset leaves the board's own (6 = 1.8 us,
+        # Sprite_tm's value), or with bus_clock set, 1.8 us at that clock (6 words, 3 at half). Longer pulses put more
+        # energy into each drop, e.g. when the boost rails are below the cartridge's nominal voltage.
         self.pulse_words = config.getint('pulse_words', None, minval=PULSE_MIN, maxval=PULSE_MAX)
-        # Cartridge bus clock: ours (3.333 MHz) or the stock PolyDye firmware's setup (5.714 MHz nominal); unset leaves
-        # the board's own (ours). Needs board firmware with polydye_set_clock.
+        # Cartridge bus clock: ours (3.333 MHz), the stock PolyDye firmware's setup (2.857 MHz) or half ours (1.667
+        # MHz); unset leaves the board's own (ours). Needs board firmware with polydye_set_clock, and for half with
+        # POLYDYE_BUS_CLOCKS.
         self.bus_clock = config.get('bus_clock', None)
         if self.bus_clock is not None:
             self.bus_clock = self.bus_clock.strip().lower()
             if self.bus_clock not in CLOCKS:
-                raise config.error("[polydye] bus_clock must be ours or stock")
-        if self.pulse_words is not None and pulse_limit_error(self.pulse_words, self.bus_clock):
-            raise config.error("[polydye] pulse_words: %s" % (pulse_limit_error(self.pulse_words, self.bus_clock),))
+                raise config.error("[polydye] bus_clock must be ours, stock or half")
+        if self.pulse_words is not None and pulse_range_error(self.pulse_words, self.bus_clock):
+            raise config.error("[polydye] pulse_words: %s" % (pulse_range_error(self.pulse_words, self.bus_clock),))
         self.dpi = config.getfloat('dpi', 600., above=0.)
         self.pass_speed = config.getfloat('pass_speed', 50., above=0.)
         self.travel_speed = config.getfloat('travel_speed', 150., above=0.)
@@ -362,6 +390,7 @@ class PolyDye:
         self.set_level_cmd = self.query_level_cmd = self.spit_cmd = None
         self.spit_patterns = 0
         self.set_clock_cmd = self.query_clock_cmd = None
+        self.clock_count = 0  # bus clocks the board offers (CLOCKS[:clock_count]); 0: no clock choice
         self.last_status = {}
         self.last_pass = None
         self.querying = False
@@ -409,6 +438,13 @@ class PolyDye:
             self.set_clock_cmd = self.mcu.lookup_command("polydye_set_clock oid=%c stock=%c", cq=cq)
             self.query_clock_cmd = self.mcu.lookup_query_command("polydye_query_clock oid=%c", CLOCK, oid=self.oid,
                                                                  cq=cq)
+            # The half clock came later, with this constant.
+            self.clock_count = min(len(CLOCKS), int(self.mcu.get_constants().get('POLYDYE_BUS_CLOCKS',
+                                                                                 BUS_CLOCKS_OLD)))
+            if self.bus_clock is not None and CLOCKS.index(self.bus_clock) >= self.clock_count:
+                raise self.printer.config_error(
+                    "[polydye] bus_clock: %s needs newer PolyDye board firmware. Update it from the PolyDye page (Board "
+                    "firmware: Update to bundled firmware), or change it in polydye.cfg." % (self.bus_clock,))
         else:
             for option, value in (('cartridge_template', self.cartridge_template in NEW_TEMPLATES),
                                   ('bus_clock', self.bus_clock is not None)):
@@ -686,8 +722,9 @@ class PolyDye:
         self._respond_offsets(gcmd)
 
     cmd_POLYDYE_CARTRIDGE_help = ("Set the cartridge waveform template (TEMPLATE=color_a|color_b|black_a|black_b|"
-                                  "color_b_late), fire pulse (PULSE=6..12 words) and bus clock (CLOCK=ours|stock) "
-                                  "until the next restart; PolyDye must be off and idle")
+                                  "color_b_late), fire pulse (PULSE in words: 6-9 at our clock, 6-8 at stock, 3-4 at "
+                                  "half) and bus clock (CLOCK=ours|stock|half) until the next restart; PolyDye must be "
+                                  "off and idle")
 
     def cmd_POLYDYE_CARTRIDGE(self, gcmd):
         if self.query_cartridge_cmd is None:
@@ -703,10 +740,11 @@ class PolyDye:
         if clock is not None:
             clock = clock.lower()
             if clock not in CLOCKS:
-                raise gcmd.error("POLYDYE_CARTRIDGE: CLOCK must be ours or stock")
+                raise gcmd.error("POLYDYE_CARTRIDGE: CLOCK must be ours, stock or half")
         if self.set_clock_cmd is None and (clock is not None or name in NEW_TEMPLATES):
             raise gcmd.error("POLYDYE_CARTRIDGE: %s needs newer PolyDye board firmware; update it from the PolyDye "
                              "page (Board firmware)" % ("CLOCK" if clock is not None else name,))
+        self._check_clock(gcmd, "POLYDYE_CARTRIDGE", clock)
         if name is not None or pulse is not None or clock is not None:
             # The board refuses a change while powered or busy by shutting down; check first for a plain error.
             self.printer.lookup_object('toolhead').wait_moves()
@@ -714,9 +752,11 @@ class PolyDye:
             change = (name is not None and name != st['cartridge_template']) or (
                 pulse is not None and pulse != st['pulse_words']) or (
                 clock is not None and clock != st.get('bus_clock'))
-            # Also when nothing changes: the result must be within the limit, not just different.
-            limit = pulse_limit_error(pulse if pulse is not None else st['pulse_words'],
-                                      clock if clock is not None else st.get('bus_clock'))
+            # Also when nothing changes: the result must be within the limit, not just different. A pulse or clock
+            # asked for must also make a pulse of at least 1.8 us.
+            check = pulse_range_error if pulse is not None or clock is not None else pulse_limit_error
+            limit = check(pulse if pulse is not None else st['pulse_words'],
+                          clock if clock is not None else st.get('bus_clock'))
             if limit:
                 raise gcmd.error("POLYDYE_CARTRIDGE: %s" % (limit,))
             if change and (st['boost'] or st['live'] or st['running'] or st['queued']):
@@ -726,6 +766,12 @@ class PolyDye:
         st = self._fresh_status()
         gcmd.respond_info("PolyDye %s (set cartridge_template, pulse_words and bus_clock in polydye.cfg to keep them "
                           "after a restart)" % (cartridge_text(st),))
+
+    def _check_clock(self, gcmd, name, clock):
+        """Refuses a bus clock the board firmware doesn't have (the half clock came after the others)."""
+        if clock is not None and CLOCKS.index(clock) >= self.clock_count:
+            raise gcmd.error("%s: CLOCK=%s needs newer PolyDye board firmware; update it from the PolyDye page (Board "
+                             "firmware: Update to bundled firmware)" % (name, clock))
 
     def _send_cartridge(self, st, name, pulse, clock):
         """Sends the changed settings, in an order the board accepts: it refuses any moment where the pulse would be
@@ -850,6 +896,8 @@ class PolyDye:
         if self.set_clock_cmd is None and any(clock or tpl in NEW_TEMPLATES for tpl, _, clock in stripes):
             raise gcmd.error("POLYDYE_FIRE_TEST: color_b_late and the clock need newer PolyDye board firmware; "
                              "update it from the PolyDye page (Board firmware)")
+        for _, _, clock in stripes:
+            self._check_clock(gcmd, "POLYDYE_FIRE_TEST", clock)
         pattern = gcmd.get('PATTERN', 'all').lower()
         if pattern not in TEST_PATTERNS:
             raise gcmd.error("POLYDYE_FIRE_TEST: PATTERN must be all, mid or sparse")
@@ -880,8 +928,8 @@ class PolyDye:
         before = (st['cartridge_template'], st['pulse_words'], st.get('bus_clock'))
         stripes = [(tpl, words, clock or before[2]) for tpl, words, clock in stripes]
         for tpl, words, clock in stripes:
-            if pulse_limit_error(words, clock):
-                raise gcmd.error("POLYDYE_FIRE_TEST: stripe %s:%d: %s" % (tpl, words, pulse_limit_error(words, clock)))
+            if pulse_range_error(words, clock):
+                raise gcmd.error("POLYDYE_FIRE_TEST: stripe %s:%d: %s" % (tpl, words, pulse_range_error(words, clock)))
         positions = stripe_positions(self.pass_axis, x, y, spacing, len(stripes))
         gcmd.respond_info("PolyDye fire test, live ink, %d stripes of %d %s columns along %s:\n%s" % (
             len(stripes), columns, pattern if upload else "stored", self.pass_axis.upper(), "\n".join(
@@ -920,7 +968,8 @@ class PolyDye:
 
     cmd_POLYDYE_SPIT_help = ("LIVE INK, no motion: fire every nozzle (PATTERN=all), positions 14-90 (mid) or one "
                              "nozzle per fire pulse in turn (sparse) for SECONDS (max 10) at 1 kHz into a paper towel "
-                             "held under the cartridge, optionally with TEMPLATE, PULSE and CLOCK; needs CONFIRM=1")
+                             "held under the cartridge, optionally with TEMPLATE, PULSE and CLOCK=ours|stock|half; "
+                             "needs CONFIRM=1")
 
     def cmd_POLYDYE_SPIT(self, gcmd):
         if self.spit_cmd is None:
@@ -937,7 +986,8 @@ class PolyDye:
         if clock is not None:
             clock = clock.lower()
             if clock not in CLOCKS:
-                raise gcmd.error("POLYDYE_SPIT: CLOCK must be ours or stock")
+                raise gcmd.error("POLYDYE_SPIT: CLOCK must be ours, stock or half")
+            self._check_clock(gcmd, "POLYDYE_SPIT", clock)
         pattern = gcmd.get('PATTERN', 'all').lower()
         if pattern not in TEST_PATTERNS:
             raise gcmd.error("POLYDYE_SPIT: PATTERN must be all, mid or sparse")
@@ -956,7 +1006,8 @@ class PolyDye:
             raise gcmd.error("POLYDYE_SPIT: wait for queued passes to finish")
         self._check_current_pulse(gcmd, "POLYDYE_SPIT", st)
         before = (st['cartridge_template'], st['pulse_words'], st.get('bus_clock'))
-        limit = pulse_limit_error(pulse if pulse is not None else st['pulse_words'], clock or before[2])
+        check = pulse_range_error if pulse is not None or clock is not None else pulse_limit_error
+        limit = check(pulse if pulse is not None else st['pulse_words'], clock or before[2])
         if limit:
             raise gcmd.error("POLYDYE_SPIT: %s" % (limit,))
         columns = max(1, int(round(seconds * SPIT_HZ)))
@@ -1015,7 +1066,8 @@ class PolyDye:
     def get_status(self, eventtime):
         return dict(self.last_status, last_pass=self.last_pass, pass_axis=self.pass_axis, offset_x=self.offset_x,
                     offset_y=self.offset_y, direction_trim=self.direction_trim,
-                    spit_patterns=list(TEST_PATTERNS[:self.spit_patterns]))
+                    spit_patterns=list(TEST_PATTERNS[:self.spit_patterns]),
+                    bus_clocks=list(CLOCKS[:self.clock_count]))
 
 
 def load_config(config):
