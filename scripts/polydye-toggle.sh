@@ -9,6 +9,10 @@
 # damaged SD card), so restarting the Klipper service heals it instead of Klipper halting on
 # "Section 'polydye' is not a valid config section".
 #
+# It first writes everything pending to the SD card, and checks the add-on's own files: if an unsafe shutdown has
+# damaged the ones Klipper loads, PolyDye stays off so Klipper still starts and prints (see the README, "Raspberry
+# Pi 3: freezes and damaged files").
+#
 # Usage: polydye-toggle.sh [klipper config dir] [klipper dir]   (defaults ~/printer_data/config, ~/klipper)
 #
 # This file is part of polydye-klipper (GPLv3).
@@ -17,6 +21,12 @@ CFG_DIR="${1:-$HOME/printer_data/config}"
 KLIPPER_DIR="${2:-$HOME/klipper}"
 OUT="$CFG_DIR/polydye-active.cfg"
 REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
+BY_ID="${POLYDYE_BY_ID_DIR:-/dev/serial/by-id}"  # the override is for tests
+
+# Moonraker's Update Manager restarts Klipper right after it pulls this add-on, and Klipper may then restart the
+# PolyDye board. A Raspberry Pi 3 has frozen when a USB device left and came back, and files from the pull that were
+# still only in memory came back empty or full of zeros. Put them on the SD card first.
+sync
 
 EXTRA="$KLIPPER_DIR/klippy/extras/polydye.py"
 # -e follows the link, so this is true for a missing link and for one whose target is gone. Anything else there
@@ -35,9 +45,30 @@ if [ -d "$KLIPPER_DIR/klippy/extras" ] && [ ! -e "$EXTRA" ]; then
     fi
 fi
 
+# The add-on's own files against git's record of them (git status only compares sizes and times).
+files_ok=1
+files=$(python3 "$REPO_DIR/scripts/polydye_files.py" "$REPO_DIR" 2>&1)
+case "$files" in
+    *"result: "*)
+        corrupt=$(printf '%s\n' "$files" | sed -n 's/^corrupt //p' | tr '\n' ' ')
+        changed=$(printf '%s\n' "$files" | sed -n 's/^changed //p' | tr '\n' ' ')
+        if [ -n "$corrupt" ]; then
+            echo "polydye: ADD-ON FILES DAMAGED: ${corrupt}(probably an unsafe shutdown right after an update)." \
+                "Recover them: Update Manager, polydye, Recover, Hard recovery; see the add-on's README." >&2
+            case " $corrupt" in
+                *" klipper/polydye.py "* | *" config/polydye_macros.cfg "*) files_ok="" ;;
+            esac
+        fi
+        [ -z "$changed" ] || echo "polydye: add-on files that differ from git (local edits?): $changed"
+        ;;
+    *)
+        echo "polydye: couldn't check the add-on's files: $files" >&2
+        ;;
+esac
+
 port=""
 for _ in 1 2 3 4; do  # at boot, give USB a moment to enumerate
-    for p in /dev/serial/by-id/usb-PolyDye_*-if00; do
+    for p in "$BY_ID"/usb-PolyDye_*-if00; do
         if [ -e "$p" ]; then
             port="$p"
             break
@@ -47,7 +78,11 @@ for _ in 1 2 3 4; do  # at boot, give USB a moment to enumerate
     sleep 0.5
 done
 
-if [ -n "$port" ]; then
+if [ -n "$port" ] && [ -z "$files_ok" ]; then
+    rm -f "$OUT"
+    echo "polydye: board found at $port, but the add-on's Klipper files are damaged: PolyDye left off, so Klipper" \
+        "starts and prints without it" >&2
+elif [ -n "$port" ]; then
     cat > "$OUT.tmp" <<EOF
 # Written by polydye-toggle.sh when Klipper started, because the PolyDye board was plugged in.
 # To print without PolyDye: unplug the board's USB, then restart the Klipper service.

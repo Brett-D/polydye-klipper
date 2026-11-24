@@ -5,10 +5,18 @@
 # The page itself talks to Moonraker's normal websocket API, like Mainsail does.
 #
 # Firmware API (authorised like the rest of Moonraker's API):
-#   GET  /server/polydye/firmware          -> {"bundled": {version, size, sha256} | null, "updating": bool}
+#   GET  /server/polydye/firmware          -> {"bundled": {version, size, sha256} | null, "updating": bool,
+#                                              "files": {"corrupt": [...], "changed": [...]} | {"error": ...}, ...}
 #   POST /server/polydye/firmware/update   [file=<path under the config root>] [force=true]
 #        Updates from the given .bin, or from the firmware bundled with this add-on. Progress is sent to websocket
 #        clients as notify_polydye_firmware {"state": "running"|"done"|"error", "message", "progress"}.
+#
+# The board leaves USB and comes back when it restarts into new firmware, and a Raspberry Pi 3 has frozen when that
+# happened with ports open (its dwc_otg USB driver). So an update first writes everything pending to the SD card and
+# stops the Klipper service, and starts it again once the board is back.
+#
+# At startup it also checks the add-on's own files (scripts/polydye_files.py) and shows a Moonraker warning if an
+# unsafe shutdown damaged them.
 #
 # Copyright (C) 2026  polydye-klipper contributors
 #
@@ -22,6 +30,7 @@ import logging
 import os
 import re
 import sys
+import time
 
 from ..common import KlippyState, RequestType, TransportType
 
@@ -42,6 +51,27 @@ def power_problem(path: str = THROTTLED_PATH, bits: int = 0):
     if bits & 0x10000:
         return "the Pi has been under-volted since it started"
     return None
+
+FILES_WARNING = ("PolyDye: add-on files damaged ({files}), probably by an unsafe shutdown (the Pi froze or lost power) "
+                 "right after an update. Recover them: Update Manager, polydye, Recover, Hard Recovery (or see the "
+                 "polydye-klipper README, \"Raspberry Pi 3: freezes and damaged files\").")
+# Seconds to wait for Klipper to let go of the board's Klipper port after its service was told to stop.
+PORT_FREE_TIMEOUT = 30.
+
+
+def load_module(name: str, path: str, needed: str):
+    """Loads one of the add-on's scripts as a module. Returns (module, None), or (None, why) if it is missing or
+    damaged (a zero-filled file loads as an empty module, so check for a function it must have)."""
+    try:
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as e:
+        return None, f"{os.path.basename(path)}: {e}"
+    if not hasattr(module, needed):
+        return None, f"{os.path.basename(path)} is damaged (no {needed})"
+    return module, None
+
 
 # Files the page needs, with their content types. Nothing else in web/ is served.
 ASSETS = {
@@ -72,10 +102,13 @@ class PolyDye:
             )
         logging.info(f"polydye: serving the PolyDye page from {self.web_dir} at /server/polydye/ui")
 
+        self.repo_dir = repo_dir
         self.uploader_path = os.path.join(repo_dir, "scripts", "polydye_upload.py")
-        spec = importlib.util.spec_from_file_location("polydye_upload", self.uploader_path)
-        self.uploader = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(self.uploader)
+        # A damaged script must not stop the page from loading: it is how the damage gets reported.
+        self.uploader, self.uploader_error = load_module("polydye_upload", self.uploader_path, "update_firmware")
+        self.files_checker, files_error = load_module(
+            "polydye_files", os.path.join(repo_dir, "scripts", "polydye_files.py"), "check")
+        self.files = {"error": files_error} if files_error else {}
         self.bundled_path = os.path.join(repo_dir, "firmware", "polydye.bin")
         # The service that carries the plug-in toggle hook (install.sh's KLIPPER_SERVICE).
         self.klipper_service = config.get("klipper_service", "klipper")
@@ -84,6 +117,28 @@ class PolyDye:
         self.server.register_endpoint("/server/polydye/firmware", RequestType.GET, self._handle_firmware_info)
         self.server.register_endpoint("/server/polydye/firmware/update", RequestType.POST,
                                       self._handle_firmware_update)
+
+    async def component_init(self) -> None:
+        await self._check_files()
+
+    async def _check_files(self) -> None:
+        """Compares the add-on's files with git's record and raises a Moonraker warning (shown by Mainsail) for
+        damaged ones."""
+        if self.files_checker is None:
+            self.server.add_warning(FILES_WARNING.format(files="couldn't check them: " + self.files["error"]),
+                                    warn_id="polydye_files")
+            return
+        try:
+            self.files = await self.server.get_event_loop().run_in_thread(self.files_checker.check, self.repo_dir)
+        except Exception as e:  # not a git checkout (a copied install), or git missing: nothing to compare
+            self.files = {"error": str(e)}
+            logging.info(f"polydye: couldn't check the add-on's files: {e}")
+            return
+        if self.files["corrupt"]:
+            self.server.add_warning(FILES_WARNING.format(files=", ".join(self.files["corrupt"])),
+                                    warn_id="polydye_files")
+        elif self.files["changed"]:
+            logging.info(f"polydye: add-on files that differ from git (local edits?): {self.files['changed']}")
 
     def _make_handler(self, filename: str):
         path = os.path.join(self.web_dir, filename)
@@ -97,6 +152,8 @@ class PolyDye:
     # ---- firmware updates ----------------------------------------------------------------------------------
 
     def _image_info(self, path: str):
+        if self.uploader is None:
+            raise ValueError(f"the add-on's uploader is unusable ({self.uploader_error})")
         with open(path, "rb") as f:
             return self.uploader.image_info(f.read())
 
@@ -115,7 +172,7 @@ class PolyDye:
                 logging.warning(f"polydye: bundled firmware unusable: {e}")
         return {"bundled": bundled, "updating": self.updating, "power_problem": self._power_problem(),
                 "board_on_usb": bool(glob.glob("/dev/serial/by-id/*PolyDye*-if00")),
-                "klipper_service": self.klipper_service}
+                "klipper_service": self.klipper_service, "files": self.files}
 
     def _resolve_upload(self, rel: str) -> str:
         config_dir = self.server.lookup_component("file_manager").get_directory("config")
@@ -133,6 +190,9 @@ class PolyDye:
         rel = web_request.get_str("file", None)
         if self.updating:
             raise self.server.error("a firmware update is already running", 409)
+        if self.uploader is None:
+            raise self.server.error(f"the add-on's uploader is unusable ({self.uploader_error}): recover the "
+                                    "add-on's files first", 500)
         why = self._power_problem()
         if why:
             # A Pi 3 short of power loses USB data and can lock up during the transfer or the board's restart.
@@ -179,9 +239,47 @@ class PolyDye:
         finally:
             self.updating = False
 
-    async def _run_update_steps(self, port: str, path: str, force: bool) -> None:
-        ok, rebooted, last = False, False, ""
+    async def _sync(self) -> None:
+        """Writes everything pending to the SD card, before and after the step that has frozen a Raspberry Pi 3."""
+        await self.server.get_event_loop().run_in_thread(os.sync)
+
+    def _klipper_running(self) -> bool:
+        """Whether the Klipper service is running (or starting), so it is started again after the update."""
         try:
+            services = self.server.lookup_component("machine").get_system_info().get("service_state", {})
+            state = services.get(self.klipper_service, {}).get("active_state")
+        except Exception:
+            state = None
+        if state is None:  # Moonraker doesn't track the service: go by its connection to Klipper
+            return self.server.lookup_component("klippy_connection").is_connected()
+        return state not in ("inactive", "failed", "deactivating")
+
+    async def _wait_port_free(self, port: str) -> None:
+        """Waits until no program has `port` open (systemd's stop returns before Klipper has exited)."""
+        deadline = time.monotonic() + PORT_FREE_TIMEOUT
+        while True:
+            holders = await self.server.get_event_loop().run_in_thread(self.uploader.port_holders, port)
+            if not holders:
+                return
+            if time.monotonic() > deadline:
+                names = ", ".join(f"{name} (pid {pid})" for pid, name in holders)
+                raise Exception(f"{names} still has the board's Klipper port open; stop it, then try again")
+            await asyncio.sleep(0.25)
+
+    async def _run_update_steps(self, port: str, path: str, force: bool) -> None:
+        ok, last = False, ""
+        machine = self.server.lookup_component("machine")
+        start_klipper = False
+        try:
+            self._notify("running", "writing pending files to the SD card", 0)
+            await self._sync()
+            if self._klipper_running():
+                self._notify("running", f"stopping {self.klipper_service}: the board leaves USB while it restarts", 0)
+                await machine.do_service_action("stop", self.klipper_service)
+                start_klipper = True
+            klipper_port = self.uploader.klipper_port(port)
+            if klipper_port:
+                await self._wait_port_free(klipper_port)
             self._notify("running", "starting the update", 0)
             args = [sys.executable, self.uploader_path, "--port", port, "firmware", path]
             if force:
@@ -197,19 +295,25 @@ class PolyDye:
                 if m:
                     self._notify("running", "writing the firmware", int(m.group(1)))
                 elif last:
-                    rebooted = rebooted or "rebooting the board" in last
                     logging.info(f"polydye firmware: {last}")
                     self._notify("running", last)
             ok = await proc.wait() == 0
         except Exception as e:
             last = f"error: {e}"
             logging.exception("polydye: firmware update failed")
-        if rebooted:
-            # Klipper lost the board while it rebooted: reconnect.
+        try:
+            await self._sync()
+        except Exception:
+            logging.exception("polydye: sync after the firmware update failed")
+        if start_klipper:
+            # Also after a failed update: the board is back (or gone), and Klipper's start hook picks that up.
             try:
-                await self.server.lookup_component("klippy_apis").do_restart("FIRMWARE_RESTART")
+                self._notify("running", f"starting {self.klipper_service}")
+                await machine.do_service_action("start", self.klipper_service)
             except Exception as e:
-                logging.warning(f"polydye: FIRMWARE_RESTART after the update failed: {e}")
+                logging.exception(f"polydye: couldn't start {self.klipper_service} after the firmware update")
+                if ok:
+                    ok, last = False, f"the board was updated, but {self.klipper_service} didn't start: {e}"
         if ok:
             self._notify("done", last or "firmware updated", 100)
         else:

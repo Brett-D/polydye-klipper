@@ -8,6 +8,7 @@ import os
 import sys
 import types
 import unittest
+from unittest import mock
 
 # polydye.py imports klippy's "mcu" module at load time; the pure functions under test don't use it.
 sys.modules.setdefault("mcu", types.ModuleType("mcu"))
@@ -622,7 +623,9 @@ class BuildConfig(unittest.TestCase):
             lookup_command=lambda *a, **kw: object(), lookup_query_command=lambda *a, **kw: object(),
             try_lookup_command=lambda *a, **kw: object(), get_constants=lambda: dict(constants))
         try:
-            pd._build_config()
+            with mock.patch.object(polydye.logging, "warning") as warn:
+                pd._build_config()
+            pd.test_warnings = [c[0][0] for c in warn.call_args_list]
         except ConfigError as e:
             return pd, str(e)
         return pd, [cmd for cmd in sent if cmd.startswith(("polydye_set_pulse", "polydye_set_clock"))]
@@ -632,6 +635,16 @@ class BuildConfig(unittest.TestCase):
         self.assertEqual(pd.clock_count, 3)
         self.assertEqual(sent, ["polydye_set_clock oid=0 stock=0", "polydye_set_pulse oid=0 words=4",
                                 "polydye_set_clock oid=0 stock=2"])
+
+    def test_board_firmware_that_leaves_usb_on_reset_is_flagged(self):
+        pd, _ = self.build({'POLYDYE_SOFT_RESET': 1}, None, None)
+        self.assertTrue(pd.board_soft_reset)
+        self.assertEqual(pd.test_warnings, [])
+        pd, _ = self.build({}, None, None)
+        self.assertFalse(pd.board_soft_reset)
+        self.assertIn("leaves USB and comes back whenever Klipper resets it", pd.test_warnings[0])
+        pd.last_status, pd.last_pass, pd.pass_axis, pd.offset_x, pd.offset_y, pd.direction_trim = {}, None, 'y', 0, 0, 0
+        self.assertIs(pd.get_status(0.)['board_soft_reset'], False)  # the page shows its warning
 
     def test_half_clock_needs_newer_board_firmware(self):
         pd, error = self.build({}, 'half', 4)

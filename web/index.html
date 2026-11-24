@@ -18,6 +18,7 @@
   </header>
 
   <main>
+    <section id="files-banner" class="banner bad hidden"></section>
     <section id="banner" class="banner hidden">
       <span id="banner-text"></span>
       <button id="fw-restart-btn" class="hidden">Firmware restart</button>
@@ -158,10 +159,15 @@
         <div><span class="k">On the board</span><span class="v" id="fw-board">&ndash;</span></div>
         <div><span class="k">Bundled with this add-on</span><span class="v" id="fw-bundled">&ndash;</span></div>
       </div>
-      <p class="hint">Updates go over the board's USB cable. Klipper loses the board for about half a minute while it
-        restarts, then reconnects by itself. If the new firmware doesn't start properly, the board goes back to the
-        previous one on its own. Not possible during a print.</p>
+      <p class="hint">Updates go over the board's USB cable. Everything pending is written to the SD card first, and
+        the Klipper service is stopped for about half a minute while the board restarts into the new firmware, then
+        started again. If the new firmware doesn't start properly, the board goes back to the previous one on its
+        own. Not possible during a print.</p>
       <p id="fw-power" class="banner hidden"></p>
+      <p id="fw-hard-reset" class="banner hidden">This board firmware leaves USB and comes back whenever Klipper
+        resets it (Firmware restart, and Klipper's own restart after a configuration change). That has frozen
+        Raspberry Pi 3s. Update it once; the safest way is with the FT232 and the board's USB unplugged from the Pi
+        (README, &ldquo;Raspberry Pi 3: freezes and damaged files&rdquo;). Newer firmware resets in place.</p>
       <div class="buttons">
         <button id="fw-update-btn" class="primary fw-btn">Update to bundled firmware</button>
         <button id="fw-file-btn" class="fw-btn">Update from file&hellip;</button>

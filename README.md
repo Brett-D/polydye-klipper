@@ -49,6 +49,9 @@ that too. Afterwards `printer.cfg` and `moonraker.conf` are byte-for-byte what t
 - It also restores the add-on's link in `~/klipper/klippy/extras` if it has gone missing or broken. A lost link
   makes Klipper halt with "Section 'polydye' is not a valid config section"; restarting the Klipper service fixes
   it.
+- It first writes everything pending to the SD card (`sync`), then checks the add-on's own files against git
+  (`scripts/polydye_files.py`). If the files Klipper loads are damaged, it leaves PolyDye off so Klipper starts and
+  prints without it; see [Raspberry Pi 3: freezes and damaged files](#raspberry-pi-3-freezes-and-damaged-files).
 
 **To switch,** plug or unplug the board's J7 USB, then restart the **Klipper service**: Mainsail's power menu →
 Services → klipper, or `sudo systemctl restart klipper`. `RESTART` and `FIRMWARE_RESTART` don't re-run the script.
@@ -125,9 +128,12 @@ python3 ~/polydye-klipper/scripts/polydye_upload.py firmware ~/polydye-klipper/f
 `firmware/polydye.bin` is the firmware this version of the add-on was tested with, built from
 [polydye-firmware](https://github.com/Brett-D/polydye-firmware); add-on updates in Mainsail bring new builds.
 - The image goes into the board's spare firmware slot while the board keeps running, is checked, and the board
-  restarts into it. Klipper loses the board for about half a minute and reconnects (the page runs
-  `FIRMWARE_RESTART`). An update takes about 25 s: the transfer is paced, because a Raspberry Pi 3 lost USB data
-  and locked up at full speed.
+  restarts into it. Restarting, it leaves USB and comes back, which has frozen Raspberry Pi 3s. So the page first
+  writes everything pending to the SD card and stops the Klipper service, waits until nothing has the board's
+  Klipper port open, updates, syncs again and starts Klipper once the board is back (about half a minute in all).
+  The transfer is paced (about 25 s), because a Raspberry Pi 3 lost USB data and locked up at full speed.
+- From the command line, stop Klipper first (`sudo systemctl stop klipper`) and start it again afterwards: the
+  updater refuses while a program has the board's Klipper port open.
 - The new firmware must be confirmed by the Pi within two minutes. If it doesn't come up working, the board goes
   back to the previous firmware by itself.
 - The page refuses updates during a print, while PolyDye is on, and while the Pi reports under-voltage. The board
@@ -136,6 +142,46 @@ python3 ~/polydye-klipper/scripts/polydye_upload.py firmware ~/polydye-klipper/f
   phone chargers often sag.
 - The first firmware with USB updates has to be flashed once with the FT232, bootloader included (see
   polydye-firmware's README); after that, updates go over USB.
+
+## Raspberry Pi 3: freezes and damaged files
+
+On a Raspberry Pi 3, the board leaving USB and coming back has frozen the whole Pi (no network, no ping) until it was
+power-cycled. It happened when Klipper reset the board right after an add-on update, which Klipper does by itself
+when the board's configuration no longer matches. Files the update had just written were still only in memory, and
+came back empty or full of zeros: Klipper then stopped with "Section 'polydye' is not a valid config section", the
+PolyDye page said the bundled firmware was "not an ESP32 firmware image", and yet git and the Update Manager called
+the add-on unchanged, because git only compares sizes and times.
+
+It is a known problem of the Pi's `dwc_otg` USB driver with USB serial (ACM) devices on recent kernels
+([raspberrypi/linux#6172](https://github.com/raspberrypi/linux/issues/6172)), not a power problem. What PolyDye does
+about it:
+
+- Klipper's reset (`FIRMWARE_RESTART`, and Klipper's automatic restart after a configuration change) resets the board
+  in place, without leaving USB, with board firmware that has `POLYDYE_SOFT_RESET`. With older firmware the PolyDye
+  page's Board firmware card says so: update it once, preferably as described below.
+- Only a firmware update still makes the board leave USB. The page writes everything pending to the SD card and
+  stops Klipper first, and the board waits for the Pi to close its ports and leaves USB cleanly before it restarts.
+- Klipper's start hook and the Klipper module write everything pending to the SD card before Klipper connects to
+  the board, so a freeze can no longer cost files from an update.
+- At every start, the add-on compares its files with git. Damaged ones are listed by a Moonraker warning (Mainsail's
+  notifications) and on the PolyDye page; if the files Klipper loads are damaged, Klipper starts without PolyDye.
+
+**Recovering damaged files:** in Mainsail, Machine → Update Manager → polydye → Recover → **Hard Recovery** (it
+clones the add-on again). If Mainsail doesn't offer Recover because it thinks the add-on is fine, ask Moonraker
+directly: `curl -X POST "http://localhost:7125/machine/update/recover?name=polydye&hard=true"` on the Pi. Or clone
+it again by hand: `cd ~ && rm -rf polydye-klipper && git clone https://github.com/Brett-D/polydye-klipper.git &&
+~/polydye-klipper/install.sh`. Your `polydye.cfg` is in the config folder and isn't touched.
+
+**Updating board firmware that still leaves USB on Klipper's reset:** the safest way is with the FT232 from a PC,
+with the board's J7 USB unplugged from the Pi (polydye-firmware README, "Flash and monitor"), then plug J7 back in and
+restart the Klipper service. From the Pi, stop Klipper first and sync: `sync && sudo systemctl stop klipper`, then
+the command-line update above, then `sync && sudo systemctl start klipper`. The board's restart can still freeze the
+Pi that one time, but no files are lost.
+
+**Optional, not changed by PolyDye:** the reported cure is the Pi's other USB driver, `dwc2`: add
+`dtoverlay=dwc2,dr_mode=host` to `/boot/firmware/config.txt` (`/boot/config.txt` on older systems) and reboot. It
+uses more CPU and can be slower for some USB devices; on a Pi 3 B the wired Ethernet hangs off USB too. Remove the
+line to go back. Another commonly tried setting is `dwc_otg.fiq_fsm_enable=0` in `cmdline.txt`.
 
 ## Configuration
 
@@ -150,8 +196,10 @@ restart_method: command
 [include polydye.cfg]
 ```
 
-`restart_method: command` makes `FIRMWARE_RESTART` reboot the board with Klipper's reset command. Klipper picks
-that by itself once it has talked to the board. Without the option, a `FIRMWARE_RESTART` while the board is missing
+`restart_method: command` makes `FIRMWARE_RESTART` reset the board with Klipper's reset command. Klipper picks
+that by itself once it has talked to the board. Board firmware with `POLYDYE_SOFT_RESET` in its data dictionary
+resets in place and stays on USB; older firmware restarts the chip, so the board leaves USB and comes back (the
+PolyDye page warns about that, see below). Without the option, a `FIRMWARE_RESTART` while the board is missing
 would try an Arduino-style reset on its absent port. That fails, and Moonraker is left talking to a Klipper that
 no longer answers until the Klipper service restarts.
 

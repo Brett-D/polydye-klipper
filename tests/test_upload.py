@@ -4,10 +4,13 @@
 This file is part of polydye-klipper (GPLv3).
 """
 import os
+import shutil
 import struct
 import sys
+import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 import polydye_upload  # noqa: E402
@@ -44,6 +47,42 @@ class UpdateFirmware(unittest.TestCase):
         for rate in (0, -1., float("nan"), float("inf")):
             with self.assertRaisesRegex(ValueError, "transfer rate"):
                 polydye_upload.update_firmware("/nonexistent/port", fake_image(), rate=rate, log=None)
+
+    def test_refused_while_klipper_has_the_board_open(self):
+        # The board leaves USB and comes back when it restarts into the new firmware: not with Klipper's port open.
+        port = "/dev/serial/by-id/usb-PolyDye_PolyDye_ink_controller_E4B063-if02"
+        with mock.patch.object(polydye_upload, "port_holders", return_value=[(812, "klippy")]) as holders:
+            with self.assertRaisesRegex(polydye_upload.BoardError, r"klippy \(pid 812\).*stop Klipper first"):
+                polydye_upload.update_firmware(port, fake_image(), log=None)
+        holders.assert_called_once_with(port[:-2] + "00")
+
+
+class KlipperPort(unittest.TestCase):
+    def test_from_the_data_port(self):
+        self.assertEqual(polydye_upload.klipper_port("/dev/serial/by-id/usb-PolyDye_x-if02"),
+                         "/dev/serial/by-id/usb-PolyDye_x-if00")
+        self.assertIsNone(polydye_upload.klipper_port("/nonexistent/ttyACM9"))
+
+    def test_holders_from_proc(self):
+        # A fake /proc: pid 812 (klippy) has the port open, pid 900 something else, pid 950 can't be read.
+        proc = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, proc)
+        port = os.path.join(proc, "ttyACM0")
+        open(port, "w").close()
+        for pid, name, target in (("812", "klippy", port), ("900", "bash", "/dev/null"), ("950", None, None)):
+            os.makedirs(os.path.join(proc, pid, "fd") if name else os.path.join(proc, pid))
+            if name:
+                with open(os.path.join(proc, pid, "comm"), "w") as f:
+                    f.write(name + "\n")
+                os.symlink(target, os.path.join(proc, pid, "fd", "3"))
+        self.assertEqual(polydye_upload.port_holders(port, proc=proc), [(812, "klippy")])
+        self.assertEqual(polydye_upload.port_holders(os.path.join(proc, "gone"), proc=proc), [])
+        self.assertEqual(polydye_upload.port_holders(None, proc=proc), [])
+
+    @unittest.skipUnless(os.path.isdir("/proc/self/fd"), "needs Linux /proc")
+    def test_finds_this_process(self):
+        with tempfile.NamedTemporaryFile() as f:
+            self.assertIn(os.getpid(), [pid for pid, _ in polydye_upload.port_holders(f.name)])
 
 
 def frame(ftype, seq, body):

@@ -74,6 +74,40 @@ check '[ "$(readlink "$EXTRA")" = "$REPO/klipper/polydye.py" ]' \
 check '! grep -q restored "$T/toggle3.log" && [ "$(grep -c polydye "$T/klipper/.git/info/exclude")" = 1 ]' \
     "a good link is left alone"
 
+# The toggle checks the add-on's own files: a copy of the add-on as a git checkout (with any uncommitted work), its
+# files older than git's index as after a real checkout, and a board "plugged in".
+A="$T/addon"
+mkdir -p "$A"
+(cd "$REPO" && git ls-files -z --cached --others --exclude-standard | xargs -0 cp --parents -t "$A")
+find "$A" -type f -exec touch -d 2000-01-01 {} +
+git -C "$A" init -q
+git -C "$A" add -A
+git -C "$A" -c user.name=test -c user.email=test@example.com commit -q -m add-on
+mkdir -p "$T/by-id"
+touch "$T/by-id/usb-PolyDye_PolyDye_ink_controller_E4B063-if00"
+export POLYDYE_BY_ID_DIR="$T/by-id"
+# What an unsafe shutdown leaves: the size and time git recorded, but zeros instead of the content.
+zero_fill() {
+    local f="$A/$1" size
+    size=$(stat -c %s "$f")
+    touch -r "$f" "$T/ref"
+    head -c "$size" /dev/zero > "$f"
+    touch -r "$T/ref" "$f"
+}
+"$A/scripts/polydye-toggle.sh" "$T/config" "$T/klipper" > "$T/toggle4.log" 2>&1
+check 'grep -qx "\[mcu polydye\]" "$T/config/polydye-active.cfg" && ! grep -q DAMAGED "$T/toggle4.log"' \
+    "board plugged in, files intact: PolyDye on"
+zero_fill web/polydye.css
+check '[ -z "$(git -C "$A" status --porcelain)" ]' "git status misses a zero-filled file"
+"$A/scripts/polydye-toggle.sh" "$T/config" "$T/klipper" > "$T/toggle5.log" 2>&1
+check 'grep -q "ADD-ON FILES DAMAGED: web/polydye.css" "$T/toggle5.log" && [ -f "$T/config/polydye-active.cfg" ]' \
+    "a damaged page file is reported; PolyDye stays on"
+zero_fill klipper/polydye.py
+"$A/scripts/polydye-toggle.sh" "$T/config" "$T/klipper" > "$T/toggle6.log" 2>&1
+check '[ ! -e "$T/config/polydye-active.cfg" ] && grep -q "Klipper files are damaged: PolyDye left off" "$T/toggle6.log"' \
+    "a damaged Klipper module: PolyDye left off, so Klipper starts and prints"
+unset POLYDYE_BY_ID_DIR
+
 bash "$REPO/uninstall.sh" > /dev/null
 check 'cmp -s "$T/printer.orig" "$T/config/printer.cfg"' "printer.cfg restored byte for byte"
 check 'cmp -s "$T/moonraker.orig" "$T/config/moonraker.conf"' "moonraker.conf restored byte for byte"

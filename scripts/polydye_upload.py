@@ -16,7 +16,10 @@ The board appears as two serial ports; the data port is the second one
 
 `firmware` updates the board over USB: it writes the image to the board's spare firmware slot, reboots the board
 into it, waits for it to come back and confirms it. If the new firmware doesn't come back working, the board returns
-to the previous one by itself. Klipper loses the board while it reboots; run FIRMWARE_RESTART afterwards.
+to the previous one by itself. The board leaves USB and comes back when it reboots, so stop Klipper first
+(`sudo systemctl stop klipper`) and start it again afterwards: on Linux this refuses to start while a program has the
+board's Klipper port open, because a Raspberry Pi 3 has frozen when the board came back with ports open. The PolyDye
+page in Mainsail does both for you.
 
 Job files (.pdj, version 0): b"PDJ0", u32 pass count, then per pass a u32 length and a PUT payload
 (layer u16, pass u16, cart u8, flags u8, columns u16, columns * 42 bytes of nozzle data). Integers are
@@ -191,11 +194,70 @@ def port_present(port):
     return any(p.device == port for p in list_ports.comports())
 
 
+def klipper_port(data_port):
+    """The board's Klipper port (its -if00 serial port) for its data port (-if02), or None if that can't be told
+    (only /dev/serial/by-id names, or a tty one of them points at, can be matched)."""
+    if data_port.endswith("-if02"):
+        return data_port[:-len("02")] + "00"
+    try:
+        target = os.path.realpath(data_port)
+        for p in glob.glob("/dev/serial/by-id/*PolyDye*-if02"):
+            if os.path.realpath(p) == target:
+                return p[:-len("02")] + "00"
+    except OSError:
+        pass
+    return None
+
+
+def port_holders(port, proc="/proc"):
+    """[(pid, program name)] of the processes that have `port` open, as far as /proc shows (Linux; processes of
+    other users aren't visible). Empty if `port` doesn't exist or there's no /proc."""
+    if not port or not os.path.exists(port):
+        return []
+    target = os.path.realpath(port)
+    holders = []
+    try:
+        pids = [p for p in os.listdir(proc) if p.isdigit()]
+    except OSError:
+        return []
+    for pid in pids:
+        fd_dir = os.path.join(proc, pid, "fd")
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(os.path.join(fd_dir, fd)) != target:
+                    continue
+            except OSError:
+                continue
+            try:
+                with open(os.path.join(proc, pid, "comm")) as f:
+                    name = f.read().strip()
+            except OSError:
+                name = "?"
+            holders.append((int(pid), name))
+            break
+    return holders
+
+
+def sync_disks():
+    """Writes everything pending to disk (POSIX), before a step that has frozen a Raspberry Pi 3."""
+    if hasattr(os, "sync"):
+        os.sync()
+
+
 def update_firmware(port, blob, force=False, log=print, confirm=True, rate=FW_RATE):
     """Writes `blob` to the board, reboots into it and confirms it. Returns the new version."""
     if not (isinstance(rate, (int, float)) and math.isfinite(rate) and rate > 0):
         raise ValueError("the transfer rate must be a positive number of bytes per second")
     info = image_info(blob)
+    holders = port_holders(klipper_port(port))
+    if holders:
+        raise BoardError("%s has the board's Klipper port open: stop Klipper first (sudo systemctl stop klipper). "
+                         "The board leaves USB and comes back when it restarts into the new firmware"
+                         % ", ".join("%s (pid %d)" % (name, pid) for pid, name in holders))
     board = DataPort(port)
     try:
         hello = board.hello()
@@ -234,6 +296,7 @@ def update_firmware(port, blob, force=False, log=print, confirm=True, rate=FW_RA
                 pass
             raise
         say(log, "written to %s and checked; rebooting the board" % target["partition"])
+        sync_disks()
         try:
             board.request(T_REBOOT)
         except (BoardError, OSError) as e:  # pyserial's SerialException is an OSError

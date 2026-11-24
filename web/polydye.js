@@ -5,7 +5,7 @@
 const $ = (id) => document.getElementById(id);
 const state = {
   online: false, klippy: 'disconnected', message: '', board: false, printer: {},
-  fw: { bundled: null, updating: false, power: null, boardOnUsb: false },
+  fw: { bundled: null, updating: false, power: null, boardOnUsb: false, files: {} },
 };
 let ws = null;
 let nextId = 1;
@@ -172,6 +172,12 @@ function text(id, value, cls) {
 }
 
 function render() {
+  const corrupt = state.fw.files.corrupt || [];
+  $('files-banner').classList.toggle('hidden', !corrupt.length);
+  $('files-banner').textContent = corrupt.length ? `This add-on's files are damaged: ${corrupt.join(', ')}, `
+    + 'probably by an unsafe shutdown (the Pi froze or lost power) right after an update. Recover them in Mainsail: '
+    + 'Machine, Update Manager, polydye, Recover, Hard Recovery. See the README, "Raspberry Pi 3: freezes and '
+    + 'damaged files".' : '';
   const banner = $('banner');
   const bannerText = $('banner-text');
   const p = state.printer;
@@ -242,6 +248,8 @@ function renderFirmware(printing) {
   $('fw-power').textContent = power ? `Updates are off: ${power}. A Raspberry Pi 3 short of power loses USB data `
     + 'and can lock up during an update. Use a 5.1 V, 2.5 A supply (the official one is best), then restart the Pi.' : '';
   if (power) document.querySelectorAll('.fw-btn').forEach((b) => { b.disabled = true; });
+  // false only once Klipper has connected to board firmware that restarts the chip on Klipper's reset.
+  $('fw-hard-reset').classList.toggle('hidden', (state.printer.polydye || {}).board_soft_reset !== false);
 }
 
 async function loadFirmwareInfo() {
@@ -252,6 +260,7 @@ async function loadFirmwareInfo() {
     state.fw.power = info.power_problem;
     state.fw.boardOnUsb = info.board_on_usb;
     state.fw.klipperService = info.klipper_service || 'klipper';
+    state.fw.files = info.files || {};
   } catch (e) {
     log(`! firmware info: ${e.message}`);
   }
@@ -270,8 +279,8 @@ function firmwareProgress(p) {
 }
 
 async function startFirmwareUpdate(params, label) {
-  const ok = window.confirm(`${label}?\n\nThe printer must be idle. Klipper loses the PolyDye board for about half `
-    + 'a minute while it restarts, then reconnects.');
+  const ok = window.confirm(`${label}?\n\nThe printer must be idle. The ${state.fw.klipperService} service is `
+    + 'stopped for about half a minute while the board restarts into the new firmware, then started again.');
   if (!ok) return;
   try {
     const r = await rpc('server.polydye.firmware.update', params);
