@@ -58,6 +58,8 @@ FILES_WARNING = ("PolyDye: add-on files damaged ({files}), probably by an unsafe
                  "polydye-klipper README, \"Raspberry Pi 3: freezes and damaged files\").")
 # Seconds to wait for Klipper to let go of the board's Klipper port after its service was told to stop.
 PORT_FREE_TIMEOUT = 30.
+# Seconds a cleanup waits for a board that restarted into new firmware the uploader didn't get to confirm.
+REBOOT_SETTLE_TIMEOUT = 40.
 
 
 def load_module(name: str, path: str, needed: str):
@@ -128,7 +130,7 @@ class PolyDye:
         task = self.update_task
         if task is not None and not task.done():
             task.cancel()
-            await asyncio.wait([task], timeout=30.)
+            await asyncio.wait([task], timeout=REBOOT_SETTLE_TIMEOUT + 20.)
 
     async def _check_files(self) -> None:
         """Compares the add-on's files with git's record and raises a Moonraker warning (shown by Mainsail) for
@@ -235,18 +237,19 @@ class PolyDye:
         except BaseException:
             self.updating = False
             raise
-        self.update_task = self.server.get_event_loop().create_task(self._run_update(ports[0], path, force))
+        self.update_task = self.server.get_event_loop().create_task(
+            self._run_update(ports[0], path, force, info["version"]))
         return {"started": True, "version": info["version"]}
 
     def _notify(self, state: str, message: str, progress=None) -> None:
         self.server.send_event("polydye:polydye_firmware",
                                {"state": state, "message": message, "progress": progress})
 
-    async def _run_update(self, port: str, path: str, force: bool) -> None:
+    async def _run_update(self, port: str, path: str, force: bool, version: str) -> None:
         # self.updating stays set until the final notification, so no second update can start while Klipper is
         # still reconnecting to the board.
         try:
-            await self._run_update_steps(port, path, force)
+            await self._run_update_steps(port, path, force, version)
         finally:
             self.updating = False
 
@@ -277,16 +280,36 @@ class PolyDye:
                 raise Exception(f"{names} still has the board's Klipper port open; stop it, then try again")
             await asyncio.sleep(0.25)
 
-    async def _run_update_steps(self, port: str, path: str, force: bool) -> None:
+    async def _settle_after_reboot(self, port: str, version: str, partition) -> bool:
+        """The board restarted into `version`, but the uploader was stopped before confirming it: it would go back
+        to its previous firmware within two minutes, leaving USB and coming back after Klipper has its port again.
+        Confirm it here, or see it go back. Returns whether the board has settled."""
+        try:
+            await self.server.get_event_loop().run_in_thread(
+                lambda: self.uploader.confirm_after_reboot(port, version, partition, log=None,
+                                                           timeout=REBOOT_SETTLE_TIMEOUT))
+            logging.info(f"polydye: confirmed firmware {version} after an interrupted update")
+        except self.uploader.RolledBack as e:
+            logging.warning(f"polydye: after an interrupted update: {e}")
+        except Exception as e:
+            logging.error(f"polydye: the board hasn't settled after an interrupted update ({e}): {self.klipper_service} "
+                          "left stopped; start it once the board is back")
+            return False
+        return True
+
+    async def _run_update_steps(self, port: str, path: str, force: bool, version: str) -> None:
         ok, last, proc, start_klipper = False, "", None, False
+        rebooting, partition = False, None
         machine = self.server.lookup_component("machine")
         try:
             self._notify("running", "writing pending files to the SD card", 0)
             await self._sync()
             if self._klipper_running():
                 self._notify("running", f"stopping {self.klipper_service}: the board leaves USB while it restarts", 0)
-                await machine.do_service_action("stop", self.klipper_service)
+                # Set first: if this is interrupted after systemd took the request, Klipper must still be started
+                # again (starting a running service changes nothing).
                 start_klipper = True
+                await machine.do_service_action("stop", self.klipper_service)
             klipper_port = self.uploader.klipper_port(port)
             if klipper_port:
                 await self._wait_port_free(klipper_port)
@@ -305,6 +328,9 @@ class PolyDye:
                 if m:
                     self._notify("running", "writing the firmware", int(m.group(1)))
                 elif last:
+                    m = re.match(r"written to (\S+) and checked; rebooting the board", last)
+                    if m:
+                        rebooting, partition = True, m.group(1)
                     logging.info(f"polydye firmware: {last}")
                     self._notify("running", last)
             ok = await proc.wait() == 0
@@ -320,6 +346,10 @@ class PolyDye:
                 except ProcessLookupError:
                     pass
                 await proc.wait()
+            # Ended by a signal: stopped here, or by systemd, which stops Moonraker's whole service, the uploader too.
+            killed = proc is not None and proc.returncode is not None and proc.returncode < 0
+            if killed and rebooting and not await self._settle_after_reboot(port, version, partition):
+                start_klipper = False
             try:
                 await self._sync()
             except Exception:

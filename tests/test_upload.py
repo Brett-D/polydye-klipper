@@ -57,6 +57,48 @@ class UpdateFirmware(unittest.TestCase):
         holders.assert_called_once_with(port[:-2] + "00")
 
 
+class ConfirmAfterReboot(unittest.TestCase):
+    def confirm(self, hello, present=(True, False, True), timeout=180.):
+        """The board still there, gone, then back; it answers HELLO with `hello`. Returns (result, requests)."""
+        present, requests = iter(present), []
+
+        class Board:
+            def __init__(self, port, timeout=10.):
+                pass
+
+            def hello(self):
+                return hello
+
+            def request(self, ftype, *args, **kw):
+                requests.append(ftype)
+
+            def close(self):
+                pass
+        with mock.patch.object(polydye_upload, "port_present", lambda port: next(present, True)), \
+                mock.patch.object(polydye_upload, "DataPort", Board), \
+                mock.patch.object(polydye_upload.time, "sleep", lambda s: None):
+            try:
+                return polydye_upload.confirm_after_reboot("/dev/x-if02", "9ba5def", "ota_1", log=None,
+                                                           timeout=timeout), requests
+            except polydye_upload.BoardError as e:
+                return e, requests
+
+    def test_confirms_the_new_firmware(self):
+        self.assertEqual(self.confirm({"firmware": "9ba5def", "partition": "ota_1"}),
+                         ("9ba5def", [polydye_upload.T_FW_CONFIRM]))
+
+    def test_rolled_back(self):
+        err, requests = self.confirm({"firmware": "cd4926d", "partition": "ota_0"})
+        self.assertIsInstance(err, polydye_upload.RolledBack)
+        self.assertIn("went back to cd4926d (ota_0)", str(err))
+        self.assertEqual(requests, [])
+
+    def test_not_back(self):
+        err, _ = self.confirm({}, present=[False] * 1000000, timeout=0.05)
+        self.assertNotIsInstance(err, polydye_upload.RolledBack)
+        self.assertIn("didn't come back", str(err))
+
+
 class KlipperPort(unittest.TestCase):
     def test_from_the_data_port(self):
         self.assertEqual(polydye_upload.klipper_port("/dev/serial/by-id/usb-PolyDye_x-if02"),

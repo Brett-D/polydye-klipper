@@ -306,10 +306,21 @@ def update_firmware(port, blob, force=False, log=print, confirm=True, rate=FW_RA
     finally:
         board.close()
 
-    # The board comes back as the same USB device. If the new firmware doesn't work, it returns to the old one
-    # within about two minutes.
-    deadline = time.time() + 180.
-    while port_present(port) and time.time() < deadline - 170.:
+    return confirm_after_reboot(port, done["version"], target["partition"], log=log, confirm=confirm)
+
+
+class RolledBack(BoardError):
+    """The board came back running its previous firmware."""
+
+
+def confirm_after_reboot(port, version, partition, log=print, confirm=True, timeout=180.):
+    """After REBOOT: waits for the board to leave USB and come back as the same device, checks that it runs `version`
+    (from `partition`, if given) and confirms it. Returns the version. Raises RolledBack if the board went back to its
+    previous firmware, BoardError if it didn't come back within `timeout` seconds."""
+    # If the new firmware doesn't work, the board returns to the old one within about two minutes.
+    deadline = time.time() + timeout
+    gone_by = time.time() + min(10., timeout)
+    while port_present(port) and time.time() < gone_by:
         time.sleep(0.2)
     hello = None
     while time.time() < deadline:
@@ -322,24 +333,23 @@ def update_firmware(port, blob, force=False, log=print, confirm=True, rate=FW_RA
             continue
         try:
             hello = board.hello()
-            if hello["firmware"] != done["version"] or hello.get("partition") != target["partition"]:
+            if hello["firmware"] != version or (partition and hello.get("partition") != partition):
                 break
             if not confirm:
                 say(log, "the board runs %s, NOT confirmed: it goes back to the previous firmware within %d s"
-                    % (done["version"], 120))
-                return done["version"]
+                    % (version, 120))
+                return version
             board.request(T_FW_CONFIRM, retries=2, log=log)
-            say(log, "the board runs %s; confirmed" % done["version"])
-            return done["version"]
+            say(log, "the board runs %s; confirmed" % version)
+            return version
         except Exception:
             continue
         finally:
             board.close()
     if hello is None:
         raise BoardError("the board didn't come back after the update; check its USB cable and power")
-    raise BoardError("the new firmware didn't start properly; the board went back to %s (%s)"
+    raise RolledBack("the new firmware didn't start properly; the board went back to %s (%s)"
                      % (hello["firmware"], hello.get("partition")))
-
 
 def default_port():
     ports = sorted(glob.glob("/dev/serial/by-id/*PolyDye*-if02"))

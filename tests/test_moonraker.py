@@ -52,6 +52,8 @@ class FakeMachine:
         self.events.append((action, service))
         if action == self.fail:
             raise RuntimeError("Service Actions Not Available")
+        if action == "stop" and self.fail == "hang":
+            await asyncio.Event().wait()  # systemd still working on it
 
 
 class FakeServer:
@@ -73,8 +75,17 @@ class FakeServer:
 
 
 class FakeUploader:
-    def __init__(self, events, holders):
-        self.events, self.holders = events, list(holders)
+    class RolledBack(Exception):
+        pass
+
+    def __init__(self, events, holders, settle=None):
+        self.events, self.holders, self.settle = events, list(holders), settle
+
+    def confirm_after_reboot(self, port, version, partition, log=None, timeout=0.):
+        self.events.append(("confirm", version, partition))
+        if self.settle:
+            raise self.settle
+        return version
 
     def klipper_port(self, port):
         return port[:-2] + "00"
@@ -112,12 +123,12 @@ class FakeProc:
 
 class Update(unittest.TestCase):
     def run_update(self, state="active", fail=None, rc=0, lines=("progress: 50%", "the board runs 9ba5def; confirmed"),
-                   holders=([(812, "klippy")],), scenario=None):
+                   holders=([(812, "klippy")],), scenario=None, settle=None):
         events = []
         comp = object.__new__(pd.PolyDye)
         comp.server = FakeServer(events, state, fail)
         comp.klipper_service = "klipper"
-        comp.uploader = FakeUploader(events, holders)
+        comp.uploader = FakeUploader(events, holders, settle)
         comp.uploader_path = "/home/pi/polydye-klipper/scripts/polydye_upload.py"
         comp.update_task = None
 
@@ -126,7 +137,8 @@ class Update(unittest.TestCase):
             return FakeProc(events, lines, rc, hang=scenario is not None)
         with mock.patch.object(pd.os, "sync", side_effect=lambda: events.append("sync")), \
                 mock.patch.object(pd.asyncio, "create_subprocess_exec", fake_exec):
-            asyncio.run(scenario(comp, events) if scenario else comp._run_update_steps(DATA_PORT, "/fw.bin", False))
+            asyncio.run(scenario(comp, events) if scenario else comp._run_update_steps(DATA_PORT, "/fw.bin", False,
+                                                                                       "9ba5def"))
         return [e for e in events if e[0] != "notify"], [e for e in events if e[0] == "notify"]
 
     def test_sync_stop_klipper_wait_for_its_port_update_sync_start(self):
@@ -148,20 +160,52 @@ class Update(unittest.TestCase):
     def test_no_update_if_klipper_cant_be_stopped(self):
         with self.assertLogs(level="ERROR"):
             steps, notes = self.run_update(fail="stop")
-        self.assertEqual(steps, ["sync", ("stop", "klipper"), "sync"])
+        # Started again in case systemd took the request after all (a running service stays as it is).
+        self.assertEqual(steps, ["sync", ("stop", "klipper"), "sync", ("start", "klipper")])
         self.assertEqual(notes[-1][1], "error")
         self.assertIn("Service Actions Not Available", notes[-1][2])
 
-    def test_moonraker_shutting_down_mid_update_ends_the_uploader_then_starts_klipper(self):
-        async def shut_down_mid_update(comp, events):
+    @staticmethod
+    def shut_down_after(event):
+        """Moonraker shutting down (on_exit) once `event` has happened."""
+        async def scenario(comp, events):
             comp.update_task = asyncio.get_running_loop().create_task(
-                comp._run_update_steps(DATA_PORT, "/fw.bin", False))
-            while ("upload", "/fw.bin") not in events:
+                comp._run_update_steps(DATA_PORT, "/fw.bin", False, "9ba5def"))
+            while event not in events:
                 await asyncio.sleep(0)
             await comp.on_exit()
-            self.assertTrue(comp.update_task.cancelled())
-        steps, _ = self.run_update(scenario=shut_down_mid_update)
+            assert comp.update_task.cancelled()
+        return scenario
+
+    def test_moonraker_shutting_down_mid_update_ends_the_uploader_then_starts_klipper(self):
+        steps, _ = self.run_update(scenario=self.shut_down_after(("upload", "/fw.bin")))
         self.assertEqual(steps[-4:], [("upload", "/fw.bin"), "terminate", "sync", ("start", "klipper")])
+
+    def test_moonraker_shutting_down_while_klipper_stops_still_starts_it(self):
+        steps, _ = self.run_update(fail="hang", scenario=self.shut_down_after(("stop", "klipper")))
+        self.assertEqual(steps, ["sync", ("stop", "klipper"), "sync", ("start", "klipper")])
+
+    def test_after_an_interrupted_reboot_the_new_firmware_is_confirmed_before_klipper_starts(self):
+        rebooting = ("progress: 100%", "written to ota_1 and checked; rebooting the board")
+        after_reboot = self.shut_down_after(("notify", "running", rebooting[1]))
+        steps, _ = self.run_update(lines=rebooting, scenario=after_reboot)
+        self.assertEqual(steps[-4:], ["terminate", ("confirm", "9ba5def", "ota_1"), "sync", ("start", "klipper")])
+        # Gone back to the old firmware: settled too.
+        with self.assertLogs(level="WARNING"):
+            steps, _ = self.run_update(lines=rebooting, scenario=after_reboot,
+                                       settle=FakeUploader.RolledBack("went back to cd4926d"))
+        self.assertEqual(steps[-1], ("start", "klipper"))
+        # Not back: Klipper stays stopped rather than have the board rejoin USB under it.
+        with self.assertLogs(level="ERROR"):
+            steps, _ = self.run_update(lines=rebooting, scenario=after_reboot,
+                                       settle=RuntimeError("the board didn't come back"))
+        self.assertEqual(steps[-2:], [("confirm", "9ba5def", "ota_1"), "sync"])
+
+    def test_uploader_killed_by_systemd_after_the_reboot(self):
+        # systemd stops Moonraker's whole service: the uploader may end by a signal before on_exit runs.
+        steps, notes = self.run_update(rc=-15, lines=("written to ota_0 and checked; rebooting the board",))
+        self.assertEqual(steps[-3:], [("confirm", "9ba5def", "ota_0"), "sync", ("start", "klipper")])
+        self.assertEqual(notes[-1][1], "error")
 
     def test_no_update_while_something_keeps_the_klipper_port_open(self):
         with mock.patch.object(pd, "PORT_FREE_TIMEOUT", 0.), self.assertLogs(level="ERROR"):
