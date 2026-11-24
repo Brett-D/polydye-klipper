@@ -889,10 +889,11 @@ class TestCleanup(unittest.TestCase):
         self.assertEqual(polydye.measured_clock_text(3251000, 3333333, 'ours'),
                          "bus clock measured 3.251 MHz (ours clock 3.333 MHz, -2.5 %)")
 
-    def clock_test(self, bad=(), **params):
+    def clock_test(self, bad=(), boost_idle_s=None, **params):
         """POLYDYE_CLOCK_TEST on a board whose clock checks fail at the call numbers in `bad`; returns (board, replies,
         error or None)."""
         pd, board = self.make(fail_on="NOTHING")
+        pd.boost_idle_s = boost_idle_s
         board.pulse = 9  # too long for the stock clock: the test uses 6 words and puts 9 back
         calls = []
 
@@ -924,6 +925,11 @@ class TestCleanup(unittest.TestCase):
                                    "times (a live run would have fired nothing). OK"])
         self.assertEqual((board.pulse, board.clock, board.boost), (9, 'ours', False))
         self.assertEqual(board.violations, [])
+        # It fires nothing, so it never turns the boost on, also with board firmware that keeps it on after tests.
+        board, _, error = self.clock_test(boost_idle_s=1800, COUNT=1)
+        self.assertIsNone(error)
+        self.assertEqual([s for s in board.sent if isinstance(s, tuple) and s[0] == 'mode'], [])
+        self.assertEqual((board.boost, board.pulse, board.clock), (False, 9, 'ours'))
 
     def test_clock_test_names_each_wrong_switch(self):
         board, replies, error = self.clock_test(bad=(5,), COUNT=3)
@@ -956,6 +962,7 @@ class TestCleanup(unittest.TestCase):
     def test_fire_test_warms_the_head_before_each_stripe(self):
         pd, board = self.make(fail_on="NOTHING")
         pd.spit_run_cmd = object()
+        pd.warm_max_words, pd.warm_max_us, pd.warm_max_s, pd.warm_duty_ppm = 12, 2.9, 30., 5800
         pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b_late:6:stock,color_b_late:8:stock", X=130., Y=100.,
                                            SPACING=20., COLUMNS=600, UPLOAD=1, LAYER=0, PASS=0, PATTERN='stock',
                                            WARM=10., WARM_PULSE=8, WARM_PERIOD_US=508))
@@ -967,6 +974,17 @@ class TestCleanup(unittest.TestCase):
                          ["POLYDYE_UPLOAD_TEST_PASS", "POLYDYE_WARM", "POLYDYE_ENABLE", "POLYDYE_PASS",
                           "POLYDYE_WARM", "POLYDYE_ENABLE", "POLYDYE_PASS"])
         self.assertEqual(steps[1], warm)
+        # A warm-up pulse too long for one stripe's clock is refused before anything moves: 9 words is 2.7 us with
+        # our clock but 3.15 us with the stock one.
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_run_cmd = object()
+        pd.warm_max_words, pd.warm_max_us, pd.warm_max_s, pd.warm_duty_ppm = 12, 2.9, 30., 5800
+        with self.assertRaisesRegex(RuntimeError, "stripe color_b_late:6:stock: WARM_PULSE=9 is 3.15 us at the stock "
+                                                  "clock"):
+            pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b_late:6:ours,color_b_late:6:stock", X=80., Y=60.,
+                                               SPACING=20., COLUMNS=600, UPLOAD=1, LAYER=0, PASS=0, WARM=10.,
+                                               WARM_PULSE=9, WARM_PERIOD_US=508))
+        self.assertEqual(board.sent, [])
         # Older board firmware: refused before anything moves.
         pd, board = self.make(fail_on="NOTHING")
         with self.assertRaisesRegex(RuntimeError, "WARM needs newer PolyDye board firmware"):

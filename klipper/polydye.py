@@ -1343,6 +1343,15 @@ class PolyDye:
         for tpl, words, clock in stripes:
             if pulse_range_error(words, clock):
                 raise gcmd.error("POLYDYE_FIRE_TEST: stripe %s:%d: %s" % (tpl, words, pulse_range_error(words, clock)))
+        if warm:
+            # Each stripe's warm-up runs with its template and clock: check them all before anything moves or fires.
+            if warm > self.warm_max_s + 1e-9:
+                raise gcmd.error("POLYDYE_FIRE_TEST: a warm-up lasts at most %g s with this board firmware%s"
+                                 % (self.warm_max_s, "; newer firmware takes up to %g s (Board firmware: Update to "
+                                    "bundled firmware)" % (WARM_MAX_S,) if self.warm_duty_ppm is None else ""))
+            for tpl, words, clock in stripes:
+                self._warm_plan(gcmd, "POLYDYE_FIRE_TEST: stripe %s:%d:%s" % (tpl, words, clock or 'ours'), warm,
+                                warm_words, warm_period, tpl, clock)
         positions = stripe_positions(self.pass_axis, x, y, spacing, len(stripes))
         # The stock pattern's random columns go up REPEAT times each, so the stripe has whole repeats.
         upload_columns = max(1, columns // random['repeat']) if random else columns
@@ -1448,7 +1457,8 @@ class PolyDye:
                     last = check("switch %d to %s" % (i + 1, clock), clock)
         finally:
             self.testing = False
-            self._restore_after_test(before)
+            # It fires nothing, so it leaves the boost as it found it.
+            self._restore_after_test(before, power=False)
         ranges = "; ".join("%s clock (%.3f MHz) measured %.3f-%.3f MHz" % (
             clock, CLOCK_HZ[clock] / 1e6, min(measured[clock]) / 1e6, max(measured[clock]) / 1e6)
             for clock in CLOCKS if measured[clock])
@@ -1735,14 +1745,16 @@ class PolyDye:
                              % (cmd, period, WARM_MAX_COLUMNS * period / 1e6, WARM_MAX_COLUMNS))
         return words, period, columns
 
-    def _restore_after_test(self, before):
-        """Always turn PolyDye off and put the template, pulse and clock back, even after an error (which is re-raised by
-        the caller); problems here are logged so they don't hide that error."""
+    def _restore_after_test(self, before, power=True):
+        """Always turn live ink off (and the boost, unless the board keeps it on between tests) and put the template,
+        pulse and clock back, even after an error (which is re-raised by the caller); problems here are logged so they
+        don't hide that error. With power False (a test that never fires) the boost and live ink are left as they are:
+        only the settings go back."""
         if self.printer.is_shutdown():
             return
         try:
             self.printer.lookup_object('toolhead').wait_moves()
-            st = self._live_off()
+            st = self._live_off() if power else self._fresh_status()
             self._send_cartridge(st, before[0], before[1] if before[1] != st['pulse_words'] else None,
                                  before[2] if before[2] is not None and before[2] != st.get('bus_clock') else None)
             self._query_status()
