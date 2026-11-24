@@ -62,7 +62,11 @@ case "$files" in
         [ -z "$changed" ] || echo "polydye: add-on files that differ from git (local edits?): $changed"
         ;;
     *)
-        echo "polydye: couldn't check the add-on's files: $files" >&2
+        # No result line: the checker itself is missing or damaged, most likely by the same shutdown. A copied
+        # install (not a git checkout) gets "result: unknown" instead and carries on.
+        files_ok=""
+        echo "polydye: ADD-ON FILES DAMAGED: couldn't check them ($files)." \
+            "Recover them: Update Manager, polydye, Recover, Hard recovery; see the add-on's README." >&2
         ;;
 esac
 

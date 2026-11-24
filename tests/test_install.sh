@@ -106,6 +106,15 @@ zero_fill klipper/polydye.py
 "$A/scripts/polydye-toggle.sh" "$T/config" "$T/klipper" > "$T/toggle6.log" 2>&1
 check '[ ! -e "$T/config/polydye-active.cfg" ] && grep -q "Klipper files are damaged: PolyDye left off" "$T/toggle6.log"' \
     "a damaged Klipper module: PolyDye left off, so Klipper starts and prints"
+# Rewrite every file from git, as a recovery would. git skips files whose size and time still match its index (so a
+# plain `git reset --hard` doesn't repair this damage): change the times first.
+(cd "$A" && git ls-files -z | xargs -0 touch && git checkout-index -f -a)
+"$A/scripts/polydye-toggle.sh" "$T/config" "$T/klipper" > "$T/toggle7.log" 2>&1
+check '[ -f "$T/config/polydye-active.cfg" ] && ! grep -q DAMAGED "$T/toggle7.log"' "recovered files: PolyDye on again"
+zero_fill scripts/polydye_files.py
+"$A/scripts/polydye-toggle.sh" "$T/config" "$T/klipper" > "$T/toggle8.log" 2>&1
+check '[ ! -e "$T/config/polydye-active.cfg" ] && grep -q "DAMAGED: couldn.t check them" "$T/toggle8.log"' \
+    "a damaged file checker: PolyDye left off too"
 unset POLYDYE_BY_ID_DIR
 
 bash "$REPO/uninstall.sh" > /dev/null

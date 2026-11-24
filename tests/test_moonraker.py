@@ -150,8 +150,7 @@ class Files(unittest.TestCase):
         comp = object.__new__(pd.PolyDye)
         comp.server = FakeServer([])
         comp.repo_dir = "/home/pi/polydye-klipper"
-        comp.files_checker = checker
-        comp.files = {"error": error} if error else {}
+        comp.files_checker, comp.files_error, comp.files = checker, error, {}
         return comp
 
     def test_damaged_files_raise_a_moonraker_warning(self):
@@ -179,7 +178,9 @@ class Files(unittest.TestCase):
         self.assertIsNone(module)
         comp = self.component(None, error)
         asyncio.run(comp.component_init())
-        self.assertIn("couldn't check them: polydye_files.py", comp.server.warnings["polydye_files"])
+        self.assertIn("scripts/polydye_files.py, so the others couldn't be checked: polydye_files.py",
+                      comp.server.warnings["polydye_files"])
+        self.assertEqual(comp.files["corrupt"], ["scripts/polydye_files.py"])  # the page shows its recovery banner
 
 
 if __name__ == "__main__":

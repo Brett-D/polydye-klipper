@@ -52,6 +52,7 @@ def power_problem(path: str = THROTTLED_PATH, bits: int = 0):
         return "the Pi has been under-volted since it started"
     return None
 
+CHECKER = "scripts/polydye_files.py"
 FILES_WARNING = ("PolyDye: add-on files damaged ({files}), probably by an unsafe shutdown (the Pi froze or lost power) "
                  "right after an update. Recover them: Update Manager, polydye, Recover, Hard Recovery (or see the "
                  "polydye-klipper README, \"Raspberry Pi 3: freezes and damaged files\").")
@@ -106,9 +107,8 @@ class PolyDye:
         self.uploader_path = os.path.join(repo_dir, "scripts", "polydye_upload.py")
         # A damaged script must not stop the page from loading: it is how the damage gets reported.
         self.uploader, self.uploader_error = load_module("polydye_upload", self.uploader_path, "update_firmware")
-        self.files_checker, files_error = load_module(
-            "polydye_files", os.path.join(repo_dir, "scripts", "polydye_files.py"), "check")
-        self.files = {"error": files_error} if files_error else {}
+        self.files_checker, self.files_error = load_module("polydye_files", os.path.join(repo_dir, CHECKER), "check")
+        self.files = {}
         self.bundled_path = os.path.join(repo_dir, "firmware", "polydye.bin")
         # The service that carries the plug-in toggle hook (install.sh's KLIPPER_SERVICE).
         self.klipper_service = config.get("klipper_service", "klipper")
@@ -125,8 +125,10 @@ class PolyDye:
         """Compares the add-on's files with git's record and raises a Moonraker warning (shown by Mainsail) for
         damaged ones."""
         if self.files_checker is None:
-            self.server.add_warning(FILES_WARNING.format(files="couldn't check them: " + self.files["error"]),
-                                    warn_id="polydye_files")
+            # Most likely damaged by the same shutdown: report it as such, so the page shows the recovery steps too.
+            self.files = {"corrupt": [CHECKER], "changed": [], "error": self.files_error}
+            self.server.add_warning(FILES_WARNING.format(files=f"{CHECKER}, so the others couldn't be checked: "
+                                                               f"{self.files_error}"), warn_id="polydye_files")
             return
         try:
             self.files = await self.server.get_event_loop().run_in_thread(self.files_checker.check, self.repo_dir)

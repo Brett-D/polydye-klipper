@@ -170,7 +170,8 @@ about it:
 clones the add-on again). If Mainsail doesn't offer Recover because it thinks the add-on is fine, ask Moonraker
 directly: `curl -X POST "http://localhost:7125/machine/update/recover?name=polydye&hard=true"` on the Pi. Or clone
 it again by hand: `cd ~ && rm -rf polydye-klipper && git clone https://github.com/Brett-D/polydye-klipper.git &&
-~/polydye-klipper/install.sh`. Your `polydye.cfg` is in the config folder and isn't touched.
+~/polydye-klipper/install.sh`. Your `polydye.cfg` is in the config folder and isn't touched. A plain
+`git reset --hard` doesn't repair this damage: git skips files whose size and time still match its records.
 
 **Updating board firmware that still leaves USB on Klipper's reset:** the safest way is with the FT232 from a PC,
 with the board's J7 USB unplugged from the Pi (polydye-firmware README, "Flash and monitor"), then plug J7 back in and
