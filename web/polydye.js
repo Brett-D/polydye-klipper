@@ -640,6 +640,57 @@ const FIRE_STRIPES = 'color_b:6:ours,color_b_late:6:ours,color_b:6:stock,color_b
   + 'color_b:9:ours,color_b_late:9:ours,color_b:8:stock,color_b_late:8:stock';
 const FIRE_STRIPES_BASIC = 'color_b:6,color_b:8,color_b:9,color_a:6,color_a:9';
 let fireStripesEdited = false;
+// The random pattern's knobs (PATTERN=stock): form field, G-code parameter, range, whole numbers only.
+const KNOBS = [
+  ['density', 'DENSITY', 0, 100, false], ['repeat', 'REPEAT', 1, 16, true], ['first', 'FIRST', 0, 111, true],
+  ['last', 'LAST', 0, 111, true], ['per_pulse', 'PER_PULSE', 0, 12, true],
+];
+const WARM_OLD_US = 0.75;  // warm-up pulse limit of board firmware without the warm-up duty limit (polydye.py)
+
+// A number field's value: { empty } when blank, { bad } when it isn't a number in min..max (whole if asked).
+function numField(el, min, max, whole) {
+  const raw = el.value.trim();
+  const badInput = !!(el.validity && el.validity.badInput);
+  if (!raw && !badInput) return { empty: true };
+  const v = Number(raw);
+  const bad = badInput || !Number.isFinite(v) || v < min || v > max || (whole && !Number.isInteger(v));
+  return { v, bad, raw };
+}
+
+// The knobs a form sets, as G-code parameters (empty fields keep the stock pattern's values), or an error.
+function knobParams(f) {
+  let text = '';
+  for (const [name, param, min, max, whole] of KNOBS) {
+    const n = numField(f[name], min, max, whole);
+    if (n.empty) continue;
+    if (n.bad) {
+      return { error: `${param} must be ${whole ? 'a whole number ' : ''}from ${min} to ${max}`
+        + `${n.raw ? `, not "${n.raw}"` : ''}` };
+    }
+    text += ` ${param}=${n.v}`;
+  }
+  const colors = f.colors.value.trim().toLowerCase();
+  if (colors) {
+    if (!/^[cmy]{1,3}$/.test(colors) || new Set(colors).size !== colors.length) {
+      return { error: `COLORS must be any of c, m and y, e.g. cmy or m, not "${f.colors.value.trim()}"` };
+    }
+    text += ` COLORS=${colors}`;
+  }
+  const first = f.first.value.trim() ? Number(f.first.value) : 14;
+  const last = f.last.value.trim() ? Number(f.last.value) : 85;
+  if (first > last) return { error: `the first position (${first}) is after the last (${last})` };
+  return { text, error: '' };
+}
+
+const knobsGiven = (f) => KNOBS.some(([name]) => f[name].value.trim() !== '') || f.colors.value.trim() !== '';
+
+// The knob fields only go with the stock pattern.
+function showKnobs() {
+  ['fire-form', 'spit-form'].forEach((id) => {
+    const stock = $(id).elements.pattern.value === 'stock';
+    $(id).querySelectorAll('.knob').forEach((el) => el.classList.toggle('hidden', !stock));
+  });
+}
 
 function expectText(line) {
   return LOW_RAIL.includes(line) ? 'about 7.6 V (low rail, the reference design\'s 9 V)'
@@ -882,6 +933,7 @@ $('fire-form').addEventListener('input', (ev) => {
   if (ev.target.name === 'stripes') fireStripesEdited = true;
   renderFireLegend((state.printer.polydye || {}).pass_axis);
 });
+$('fire-form').addEventListener('change', () => showKnobs());
 $('fire-form').addEventListener('submit', (ev) => ev.preventDefault());
 $('spit-form').addEventListener('submit', (ev) => ev.preventDefault());
 $('spit-form').addEventListener('change', () => render());
@@ -889,11 +941,16 @@ $('spit-form').addEventListener('change', () => render());
 $('fire-btn').addEventListener('click', () => {
   const v = fireValues();
   if (!v.valid) return;
+  const knobs = v.pattern === 'stock' ? knobParams($('fire-form').elements) : { text: '' };
+  if (knobs.error) {
+    log(`! fire test: ${knobs.error}`);
+    return;
+  }
   const ok = window.confirm(`Print the fire test with LIVE INK?\n\nPaper taped on the bed, cartridge fitted. It homes `
     + `if needed, lowers the nozzle to Z ${v.z} mm and prints ${v.stripes.length} stripes, the first at X ${v.x}, `
     + `Y ${v.y}. The template and pulse go back to what they were afterwards.`);
   if (!ok) return;
-  gcode(`PD_FIRE_TEST X=${v.x} Y=${v.y} Z=${v.z} SPACING=${v.spacing} PATTERN=${v.pattern} `
+  gcode(`PD_FIRE_TEST X=${v.x} Y=${v.y} Z=${v.z} SPACING=${v.spacing} PATTERN=${v.pattern}${knobs.text} `
     + `STRIPES=${v.stripes.join(',')}`);
 });
 
@@ -920,21 +977,39 @@ $('spit-btn').addEventListener('click', () => {
     log(`! spit test: ${pulseRangeText(words, clock)}${pulse >= 3 ? '' : ': enter a fire pulse'}`);
     return;
   }
+  const knobs = stock ? knobParams(f) : { text: '' };
+  if (knobs.error) {
+    log(`! spit test: ${knobs.error}`);
+    return;
+  }
+  const warm = numField(f.warm, 0, 30, false);
+  const warmPulse = numField(f.warm_pulse, 1, 12, true);
+  const warmPeriod = numField(f.warm_period, 1, 65535, true);
+  if (warm.bad || warmPulse.bad || warmPeriod.bad) {
+    log('! spit test: the warm-up is 0-30 s, its pulse 1-12 words and its period 1-65535 µs (or leave them empty)');
+    return;
+  }
+  const warmS = warm.empty ? 0 : warm.v;
+  const warmParams = warmS > 0 ? ` WARM=${warmS}${warmPulse.empty ? '' : ` WARM_PULSE=${warmPulse.v}`}`
+    + `${warmPeriod.empty ? '' : ` WARM_PERIOD_US=${warmPeriod.v}`}` : '';
   const each = period > 0 ? `a column every ${period} µs` : `${SPIT_HZ} columns a second`;
   const rate = period > 0 ? `every ${period} µs for ${seconds} s` : `${SPIT_HZ} times a second for ${seconds} s`;
   const which = {
     mid: `Nozzle positions 14-90 fire ${rate}.`,
     sparse: `${each} for ${seconds} s, each firing one nozzle per fire pulse, a different one `
       + 'each column, so every nozzle fires in turn.',
-    stock: `A random quarter of positions 14-85 fires in each column, each column twice, like the stock firmware, `
+    stock: knobs.text ? `The stock firmware's random pattern with${knobs.text} fires ${each} for ${seconds} s.`
+      : `A random quarter of positions 14-85 fires in each column, each column twice, like the stock firmware, `
       + `${each} for ${seconds} s.`,
   }[f.pattern.value] || `Every nozzle fires ${rate}.`;
+  const first = warmS > 0 ? `First a ${warmS} s warm-up fires every nozzle with `
+    + `${warmPulse.empty ? 'short pulses' : `${warmPulse.v}-word pulses`}, then, in the same run: ` : '';
   const ok = window.confirm(`Spit test: LIVE INK, no motion.\n\nHold a folded paper towel under the cartridge, `
-    + `against the nozzles. ${which}`);
+    + `against the nozzles. ${first}${which}`);
   if (!ok) return;
   gcode(`POLYDYE_SPIT SECONDS=${seconds}${f.template.value ? ` TEMPLATE=${f.template.value}` : ''}`
     + `${pulse >= 3 && pulse <= 12 ? ` PULSE=${pulse}` : ''}${f.clock.value ? ` CLOCK=${f.clock.value}` : ''}`
-    + ` PATTERN=${f.pattern.value}${period > 0 ? ` PERIOD_US=${period}` : ''} CONFIRM=1`);
+    + ` PATTERN=${f.pattern.value}${knobs.text}${period > 0 ? ` PERIOD_US=${period}` : ''}${warmParams} CONFIRM=1`);
 });
 
 function renderDiagnostics(pd, printing) {
@@ -956,6 +1031,13 @@ function renderDiagnostics(pd, printing) {
   // The stock pattern and the column period came together.
   const stockOld = diag && (spit.pattern.value === 'stock' || spit.period.value.trim() !== '')
     && !(pd.spit_patterns || []).includes('stock');
+  // Then the warm-up's longer pulses and the stock pattern's knobs (the fire test takes the knobs on any firmware).
+  const randomOld = diag && !stockOld && spit.pattern.value === 'stock' && knobsGiven(spit) && !pd.spit_random;
+  const warmWords = parseInt(spit.warm_pulse.value, 10);
+  const warmClock = spit.clock.value || (spit.pattern.value === 'stock' ? 'stock' : pd.bus_clock || 'ours');
+  const warmOld = diag && !stockOld && parseFloat(spit.warm.value) > 0 && warmWords > 0 && !pd.warm_duty_ppm
+    && pulseUs(warmWords, warmClock) > WARM_OLD_US + 1e-9;
+  showKnobs();
   const oldText = [];
   if (sparseOld) {
     oldText.push('The sparse spit test needs newer board firmware: Update to bundled firmware under Board firmware. '
@@ -967,9 +1049,17 @@ function renderDiagnostics(pd, printing) {
     oldText.push('The stock-emulation spit test and the column period need newer board firmware: Update to bundled '
       + 'firmware under Board firmware.');
   }
+  if (randomOld) {
+    oldText.push("The stock pattern's knobs need newer board firmware for the spit test: Update to bundled firmware "
+      + 'under Board firmware. The fire test takes them with this one.');
+  }
+  if (warmOld) {
+    oldText.push(`Warm-up pulses longer than ${WARM_OLD_US} µs need newer board firmware: Update to bundled firmware `
+      + 'under Board firmware.');
+  }
   $('spit-fw-old').textContent = oldText.join(' ');
   $('spit-fw-old').classList.toggle('hidden', !oldText.length);
-  $('spit-btn').disabled = !diag || busy || sparseOld || halfOld || deskjetOld || stockOld;
+  $('spit-btn').disabled = !diag || busy || sparseOld || halfOld || deskjetOld || stockOld || randomOld || warmOld;
   const cartOut = $('sig-cart-out').checked;
   const level = pd.level || null;
   $('sig-start').disabled = !diag || busy || !cartOut || !!pd.live;

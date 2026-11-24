@@ -31,6 +31,11 @@ CLOCK = "polydye_clock oid=%c stock=%c nominal_hz=%u measured_hz=%u"
 # (underruns) or the bus still busy (overruns), and its worst lateness and slowest column preparation in clock ticks.
 RUN = ("polydye_run oid=%c fault_static_string_id=%hu columns=%u warm_left=%u underruns=%u overruns=%u late_max=%u "
        "fill_max=%u")
+# The board's bus clock check on its own (polydye_check_clock, board firmware with POLYDYE_BUS_HZ_FAST_PCT): ok 1 if
+# the clock passed, 0 if it was still off after the board set it up again, 2 if a run was active; the last probe; and
+# counts since power-up of probes, set-ups redone after a probe found the clock off, and checks that found it still off.
+CLOCK_CHECK = "polydye_clock_check oid=%c ok=%c measured_hz=%u probes=%u resets=%u refused=%u"
+CLOCK_TEST_MAX = 500
 # Bus clocks in polydye_set_clock numbering: ours (POLYDYE_BUS_HZ), the stock firmware's setup, and half ours. The
 # stock setup's divider of 1 acts as 2 on the board (measured 2.82-2.83 MHz), so it runs at 2.857 MHz, not the 5.714 MHz
 # it looks like on paper. Half (1.667 MHz) gives every template edge twice the time to settle; it needs board firmware
@@ -71,10 +76,15 @@ PULSE_MAX_EXT_US, SPIT_EXT_MAX_S = 5.0, 3.
 # Board firmware before 5.0 us has POLYDYE_PULSE_MAX_EXT_NS = 4000; the add-on follows the board's constant.
 PULSE_MAX_EXT_NS_OLD = 4000
 SPIT_EXT_MAX_COLUMNS = int(SPIT_EXT_MAX_S * SPIT_HZ)
-# Head warm-up (POLYDYE_SPIT WARM=, POLYDYE_WARM; board firmware with polydye_spit_run): every nozzle fired with
-# pulses too short to boil ink, 1 or 2 words and at most WARM_MAX_US (the board's POLYDYE_WARM_MAX_NS), as fast as the
-# column allows, for at most WARM_MAX_S and WARM_MAX_COLUMNS columns, right before the spit.
-WARM_MAX_S, WARM_MAX_WORDS, WARM_MAX_US, WARM_MAX_COLUMNS = 10., 2, 0.75, 65535
+# Head warm-up (POLYDYE_SPIT WARM=, POLYDYE_WARM; board firmware with polydye_spit_run): every nozzle fired, right before
+# the spit in the same board run. Board firmware with POLYDYE_WARM_MAX_DUTY_PPM takes any pulse up to the live limit (the
+# board's POLYDYE_WARM_MAX_NS, 2.9 us: 12 heaters on every fire pulse heat the head rather than spit), at most that
+# heater duty (pulse / period, the board's POLYDYE_WARM_MAX_DUTY_PPM), for up to its POLYDYE_WARM_MAX_MS; older board
+# firmware takes 1 or 2 words, at most WARM_OLD_US, for at most WARM_OLD_S. The default pulse is the longest within
+# WARM_SHORT_US (too short to boil ink), the default period the shortest the column and the duty allow. At most
+# WARM_MAX_COLUMNS columns.
+WARM_OLD_S, WARM_OLD_WORDS, WARM_OLD_US, WARM_MAX_COLUMNS = 10., 2, 0.75, 65535
+WARM_SHORT_US = 0.75
 # A spit test with PERIOD_US (board firmware with polydye_spit_run) keeps the board's column limits: at most
 # SPIT_MAX_COLUMNS (SPIT_EXT_MAX_COLUMNS extended), so a shorter period means a shorter spit. The period must be at
 # least the column's time on the bus plus PERIOD_MARGIN_US (the board's printcart_min_period_us()): 14 packets of the
@@ -94,6 +104,16 @@ TEST_PATTERN_TEXT = {'all': "all-nozzle", 'mid': "positions 14-90", 'sparse': "s
 SPIT_PATTERNS_OLD = 2
 SPARSE_COLUMNS = 12
 MID_POSITIONS = range(14, 91)
+# The random pattern (board firmware with polydye_set_spit_random, its spit pattern RANDOM_PATTERN): the stock pattern
+# with knobs, for finding what makes a cartridge eject. PATTERN=stock with DENSITY (% of positions), REPEAT (each random
+# column sent that many times), COLORS (any of c, m, y), FIRST/LAST (Sprite_tm's colour positions 0-111) or PER_PULSE
+# (exactly that many random heaters on every fire pulse instead of DENSITY); those not given are the stock pattern's.
+# The fire test and test passes make the same columns here (random_column), for any board firmware.
+RANDOM_PATTERN = 4
+RANDOM_KNOBS = ('DENSITY', 'REPEAT', 'COLORS', 'FIRST', 'LAST', 'PER_PULSE')
+RANDOM_FULL, RANDOM_REPEAT_MAX, RANDOM_PER_PULSE_MAX, COLOR_POSITIONS = 1024, 16, 12, 112
+STOCK_RANDOM = {'density': 255, 'repeat': 2, 'colors': 7, 'first': 14, 'last': 85, 'per_pulse': 0}
+COLOR_NAMES = ('cyan', 'magenta', 'yellow')
 # The board refuses live ink within 0.1 s of the boost turning on; POLYDYE_ENABLE keeps the next moves this far out.
 BOOST_SETTLE = 0.15
 # Byte order of the colour nozzles in a column, from Sprite_tm's printcart_genwaveform.c (printcart_fire_nozzle_color;
@@ -259,6 +279,11 @@ def pulse_us(words, clock):
     return words * 1e6 / CLOCK_HZ.get(clock or 'ours', PULSE_WORD_HZ)
 
 
+def pulse_ns(words, clock):
+    """Fire pulse length in whole ns at a bus clock, rounded up like the board's printcart_pulse_ns()."""
+    return -(-words * 10 ** 9 // int(CLOCK_HZ.get(clock or 'ours', PULSE_WORD_HZ)))
+
+
 def pulse_energy_pct(us):
     """Heater energy of a pulse on the PolyDye high rail, in % of Sprite_tm's 1.8 us at 16 V (energy ~ V^2 t)."""
     return 100. * RAIL_V * RAIL_V * us / (REF_V * REF_V * REF_US)
@@ -294,9 +319,11 @@ def warm_text(columns, words, clock, period_us):
     """A warm-up's settings and total energy, for messages: per nozzle, as heating time and in reference pulses."""
     us = pulse_us(words, clock)
     pct = pulse_energy_pct(us)
-    return ("warm-up %.1f s: %d all-nozzle columns every %d us, %d-word pulses of %.2f us (%.0f %% energy each, too "
-            "short to boil ink); per nozzle %.0f us of heating in all, the energy of %.0f reference pulses (heater "
-            "duty %.2f %%)" % (columns * period_us / 1e6, columns, period_us, words, us, pct, columns * us,
+    note = ("too short to boil ink" if us <= WARM_SHORT_US + 1e-9
+            else "12 heaters on every pulse heat the head rather than spit")
+    return ("warm-up %.1f s: %d all-nozzle columns every %d us, %d-word pulses of %.2f us (%.0f %% energy each, %s); "
+            "per nozzle %.0f us of heating in all, the energy of %.0f reference pulses (heater "
+            "duty %.2f %%)" % (columns * period_us / 1e6, columns, period_us, words, us, pct, note, columns * us,
                                columns * pct / 100., 100. * us / period_us))
 
 
@@ -318,6 +345,28 @@ def spit_rate_text(period_us):
     if period_us == SPIT_PERIOD_US:
         return "at %d Hz" % (SPIT_HZ,)
     return "every %d us (%.0f Hz)" % (period_us, 1e6 / period_us)
+
+
+def clock_off_pct(measured_hz, nominal_hz):
+    return (measured_hz - nominal_hz) * 100. / nominal_hz
+
+
+def clock_wrong(measured_hz, nominal_hz, check):
+    """True if the board's clock check (`check`: % fast, % slow) refuses a measured bus clock."""
+    return check is not None and not -check[1] <= clock_off_pct(measured_hz, nominal_hz) <= check[0]
+
+
+def measured_clock_text(measured_hz, nominal_hz, name, check=None):
+    """The bus clock the board measured against its setting, for messages; `check` is the board's (% fast, % slow)
+    limits, None if it doesn't check the clock."""
+    text = "bus clock measured %.3f MHz (%s%.3f MHz, %+.1f %%)" % (
+        measured_hz / 1e6, "%s clock " % (name,) if name else "set to ", nominal_hz / 1e6,
+        clock_off_pct(measured_hz, nominal_hz))
+    if check is None:
+        return text
+    if not clock_wrong(measured_hz, nominal_hz, check):
+        return text + ", within the board's +%d/-%d %% clock check" % check
+    return text + ": WRONG, outside the board's +%d/-%d %% clock check, so it fires nothing at it" % check
 
 
 def run_fault(run):
@@ -382,6 +431,110 @@ def sparse_column(k):
     return bytes(col)
 
 
+def parse_colors(text):
+    """COLORS: any of c, m and y, each once -> the board's colour bits (cyan 1, magenta 2, yellow 4). Raises ValueError."""
+    t = text.strip().lower()
+    if not t or len(set(t)) != len(t) or any(ch not in "cmy" for ch in t):
+        raise ValueError("COLORS must be any of c, m and y, e.g. cmy or m (not %r)" % (text,))
+    return sum(1 << "cmy".index(ch) for ch in t)
+
+
+def random_text(r):
+    """The random pattern's settings, for messages."""
+    colours = "/".join(name for i, name in enumerate(COLOR_NAMES) if r['colors'] >> i & 1)
+    which = ("%d heater%s on every fire pulse" % (r['per_pulse'], "" if r['per_pulse'] == 1 else "s")
+             if r['per_pulse'] else "%.1f %%" % (r['density'] * 100. / RANDOM_FULL))
+    times = {1: "once", 2: "twice"}.get(r['repeat'], "%d times" % (r['repeat'],))
+    return "random: %s of positions %d-%d of %s, each column %s" % (which, r['first'], r['last'], colours, times)
+
+
+_MASK32 = 0xFFFFFFFF
+_SEED_DENSITY, _SEED_PER_PULSE, _GOLDEN = 0x5DEECE66, 0xA5F1523B, 0x9E3779B9
+
+
+def _fmix32(h):
+    h ^= h >> 16
+    h = (h * 0x85EBCA6B) & _MASK32
+    h ^= h >> 13
+    h = (h * 0xC2B2AE35) & _MASK32
+    return h ^ (h >> 16)
+
+
+def random_plan(r):
+    """For each packet and fire line (F3: bits 0-3, F5: bits 4-7), the heaters the random pattern may pick, as data line
+    * 8 + bit, in the board's order (printcart_random_plan)."""
+    plan = [[[], []] for _ in range(14)]
+    for c in range(3):
+        if r['colors'] >> c & 1:
+            for p in range(r['first'], r['last'] + 1):
+                byte, bit = COLOR_BYTE_ORDER[c][p % 14] + 14 * c, p // 14
+                slots = plan[byte % 14][bit // 4]
+                if len(slots) < RANDOM_PER_PULSE_MAX:
+                    slots.append((byte // 14) * 8 + bit)
+    return plan
+
+
+def random_column(k, r, plan=None):
+    """Column k of the random pattern with settings `r`, exactly as the board makes it (printcart_pattern_random):
+    random column k // repeat. With per_pulse 0 each selected position fires with probability density / 1024, drawn in
+    the stock pattern's order; otherwise every fire pulse gets exactly per_pulse of its eligible heaters (all of them if
+    fewer). `plan` is random_plan(r), worked out once for many columns."""
+    col = bytearray(NOZDATA_SIZE)
+    m = (k // r['repeat']) & _MASK32
+    if not r['per_pulse']:
+        s = _fmix32(m ^ _SEED_DENSITY)
+        for c in range(3):
+            for p in range(r['first'], r['last'] + 1):
+                s = (s + _GOLDEN) & _MASK32
+                if r['colors'] >> c & 1 and (_fmix32(s) >> 22) < r['density']:
+                    col[COLOR_BYTE_ORDER[c][p % 14] + 14 * c] |= 1 << (p // 14)
+        return bytes(col)
+    plan = plan or random_plan(r)
+    s = _fmix32(m ^ _SEED_PER_PULSE)
+    for packet in range(14):
+        for half in range(2):
+            pick = list(plan[packet][half])
+            n = len(pick)
+            for i in range(min(r['per_pulse'], n)):  # a partial Fisher-Yates shuffle: distinct heaters
+                s = (s + _GOLDEN) & _MASK32
+                j = i + _fmix32(s) % (n - i)
+                pick[i], pick[j] = pick[j], pick[i]
+                col[(pick[i] >> 3) * 14 + packet] |= 1 << (pick[i] & 7)
+    return bytes(col)
+
+
+def random_settings(gcmd, cmd):
+    """The random pattern's settings from DENSITY (%), REPEAT, COLORS, FIRST, LAST and PER_PULSE, the stock pattern's
+    for those not given; None if none is given."""
+    if all(gcmd.get(k, None) is None for k in RANDOM_KNOBS):
+        return None
+    r = dict(STOCK_RANDOM)
+    density = gcmd.get_float('DENSITY', None, minval=0., maxval=100.)
+    if density is not None:
+        r['density'] = int(round(density * RANDOM_FULL / 100.))
+    r['repeat'] = gcmd.get_int('REPEAT', r['repeat'], minval=1, maxval=RANDOM_REPEAT_MAX)
+    colors = gcmd.get('COLORS', None)
+    if colors is not None:
+        try:
+            r['colors'] = parse_colors(colors)
+        except ValueError as e:
+            raise gcmd.error("%s: %s" % (cmd, e))
+    r['first'] = gcmd.get_int('FIRST', r['first'], minval=0, maxval=COLOR_POSITIONS - 1)
+    r['last'] = gcmd.get_int('LAST', r['last'], minval=0, maxval=COLOR_POSITIONS - 1)
+    if r['first'] > r['last']:
+        raise gcmd.error("%s: FIRST=%d is after LAST=%d" % (cmd, r['first'], r['last']))
+    r['per_pulse'] = gcmd.get_int('PER_PULSE', r['per_pulse'], minval=0, maxval=RANDOM_PER_PULSE_MAX)
+    return r
+
+
+def random_params(r):
+    """The random pattern's settings as G-code parameters (for POLYDYE_UPLOAD_TEST_PASS)."""
+    return " DENSITY=%s REPEAT=%d COLORS=%s FIRST=%d LAST=%d PER_PULSE=%d" % (
+        repr(r['density'] * 100. / RANDOM_FULL), r['repeat'], "".join(ch for i, ch in enumerate("cmy")
+                                                                     if r['colors'] >> i & 1),
+        r['first'], r['last'], r['per_pulse'])
+
+
 def stripe_positions(axis, x, y, spacing, count):
     """Bed (X, Y) of each fire-test stripe's first column: stripes run along the pass axis, side by side across it."""
     if axis == 'y':
@@ -389,10 +542,16 @@ def stripe_positions(axis, x, y, spacing, count):
     return [(x, y + i * spacing) for i in range(count)]
 
 
-def test_pass_data(pattern, columns, repeat=1):
+def test_pass_data(pattern, columns, repeat=1, random=None):
     """Nozzle data for POLYDYE_UPLOAD_TEST_PASS: `columns` columns of `pattern`, each sent `repeat` times in a row.
-    Returns (data, column count). Raises ValueError for an unknown pattern."""
+    `stock` is the random pattern with settings `random` (the stock pattern's if None) and that repeat. Returns (data,
+    column count). Raises ValueError for an unknown pattern."""
     full, empty = b"\xff" * NOZDATA_SIZE, b"\x00" * NOZDATA_SIZE
+    if pattern == 'stock':
+        r = dict(random or STOCK_RANDOM, repeat=repeat)
+        plan = random_plan(r)
+        total = columns * repeat
+        return b"".join(random_column(i, r, plan) for i in range(total)), total
     if pattern == 'alternate':
         cols = [full if i % 2 == 0 else empty for i in range(columns)]
     elif pattern in ('all', 'none', 'mid'):
@@ -400,7 +559,7 @@ def test_pass_data(pattern, columns, repeat=1):
     elif pattern == 'sparse':
         cols = [sparse_column(i) for i in range(columns)]
     else:
-        raise ValueError("PATTERN must be alternate, all, none, mid or sparse")
+        raise ValueError("PATTERN must be alternate, all, none, mid, sparse or stock")
     return b"".join(col * repeat for col in cols), columns * repeat
 
 
@@ -493,8 +652,14 @@ class PolyDye:
         self.spit_patterns = 0
         self.spit_ext_cmd = None  # the extended spit test, on board firmware that has it
         self.spit_run_cmd = None  # a spit test with its own column period and a warm-up, on board firmware with it
+        self.spit_random_cmd = None  # the random pattern's settings, on board firmware with it
+        # The board's warm-up limits (board firmware with POLYDYE_WARM_MAX_DUTY_PPM; older: WARM_OLD_*, no duty limit).
+        self.warm_max_words, self.warm_max_us, self.warm_max_s = WARM_OLD_WORDS, WARM_OLD_US, WARM_OLD_S
+        self.warm_duty_ppm = None
         self.pulse_max_ext_us = PULSE_MAX_EXT_US  # the board's extended-spit limit (POLYDYE_PULSE_MAX_EXT_NS)
         self.set_clock_cmd = self.query_clock_cmd = None
+        self.check_clock_cmd = None  # the board's clock check on its own, on board firmware with it
+        self.bus_hz_check = None  # (% fast, % slow) the board refuses to fire at; None: it doesn't check the clock
         self.query_run_cmd = None  # the board's last run, on board firmware with polydye_query_run
         self.testing = False  # a spit test or warm-up is running: it reports a shutdown itself
         self.clock_count = 0  # bus clocks the board offers (CLOCKS[:clock_count]); 0: no clock choice
@@ -523,6 +688,8 @@ class PolyDye:
         gcode.register_command('POLYDYE_FIRE_TEST', self.cmd_POLYDYE_FIRE_TEST, desc=self.cmd_POLYDYE_FIRE_TEST_help)
         gcode.register_command('POLYDYE_SPIT', self.cmd_POLYDYE_SPIT, desc=self.cmd_POLYDYE_SPIT_help)
         gcode.register_command('POLYDYE_WARM', self.cmd_POLYDYE_WARM, desc=self.cmd_POLYDYE_WARM_help)
+        gcode.register_command('POLYDYE_CLOCK_TEST', self.cmd_POLYDYE_CLOCK_TEST,
+                               desc=self.cmd_POLYDYE_CLOCK_TEST_help)
 
     def _build_config(self):
         self.mcu.add_config_cmd("config_polydye oid=%d" % (self.oid,))
@@ -563,14 +730,32 @@ class PolyDye:
                    "warm_words=%c warm_period_us=%hu")
             if self.mcu.try_lookup_command(fmt) is not None:
                 self.spit_run_cmd = self.mcu.lookup_command(fmt, cq=cq)
+                constants = self.mcu.get_constants()
+                if 'POLYDYE_WARM_MAX_DUTY_PPM' in constants:
+                    self.warm_max_words = int(constants['POLYDYE_WARM_MAX_WORDS'])
+                    self.warm_max_us = constants['POLYDYE_WARM_MAX_NS'] / 1000.
+                    self.warm_duty_ppm = int(constants['POLYDYE_WARM_MAX_DUTY_PPM'])
+                    self.warm_max_s = constants['POLYDYE_WARM_MAX_MS'] / 1000.
+            # Then the random pattern's knobs.
+            fmt = "polydye_set_spit_random oid=%c density=%hu repeat=%c colors=%c first=%c last=%c per_pulse=%c"
+            if self.mcu.try_lookup_command(fmt) is not None:
+                self.spit_random_cmd = self.mcu.lookup_command(fmt, cq=cq)
         # color_b_late and the bus clock choice came with the stock-firmware comparison.
         if self.mcu.try_lookup_command("polydye_query_clock oid=%c") is not None:
             self.set_clock_cmd = self.mcu.lookup_command("polydye_set_clock oid=%c stock=%c", cq=cq)
             self.query_clock_cmd = self.mcu.lookup_query_command("polydye_query_clock oid=%c", CLOCK, oid=self.oid,
                                                                  cq=cq)
+            # The board's clock check on its own (POLYDYE_CLOCK_TEST) came with the check before live runs.
+            if self.mcu.try_lookup_command("polydye_check_clock oid=%c") is not None:
+                self.check_clock_cmd = self.mcu.lookup_query_command("polydye_check_clock oid=%c", CLOCK_CHECK,
+                                                                     oid=self.oid, cq=cq)
             # The half clock came later, with this constant.
             self.clock_count = min(len(CLOCKS), int(self.mcu.get_constants().get('POLYDYE_BUS_CLOCKS',
                                                                                  BUS_CLOCKS_OLD)))
+            # The board's bus clock check (refuses to fire at a wrong clock) came with these constants.
+            constants = self.mcu.get_constants()
+            if 'POLYDYE_BUS_HZ_FAST_PCT' in constants:
+                self.bus_hz_check = (constants['POLYDYE_BUS_HZ_FAST_PCT'], constants['POLYDYE_BUS_HZ_SLOW_PCT'])
             if self.bus_clock is not None and CLOCKS.index(self.bus_clock) >= self.clock_count:
                 raise self.printer.config_error(
                     "[polydye] bus_clock: %s needs newer PolyDye board firmware. Update it from the PolyDye page (Board "
@@ -631,9 +816,17 @@ class PolyDye:
 
     def _report_fault(self, eventtime):
         run = self._last_run()
-        if run is None or run_fault(run) is None:
+        if run is None:
             return
-        msg = "PolyDye board: %s, after %s" % (run_fault(run), run_text(run))
+        clock = self._measured_clock()
+        if run_fault(run) is not None:
+            msg = "PolyDye board: %s, after %s%s" % (run_fault(run), run_text(run), "; %s" % (clock[0],) if clock
+                                                     else "")
+        else:
+            # A pass refused at a wrong bus clock never started: no run fault, but the board says what it measured.
+            if not clock or not clock[1]:
+                return
+            msg = "PolyDye board: %s" % (clock[0],)
         logging.warning("polydye: %s", msg)
         self.printer.lookup_object('gcode').respond_info(msg)
 
@@ -956,37 +1149,47 @@ class PolyDye:
         if clock is not None and not clock_first:
             self.set_clock_cmd.send([self.oid, CLOCKS.index(clock)])
 
-    cmd_POLYDYE_UPLOAD_TEST_PASS_help = ("Upload a test pattern pass (PATTERN=alternate|all|none|mid|sparse, each "
-                                         "column REPEAT times) to the PolyDye board; not during a print")
+    cmd_POLYDYE_UPLOAD_TEST_PASS_help = ("Upload a test pattern pass (PATTERN=alternate|all|none|mid|sparse|stock, each "
+                                         "column REPEAT times; stock takes DENSITY, COLORS, FIRST, LAST and PER_PULSE "
+                                         "too) to the PolyDye board; not during a print")
 
     def cmd_POLYDYE_UPLOAD_TEST_PASS(self, gcmd):
         layer = gcmd.get_int('LAYER', 0, minval=0, maxval=65535)
         pass_num = gcmd.get_int('PASS', 0, minval=0, maxval=65535)
         columns = gcmd.get_int('COLUMNS', 600, minval=1, maxval=65535)
         pattern = gcmd.get('PATTERN', 'alternate').lower()
-        repeat = gcmd.get_int('REPEAT', 1, minval=1, maxval=8)
+        random = None
+        if pattern == 'stock':
+            random = random_settings(gcmd, "POLYDYE_UPLOAD_TEST_PASS") or dict(STOCK_RANDOM)
+            repeat = random['repeat']
+        else:
+            if any(gcmd.get(k, None) is not None for k in RANDOM_KNOBS if k != 'REPEAT'):
+                raise gcmd.error("POLYDYE_UPLOAD_TEST_PASS: DENSITY, COLORS, FIRST, LAST and PER_PULSE go with "
+                                 "PATTERN=stock")
+            repeat = gcmd.get_int('REPEAT', 1, minval=1, maxval=8)
+        if columns * repeat > 65535:
+            raise gcmd.error("POLYDYE_UPLOAD_TEST_PASS: COLUMNS x REPEAT must be at most 65535 (it is %d)"
+                             % (columns * repeat,))
         try:
-            data, total = test_pass_data(pattern, columns, repeat)
+            data, total = test_pass_data(pattern, columns, repeat, random)
         except ValueError as e:
             raise gcmd.error("POLYDYE_UPLOAD_TEST_PASS: %s" % (e,))
-        if total > 65535:
-            raise gcmd.error("POLYDYE_UPLOAD_TEST_PASS: COLUMNS x REPEAT must be at most 65535 (it is %d)" % (total,))
         if not self.data_port:
             raise gcmd.error("POLYDYE_UPLOAD_TEST_PASS: set data_port in [polydye]")
         try:
             self.data_seq = (self.data_seq + 1) & 0xff
             hello = data_port_request(self.data_port, self.data_seq, DATA_HELLO)
             cart = 1 if hello.get('cart') == 'black' else 0
-            if cart and pattern == 'mid':
-                raise ValueError("PATTERN=mid is for a colour cartridge template")
+            if cart and pattern in ('mid', 'stock'):
+                raise ValueError("PATTERN=%s is for a colour cartridge template" % (pattern,))
             self.data_seq = (self.data_seq + 1) & 0xff
             data_port_request(self.data_port, self.data_seq, DATA_PUT,
                               struct.pack("<HHBBH", layer, pass_num, cart, 0, total) + data)
         except (DataPortError, OSError, ValueError) as e:
             raise gcmd.error("POLYDYE_UPLOAD_TEST_PASS: %s" % (e,))
         gcmd.respond_info("PolyDye: stored test pass layer %d pass %d (%d columns, %s%s)"
-                          % (layer, pass_num, total, pattern,
-                             ", each of %d sent %d times" % (columns, repeat) if repeat > 1 else ""))
+                          % (layer, pass_num, total, random_text(random) if random else pattern,
+                             ", each of %d sent %d times" % (columns, repeat) if repeat > 1 and not random else ""))
 
     cmd_POLYDYE_LEVEL_help = ("Signal check, cartridge OUT: hold one cartridge line (LINE=D1..D3|CSYNC|S1..S5|DCLK) "
                               "HIGH or LOW for a multimeter (STATE=high|low|off); needs POLYDYE_ENABLE LIVE=0 first")
@@ -1049,7 +1252,8 @@ class PolyDye:
             reactor.pause(reactor.monotonic() + 0.1)
 
     cmd_POLYDYE_FIRE_TEST_help = ("LIVE INK on paper: one stripe per TEMPLATE:PULSE[:CLOCK] in STRIPES, side by side "
-                                  "from X, Y, SPACING mm apart, at Z if given, PATTERN=all|mid|sparse; restores the "
+                                  "from X, Y, SPACING mm apart, at Z if given, PATTERN=all|mid|sparse|stock (stock "
+                                  "with DENSITY, REPEAT, COLORS, FIRST, LAST, PER_PULSE); restores the "
                                   "template, pulse, clock and G-code state afterwards. UPLOAD=0 prints the pass "
                                   "already stored as LAYER, PASS instead")
 
@@ -1068,9 +1272,14 @@ class PolyDye:
         for tpl, _, clock in stripes:
             self._check_template(gcmd, "POLYDYE_FIRE_TEST", tpl)
             self._check_clock(gcmd, "POLYDYE_FIRE_TEST", clock)
-        pattern = gcmd.get('PATTERN', 'all').lower()
-        if pattern not in TEST_PATTERNS:
-            raise gcmd.error("POLYDYE_FIRE_TEST: PATTERN must be all, mid or sparse")
+        random = random_settings(gcmd, "POLYDYE_FIRE_TEST")
+        pattern = gcmd.get('PATTERN', 'stock' if random else 'all').lower()
+        if pattern not in TEST_PATTERNS + ('stock',):
+            raise gcmd.error("POLYDYE_FIRE_TEST: PATTERN must be all, mid, sparse or stock")
+        if random is not None and pattern != 'stock':
+            raise gcmd.error("POLYDYE_FIRE_TEST: %s go with PATTERN=stock" % (", ".join(RANDOM_KNOBS),))
+        if pattern == 'stock':
+            random = random or dict(STOCK_RANDOM)
         x = gcmd.get_float('X', 70.)
         y = gcmd.get_float('Y', 60.)
         z = gcmd.get_float('Z', None, minval=0.2)
@@ -1101,8 +1310,15 @@ class PolyDye:
             if pulse_range_error(words, clock):
                 raise gcmd.error("POLYDYE_FIRE_TEST: stripe %s:%d: %s" % (tpl, words, pulse_range_error(words, clock)))
         positions = stripe_positions(self.pass_axis, x, y, spacing, len(stripes))
+        # The stock pattern's random columns go up REPEAT times each, so the stripe has whole repeats.
+        upload_columns = max(1, columns // random['repeat']) if random else columns
+        upload_cmd = ("POLYDYE_UPLOAD_TEST_PASS LAYER=%d PASS=%d COLUMNS=%d PATTERN=%s%s"
+                      % (layer, pass_num, upload_columns, pattern, random_params(random) if random else ""))
+        if random and upload:
+            columns = upload_columns * random['repeat']
         gcmd.respond_info("PolyDye fire test, live ink, %d stripes of %d %s columns along %s:\n%s" % (
-            len(stripes), columns, pattern if upload else "stored", self.pass_axis.upper(), "\n".join(
+            len(stripes), columns, (random_text(random) if random else pattern) if upload else "stored",
+            self.pass_axis.upper(), "\n".join(
                 "  %d: X=%.1f Y=%.1f  %s, pulse %d words (%.2f us)%s" % (
                     i + 1, px, py, tpl, words, pulse_us(words, clock), ", %s clock" % (clock,) if clock else "")
                 for i, ((tpl, words, clock), (px, py)) in enumerate(zip(stripes, positions)))))
@@ -1120,8 +1336,7 @@ class PolyDye:
                 # The pass store keeps the cartridge type a pass was uploaded for.
                 cart = 'black' if tpl.startswith('black') else 'color'
                 if upload and cart != uploaded:
-                    run("POLYDYE_UPLOAD_TEST_PASS LAYER=%d PASS=%d COLUMNS=%d PATTERN=%s"
-                        % (layer, pass_num, columns, pattern))
+                    run(upload_cmd)
                     uploaded = cart
                 run("POLYDYE_ENABLE LIVE=1")
                 run("POLYDYE_PASS LAYER=%d PASS=%d X=%.3f Y=%.3f DIR=1" % (layer, pass_num, px, py))
@@ -1137,22 +1352,78 @@ class PolyDye:
         gcmd.respond_info("PolyDye fire test done; %s" % (cartridge_text(self._fresh_status()),))
 
     cmd_POLYDYE_SPIT_help = ("LIVE INK, no motion: fire every nozzle (PATTERN=all), positions 14-90 (mid), one "
-                             "nozzle per fire pulse in turn (sparse) or like the stock firmware (stock) for SECONDS "
-                             "(max 10) at 1 kHz or every PERIOD_US into a paper towel held under the cartridge, "
-                             "optionally with TEMPLATE, PULSE and CLOCK=ours|stock|half and a head warm-up of WARM "
-                             "seconds first; needs CONFIRM=1. EXPERIMENTAL, can burn out nozzles: EXTENDED=1 allows a "
-                             "PULSE of up to 5.0 us for at most 3 s")
+                             "nozzle per fire pulse in turn (sparse) or like the stock firmware (stock, tuned with "
+                             "DENSITY, REPEAT, COLORS, FIRST, LAST or PER_PULSE) for SECONDS (max 10) at 1 kHz or "
+                             "every PERIOD_US into a paper towel held under the cartridge, optionally with TEMPLATE, "
+                             "PULSE and CLOCK=ours|stock|half and a head warm-up of WARM seconds (max 30) first, in the "
+                             "same run; needs CONFIRM=1. EXPERIMENTAL, can burn out nozzles: EXTENDED=1 allows a PULSE "
+                             "of up to 5.0 us for at most 3 s")
 
     def cmd_POLYDYE_SPIT(self, gcmd):
         self._spit(gcmd, "POLYDYE_SPIT", warm_only=False)
 
-    cmd_POLYDYE_WARM_help = ("LIVE, no motion, EXPERIMENTAL: warm the cartridge head for SECONDS (max 10) by firing "
-                             "every nozzle with pulses too short to boil ink (WARM_PULSE=1|2 words, at most 0.75 us) "
-                             "as fast as the column allows or every WARM_PERIOD_US, optionally with TEMPLATE and "
-                             "CLOCK; needs CONFIRM=1")
+    cmd_POLYDYE_WARM_help = ("LIVE, no motion, EXPERIMENTAL: warm the cartridge head for SECONDS (max 30) by firing "
+                             "every nozzle (WARM_PULSE words, up to 2.9 us; by default too short to boil ink) as fast "
+                             "as the column and a heater duty of 0.58 % allow or every WARM_PERIOD_US, optionally with "
+                             "TEMPLATE and CLOCK; needs CONFIRM=1")
 
     def cmd_POLYDYE_WARM(self, gcmd):
         self._spit(gcmd, "POLYDYE_WARM", warm_only=True)
+
+    cmd_POLYDYE_CLOCK_TEST_help = ("No ink, no motion: switch the cartridge bus clock between ours and stock COUNT times "
+                                   "(default 20) and have the board measure it after every switch, as before a live "
+                                   "run; PolyDye must be off")
+
+    def cmd_POLYDYE_CLOCK_TEST(self, gcmd):
+        cmd = "POLYDYE_CLOCK_TEST"
+        if self.check_clock_cmd is None:
+            raise gcmd.error("%s needs newer PolyDye board firmware; update it from the PolyDye page (Board firmware: "
+                             "Update to bundled firmware)" % (cmd,))
+        count = gcmd.get_int('COUNT', 20, minval=1, maxval=CLOCK_TEST_MAX)
+        self._check_not_printing(gcmd, cmd)
+        self.printer.lookup_object('toolhead').wait_moves()
+        st = self._fresh_status()
+        if st['boost'] or st['live'] or st['running'] or st['queued']:
+            raise gcmd.error("%s: turn PolyDye off first (POLYDYE_DISABLE)" % (cmd,))
+        before = (st['cartridge_template'], st['pulse_words'], st.get('bus_clock'))
+        clocks = ('ours', 'stock')
+        measured = {clock: [] for clock in CLOCKS}
+        wrong = []
+
+        def check(label, clock):
+            r = self.check_clock_cmd.send([self.oid])
+            if r['ok'] == 2:
+                raise gcmd.error("%s: the board is running columns; turn PolyDye off first" % (cmd,))
+            measured[clock].append(r['measured_hz'])
+            if r['ok'] != 1:
+                wrong.append("%s: %.3f MHz" % (label, r['measured_hz'] / 1e6))
+            return r
+
+        try:
+            self.testing = True
+            # The stock clock's words are longer: a pulse over the limit there is refused, so 1.8 us for the test.
+            if any(pulse_limit_error(st['pulse_words'], clock) for clock in clocks):
+                self.set_pulse_cmd.send([self.oid, min_pulse_words('ours')])
+            first = check("before switching (%s)" % (before[2] or 'ours',), before[2] or 'ours')
+            last = first
+            for i in range(count):
+                for clock in clocks:
+                    self.set_clock_cmd.send([self.oid, CLOCKS.index(clock)])
+                    last = check("switch %d to %s" % (i + 1, clock), clock)
+        finally:
+            self.testing = False
+            self._restore_after_test(before)
+        ranges = "; ".join("%s clock (%.3f MHz) measured %.3f-%.3f MHz" % (
+            clock, CLOCK_HZ[clock] / 1e6, min(measured[clock]) / 1e6, max(measured[clock]) / 1e6)
+            for clock in CLOCKS if measured[clock])
+        resets, refused = last['resets'] - first['resets'], last['refused'] - first['refused']
+        text = ("PolyDye clock test: %d switches to each of %s; %s. A first measurement was off %d time%s (the board set "
+                "the clock up again); it stayed off %d time%s (a live run would have fired nothing)"
+                % (count, " and ".join(clocks), ranges, resets, "" if resets == 1 else "s", refused,
+                   "" if refused == 1 else "s"))
+        if wrong:
+            raise gcmd.error("%s. WRONG: %s%s" % (text, ", ".join(wrong[:8]), ", ..." if len(wrong) > 8 else ""))
+        gcmd.respond_info(text + ". OK")
 
     def _spit(self, gcmd, cmd, warm_only):
         """POLYDYE_SPIT, or with warm_only POLYDYE_WARM: a warm-up and no spit columns."""
@@ -1164,14 +1435,14 @@ class PolyDye:
             raise gcmd.error("POLYDYE_SPIT: EXTENDED=1 needs newer PolyDye board firmware; update it from the PolyDye "
                              "page (Board firmware: Update to bundled firmware)")
         if warm_only:
-            warm = gcmd.get_float('SECONDS', 2., above=0., maxval=WARM_MAX_S)
+            warm = gcmd.get_float('SECONDS', 2., above=0., maxval=self.warm_max_s)
             seconds, period = 0., None
         else:
             seconds = gcmd.get_float('SECONDS', 2., above=0., maxval=SPIT_MAX_S)
             if extended and seconds > SPIT_EXT_MAX_S:
                 raise gcmd.error("POLYDYE_SPIT: an EXTENDED=1 spit test lasts at most %g s (SECONDS=%g)"
                                  % (SPIT_EXT_MAX_S, seconds))
-            warm = gcmd.get_float('WARM', 0., minval=0., maxval=WARM_MAX_S)
+            warm = gcmd.get_float('WARM', 0., minval=0., maxval=self.warm_max_s)
             period = gcmd.get_int('PERIOD_US', None, minval=1, maxval=65535)
         for option, wanted in (("PERIOD_US", period is not None), ("WARM" if not warm_only else "it", warm > 0)):
             if wanted and self.spit_run_cmd is None:
@@ -1185,9 +1456,17 @@ class PolyDye:
             raise gcmd.error("POLYDYE_SPIT: at a %d us column period a%s spit test lasts at most %.2f s (%d columns)"
                              % (column_period, "n EXTENDED=1" if extended else "",
                                 max_columns * column_period / 1e6, max_columns))
-        pattern = 'all' if warm_only else gcmd.get('PATTERN', 'all').lower()
+        random = None if warm_only else random_settings(gcmd, cmd)
+        pattern = 'all' if warm_only else gcmd.get('PATTERN', 'stock' if random else 'all').lower()
         if pattern not in SPIT_PATTERNS:
             raise gcmd.error("POLYDYE_SPIT: PATTERN must be all, mid, sparse or stock")
+        if random is not None:
+            if pattern != 'stock':
+                raise gcmd.error("POLYDYE_SPIT: %s go with PATTERN=stock" % (", ".join(RANDOM_KNOBS),))
+            if self.spit_random_cmd is None:
+                raise gcmd.error("POLYDYE_SPIT: %s need newer PolyDye board firmware; update it from the PolyDye page "
+                                 "(Board firmware: Update to bundled firmware). POLYDYE_FIRE_TEST PATTERN=stock takes "
+                                 "them with this one" % (", ".join(RANDOM_KNOBS),))
         if SPIT_PATTERNS.index(pattern) >= self.spit_patterns:
             raise gcmd.error("POLYDYE_SPIT: PATTERN=%s needs newer PolyDye board firmware; update it from the PolyDye "
                              "page (Board firmware: Update to bundled firmware)%s"
@@ -1222,7 +1501,8 @@ class PolyDye:
             self._check_clock(gcmd, cmd, clock)
         warm_words = warm_period = None
         if warm:
-            warm_words = gcmd.get_int('WARM_PULSE', None, minval=1, maxval=WARM_MAX_WORDS)
+            # Bounded by the pulse length below, where older board firmware gets the update hint.
+            warm_words = gcmd.get_int('WARM_PULSE', None, minval=1, maxval=max(PULSE_MAX, self.warm_max_words))
             warm_period = gcmd.get_int('WARM_PERIOD_US', None, minval=1, maxval=65535)
         if gcmd.get_int('CONFIRM', 0) != 1:
             if warm_only:
@@ -1266,7 +1546,8 @@ class PolyDye:
         if warm:
             warm_words, warm_period, warm_columns = self._warm_plan(gcmd, cmd, warm, warm_words, warm_period,
                                                                     fire_tpl, fire_clock)
-        pattern_no = SPIT_PATTERNS.index(pattern)
+        pattern_no = RANDOM_PATTERN if random is not None else SPIT_PATTERNS.index(pattern)
+        pattern_text = random_text(random) if random is not None else TEST_PATTERN_TEXT[pattern]
         used = board = {}
         what = "warm-up" if warm_only else "spit test"
         try:
@@ -1292,13 +1573,15 @@ class PolyDye:
                 used = dict(st, pulse_words=pulse, pulse_us=round(pulse_us(pulse, st.get('bus_clock')), 2))
                 gcmd.respond_info("PolyDye EXTENDED spit test (experimental, can burn out nozzles): %d %s columns %s, "
                                   "%s; the configured pulse stays %d words"
-                                  % (columns, TEST_PATTERN_TEXT[pattern], rate, cartridge_text(used),
-                                     st['pulse_words']))
+                                  % (columns, pattern_text, rate, cartridge_text(used), st['pulse_words']))
             else:
                 gcmd.respond_info("PolyDye spit test: %d %s columns %s, %s"
-                                  % (columns, TEST_PATTERN_TEXT[pattern], rate, cartridge_text(st)))
+                                  % (columns, pattern_text, rate, cartridge_text(st)))
+            if random is not None:
+                self.spit_random_cmd.send([self.oid, random['density'], random['repeat'], random['colors'],
+                                           random['first'], random['last'], random['per_pulse']])
             # The board starts it no sooner than 0.1 s after the boost came on.
-            if period is not None or warm:
+            if period is not None or warm or random is not None:
                 self.spit_run_cmd.send([self.oid, columns, pattern_no, pulse if extended else 0, column_period,
                                         warm_columns, warm_words or 0, warm_period or 0])
             elif extended:
@@ -1306,12 +1589,20 @@ class PolyDye:
             else:
                 self.spit_cmd.send([self.oid, columns, pattern_no])
             end = reactor.monotonic() + seconds + warm + 5.
+            clock_told = False
             while True:
                 reactor.pause(reactor.monotonic() + 0.2)
                 if self.printer.is_shutdown():
                     raise gcmd.error(self._test_shutdown_text(cmd, what, warm))
-                if not self._fresh_status()['running']:
+                now = self._fresh_status()
+                if not now['running']:
                     break
+                # The clock the columns go out at, once: the board checked it before the first column (firmware with
+                # the check), and holds every column to it.
+                if not clock_told and now.get('bus_hz_measured'):
+                    clock_told = True
+                    gcmd.respond_info("PolyDye board: %s" % (measured_clock_text(
+                        now['bus_hz_measured'], now['bus_hz'], now.get('bus_clock'), self.bus_hz_check),))
                 if reactor.monotonic() > end:
                     raise gcmd.error("%s: the board didn't finish the %s" % (cmd, what))
         finally:
@@ -1334,31 +1625,65 @@ class PolyDye:
             cartridge_text(dict(used, bus_hz_measured=st.get('bus_hz_measured'))), back))
 
     def _test_shutdown_text(self, cmd, what, warm):
-        """Why Klipper shut down during a spit test or warm-up: with what the board says stopped it, if it says."""
+        """Why Klipper shut down during a spit test or warm-up: with what the board says stopped it, if it says, and
+        the bus clock it last measured."""
         run = self._last_run()
         fault = None if run is None else run_fault(run)
+        clock = self._measured_clock()
+        clock = "; %s" % (clock[0],) if clock else ""
         if fault is None:
-            return "%s: Klipper shut down during the %s" % (cmd, what)
+            return "%s: Klipper shut down during the %s%s" % (cmd, what, clock)
         if warm and run['warm_left']:
             what = "warm-up"
-        return "%s: Klipper shut down during the %s: %s, after %s" % (cmd, what, fault, run_text(run))
+        return "%s: Klipper shut down during the %s: %s, after %s%s" % (cmd, what, fault, run_text(run), clock)
+
+    def _measured_clock(self):
+        """The bus clock the board last measured (its clock check before a live run, or the last column) as (text,
+        wrong: refused by the board's clock check); None if the board can't say. Also works after a shutdown."""
+        if getattr(self, 'query_clock_cmd', None) is None:
+            return None
+        try:
+            clock = self.query_clock_cmd.send([self.oid])
+        except Exception as e:  # the board gone (unplugged): nothing to report
+            logging.info("polydye: couldn't ask the board about its bus clock: %s", e)
+            return None
+        if not clock['measured_hz']:
+            return None
+        name = CLOCKS[clock['stock']] if clock['stock'] < len(CLOCKS) else None
+        nominal, check = CLOCK_HZ.get(name, clock['nominal_hz']), getattr(self, 'bus_hz_check', None)
+        return (measured_clock_text(clock['measured_hz'], nominal, name, check),
+                clock_wrong(clock['measured_hz'], nominal, check))
 
     def _warm_plan(self, gcmd, cmd, warm, words, period, template, clock):
         """The warm-up's pulse, period and column count for `warm` seconds: by default the longest pulse within
-        WARM_MAX_US at the clock (2 words at ours and stock, 1 at half) as fast as the column allows."""
+        WARM_SHORT_US at the clock (2 words at ours and stock, 1 at half), as fast as the column and the board's heater
+        duty limit allow. Longer pulses, up to the board's limit (2.9 us on board firmware with the duty limit), heat
+        harder; the duty limit then sets the shortest period (500 us at 2.9 us)."""
         clock = clock or 'ours'
         if words is None:
-            words = max(w for w in range(1, WARM_MAX_WORDS + 1) if pulse_us(w, clock) <= WARM_MAX_US + 1e-9)
-        if pulse_us(words, clock) > WARM_MAX_US + 1e-9:
-            raise gcmd.error("%s: WARM_PULSE=%d is %.2f us at the %s clock; a warm-up pulse is at most %.2f us (1 word "
-                             "there)" % (cmd, words, pulse_us(words, clock), clock, WARM_MAX_US))
+            words = max(w for w in range(1, WARM_OLD_WORDS + 1) if pulse_us(w, clock) <= WARM_SHORT_US + 1e-9)
+        us = pulse_us(words, clock)
+        if us > self.warm_max_us + 1e-9 or words > self.warm_max_words:
+            if self.warm_duty_ppm is None and us <= PULSE_MAX_US + 1e-9:
+                raise gcmd.error("%s: WARM_PULSE=%d (%.2f us) needs newer PolyDye board firmware, which takes warm-up "
+                                 "pulses of up to %.1f us; update it from the PolyDye page (Board firmware: Update to "
+                                 "bundled firmware). This one takes at most %.2f us"
+                                 % (cmd, words, us, PULSE_MAX_US, self.warm_max_us))
+            raise gcmd.error("%s: WARM_PULSE=%d is %.2f us at the %s clock; a warm-up pulse is at most %.2f us"
+                             % (cmd, words, us, clock, self.warm_max_us))
         fastest = min_spit_period_us(template, words, clock)
+        # The board's rule in whole ns and us: pulse_ns * 1e6 / period_us at most warm_duty_ppm.
+        duty_min = 0 if self.warm_duty_ppm is None else -(-pulse_ns(words, clock) * 1000 // self.warm_duty_ppm)
         if period is None:
-            period = max(fastest, int(math.ceil(warm * 1e6 / WARM_MAX_COLUMNS)))
+            period = max(fastest, duty_min, int(math.ceil(warm * 1e6 / WARM_MAX_COLUMNS)))
         elif period < fastest:
             raise gcmd.error("%s: WARM_PERIOD_US=%d is too short for %s at the %s clock: the column takes %d us on the "
                              "bus, so the warm-up period must be at least %d us"
                              % (cmd, period, template, clock, column_us(template, words, clock), fastest))
+        elif period < duty_min:
+            raise gcmd.error("%s: WARM_PERIOD_US=%d is too short for a %.2f us warm-up pulse: a warm-up's heater duty is "
+                             "at most %.2f %%, so its period must be at least %d us"
+                             % (cmd, period, us, self.warm_duty_ppm / 1e4, duty_min))
         columns = max(1, int(round(warm * 1e6 / period)))
         if columns > WARM_MAX_COLUMNS:
             raise gcmd.error("%s: at a %d us warm-up period the warm-up lasts at most %.2f s (%d columns)"
@@ -1384,6 +1709,8 @@ class PolyDye:
         return dict(self.last_status, last_pass=self.last_pass, pass_axis=self.pass_axis, offset_x=self.offset_x,
                     offset_y=self.offset_y, direction_trim=self.direction_trim,
                     spit_patterns=list(SPIT_PATTERNS[:self.spit_patterns]),
+                    spit_random=self.spit_random_cmd is not None, warm_max_us=self.warm_max_us,
+                    warm_max_s=self.warm_max_s, warm_duty_ppm=self.warm_duty_ppm,
                     bus_clocks=list(CLOCKS[:self.clock_count]), templates=list(TEMPLATES[:self.template_count]),
                     board_soft_reset=self.board_soft_reset)
 

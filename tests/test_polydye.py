@@ -8,6 +8,7 @@ import os
 import sys
 import types
 import unittest
+import zlib
 from unittest import mock
 
 # polydye.py imports klippy's "mcu" module at load time; the pure functions under test don't use it.
@@ -376,6 +377,11 @@ class TestCleanup(unittest.TestCase):
         pd.template_count = len(polydye.TEMPLATES)
         pd.spit_ext_cmd = pd.spit_run_cmd = None
         pd.query_run_cmd = None
+        pd.spit_random_cmd = None
+        pd.warm_max_words, pd.warm_max_us, pd.warm_max_s = polydye.WARM_OLD_WORDS, polydye.WARM_OLD_US, polydye.WARM_OLD_S
+        pd.warm_duty_ppm = None
+        pd.query_clock_cmd = pd.bus_hz_check = None
+        pd.check_clock_cmd = None
         pd.pulse_max_ext_us = polydye.PULSE_MAX_EXT_US
 
         def mode(args):
@@ -678,15 +684,17 @@ class TestCleanup(unittest.TestCase):
             pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., PULSE=11, EXTENDED=1, PATTERN='all', CONFIRM=1))
         self.assertEqual(board.sent, [])
 
-    def spit(self, pd=None, board=None, command='cmd_POLYDYE_SPIT', **params):
-        """Runs POLYDYE_SPIT (or `command`) on a board with every spit command; returns (board, replies, commands
-        sent)."""
+    def spit(self, pd=None, board=None, command='cmd_POLYDYE_SPIT', has_random=True, **params):
+        """Runs POLYDYE_SPIT (or `command`) on a board with every spit command (without the random pattern's knobs
+        unless has_random); returns (board, replies, commands sent)."""
         if pd is None:
             pd, board = self.make(fail_on="NOTHING")
         sent = []
         pd.spit_cmd = types.SimpleNamespace(send=lambda args: sent.append(('spit',) + tuple(args[1:])))
         pd.spit_ext_cmd = types.SimpleNamespace(send=lambda args: sent.append(('ext',) + tuple(args[1:])))
         pd.spit_run_cmd = types.SimpleNamespace(send=lambda args: sent.append(('run',) + tuple(args[1:])))
+        if has_random:
+            pd.spit_random_cmd = types.SimpleNamespace(send=lambda args: sent.append(('random',) + tuple(args[1:])))
         gcmd = self.gcmd(CONFIRM=1, **params)
         replies = []
         gcmd.respond_info = replies.append
@@ -767,8 +775,12 @@ class TestCleanup(unittest.TestCase):
         board, replies, sent = self.spit(SECONDS=1., CLOCK='half', PULSE=3, PATTERN='all', WARM=2.)
         self.assertIn("POLYDYE_CARTRIDGE PULSE=3 CLOCK=half", board.sent)
         self.assertEqual(sent, [('run', 1000, 0, 0, 1000, 6349, 1, 315)])
-        with self.assertRaisesRegex(RuntimeError, "WARM_PULSE=2 is 1.20 us at the half clock"):
+        # This board firmware takes warm-up pulses of up to 0.75 us; newer takes up to 2.9 us.
+        with self.assertRaisesRegex(RuntimeError, "WARM_PULSE=2 \\(1.20 us\\) needs newer PolyDye board firmware"):
             self.spit(SECONDS=1., CLOCK='half', PULSE=3, PATTERN='all', WARM=2., WARM_PULSE=2)
+        with self.assertRaisesRegex(RuntimeError, "WARM_PULSE=12 is 3.60 us at the ours clock; a warm-up pulse is at "
+                                                  "most 0.75 us"):
+            self.spit(SECONDS=1., PATTERN='all', WARM=2., WARM_PULSE=12)
         with self.assertRaisesRegex(RuntimeError, "warm-up period must be at least 168 us"):
             self.spit(SECONDS=1., PATTERN='all', WARM=1., WARM_PERIOD_US=150)
         _, _, sent = self.spit(SECONDS=1., PATTERN='all', WARM=1., WARM_PULSE=1, WARM_PERIOD_US=500)
@@ -793,6 +805,148 @@ class TestCleanup(unittest.TestCase):
             pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., PATTERN='all', WARM=2., CONFIRM=1))
         self.assertEqual(board.sent, [])
 
+    def test_spit_with_the_random_pattern_knobs(self):
+        # Any knob means PATTERN=stock with its timing; knobs not given are the stock pattern's.
+        board, replies, sent = self.spit(SECONDS=3., PERIOD_US=508, PER_PULSE=1)
+        self.assertIn("POLYDYE_CARTRIDGE TEMPLATE=color_b_late PULSE=6 CLOCK=stock", board.sent)
+        self.assertEqual(sent, [('random', 255, 2, 7, 14, 85, 1), ('run', 5906, 4, 0, 508, 0, 0, 0)])
+        self.assertIn("5906 random: 1 heater on every fire pulse of positions 14-85 of cyan/magenta/yellow, each "
+                      "column twice columns every 508 us", replies[0])
+        _, replies, sent = self.spit(SECONDS=1., DENSITY=50., COLORS='M', FIRST=20, LAST=60, REPEAT=1)
+        self.assertEqual(sent, [('random', 512, 1, 2, 20, 60, 0), ('run', 1000, 4, 0, 1000, 0, 0, 0)])
+        self.assertIn("random: 50.0 % of positions 20-60 of magenta, each column once", replies[0])
+        # With the warm-up and EXTENDED too, in the same board run.
+        _, _, sent = self.spit(SECONDS=1., PULSE=12, EXTENDED=1, REPEAT=3, WARM=1., PERIOD_US=508)
+        self.assertEqual(sent[0], ('random', 255, 3, 7, 14, 85, 0))
+        self.assertEqual(sent[1][:5], ('run', 1969, 4, 12, 508))
+        for params, message in ((dict(PATTERN='all', DENSITY=10.), "go with PATTERN=stock"),
+                                (dict(COLORS='cmk'), "COLORS must be any of c, m and y"),
+                                (dict(COLORS='cc'), "COLORS must be any of c, m and y"),
+                                (dict(FIRST=50, LAST=40), "FIRST=50 is after LAST=40"),
+                                (dict(DENSITY=10., TEMPLATE='black_b'), "PATTERN=stock is for a colour cartridge")):
+            with self.assertRaisesRegex(RuntimeError, message):
+                self.spit(SECONDS=1., **params)
+        # Older board firmware: the knobs are refused before anything is sent, with where to find them.
+        pd, board = self.make(fail_on="NOTHING")
+        with self.assertRaisesRegex(RuntimeError, "need newer PolyDye board firmware.*POLYDYE_FIRE_TEST PATTERN=stock "
+                                                  "takes them with this one"):
+            self.spit(pd, board, has_random=False, SECONDS=1., DENSITY=10.)
+        self.assertEqual(board.sent, [])
+
+    def newer_warm_up(self, pd):
+        """Board firmware with the warm-up's duty limit (POLYDYE_WARM_MAX_DUTY_PPM)."""
+        pd.warm_max_words, pd.warm_max_us, pd.warm_max_s, pd.warm_duty_ppm = 12, 2.9, 30., 5800
+
+    def test_long_warm_up_then_the_stock_pattern_in_one_run(self):
+        pd, board = self.make(fail_on="NOTHING")
+        self.newer_warm_up(pd)
+        # Brett's recipe: deskjet's all-nozzle 2.7 us (9 words at our clock) every 508 us for 20 s, then the stock
+        # pattern straight after, in the same run and so with the same template and clock (1.8 us there).
+        board, replies, sent = self.spit(pd, board, SECONDS=3., PATTERN='stock', TEMPLATE='deskjet', CLOCK='ours',
+                                         PULSE=6, PERIOD_US=508, WARM=20., WARM_PULSE=9, WARM_PERIOD_US=508)
+        self.assertIn("POLYDYE_CARTRIDGE TEMPLATE=deskjet PULSE=6 CLOCK=ours", board.sent)
+        self.assertEqual(sent, [('run', 5906, 3, 0, 508, 39370, 9, 508)])
+        self.assertIn("warm-up 20.0 s: 39370 all-nozzle columns every 508 us, 9-word pulses of 2.70 us", replies[0])
+        board, replies, sent = self.spit(pd, board, SECONDS=3., PATTERN='stock', PERIOD_US=508, WARM=26.,
+                                         WARM_PULSE=8, WARM_PERIOD_US=508)
+        # 8 words at the stock clock are 2.80 us: every 508 us a heater duty of 0.55 %, within 0.58 %.
+        self.assertEqual(sent, [('run', 5906, 3, 0, 508, 51181, 8, 508)])
+        self.assertIn("warm-up 26.0 s: 51181 all-nozzle columns every 508 us, 8-word pulses of 2.80 us", replies[0])
+        # By default as fast as the duty allows: 2.80 us needs at least 483 us.
+        _, _, sent = self.spit(pd, board, SECONDS=3., PATTERN='stock', PERIOD_US=508, WARM=20., WARM_PULSE=8)
+        self.assertEqual(sent[0][5:], (41408, 8, 483))
+        with self.assertRaisesRegex(RuntimeError, "WARM_PERIOD_US=482 is too short for a 2.80 us warm-up pulse: a "
+                                                  "warm-up's heater duty is at most 0.58 %, so its period must be at "
+                                                  "least 483 us"):
+            self.spit(pd, board, SECONDS=1., PATTERN='stock', WARM=5., WARM_PULSE=8, WARM_PERIOD_US=482)
+        with self.assertRaisesRegex(RuntimeError, "WARM_PULSE=9 is 3.15 us at the stock clock; a warm-up pulse is at "
+                                                  "most 2.90 us"):
+            self.spit(pd, board, SECONDS=1., PATTERN='stock', WARM=5., WARM_PULSE=9)
+        # The warm-up's own column limit.
+        with self.assertRaisesRegex(RuntimeError, "at a 300 us warm-up period the warm-up lasts at most 19.66 s"):
+            self.spit(pd, board, SECONDS=1., PATTERN='all', WARM=25., WARM_PULSE=1, WARM_PERIOD_US=300)
+        self.assertEqual((board.boost, board.template, board.pulse, board.clock), (False, 'color_a', 8, 'ours'))
+
+    def test_shutdown_text_has_the_measured_bus_clock(self):
+        pd, _ = self.make(fail_on="NOTHING")
+        pd.query_clock_cmd = types.SimpleNamespace(send=lambda args: {'stock': 1, 'nominal_hz': 2857142,
+                                                                      'measured_hz': 18491000})
+        pd.bus_hz_check = (5, 8)
+        self.assertEqual(pd._test_shutdown_text("POLYDYE_SPIT", "spit test", 0.),
+                         "POLYDYE_SPIT: Klipper shut down during the spit test; bus clock measured 18.491 MHz (stock "
+                         "clock 2.857 MHz, +547.2 %): WRONG, outside the board's +5/-8 % clock check, so it fires "
+                         "nothing at it")
+        self.assertEqual(polydye.measured_clock_text(2819000, 2857142, 'stock', (5, 8)),
+                         "bus clock measured 2.819 MHz (stock clock 2.857 MHz, -1.3 %), within the board's +5/-8 % "
+                         "clock check")
+        # Older board firmware doesn't check it.
+        self.assertEqual(polydye.measured_clock_text(3251000, 3333333, 'ours'),
+                         "bus clock measured 3.251 MHz (ours clock 3.333 MHz, -2.5 %)")
+
+    def clock_test(self, bad=(), **params):
+        """POLYDYE_CLOCK_TEST on a board whose clock checks fail at the call numbers in `bad`; returns (board, replies,
+        error or None)."""
+        pd, board = self.make(fail_on="NOTHING")
+        board.pulse = 9  # too long for the stock clock: the test uses 6 words and puts 9 back
+        calls = []
+
+        def check(args):
+            calls.append(board.clock)
+            n = len(calls)
+            hz = 18491000 if n in bad else int(polydye.CLOCK_HZ[board.clock] * 0.986)
+            return {'ok': 0 if n in bad else 1, 'measured_hz': hz, 'probes': 3 * n, 'resets': 2 * len(
+                [b for b in bad if b <= n]), 'refused': len([b for b in bad if b <= n])}
+        pd.check_clock_cmd = types.SimpleNamespace(send=check)
+        replies = []
+        gcmd = self.gcmd(**params)
+        gcmd.respond_info = replies.append
+        try:
+            pd.cmd_POLYDYE_CLOCK_TEST(gcmd)
+            error = None
+        except RuntimeError as e:
+            error = str(e)
+        board.calls = calls
+        return board, replies, error
+
+    def test_clock_test_switches_and_reports(self):
+        board, replies, error = self.clock_test(COUNT=3)
+        self.assertIsNone(error)
+        self.assertEqual(board.calls, ['ours'] + ['ours', 'stock'] * 3)
+        self.assertEqual(replies, ["PolyDye clock test: 3 switches to each of ours and stock; ours clock (3.333 MHz) "
+                                   "measured 3.287-3.287 MHz; stock clock (2.857 MHz) measured 2.817-2.817 MHz. A first "
+                                   "measurement was off 0 times (the board set the clock up again); it stayed off 0 "
+                                   "times (a live run would have fired nothing). OK"])
+        self.assertEqual((board.pulse, board.clock, board.boost), (9, 'ours', False))
+        self.assertEqual(board.violations, [])
+
+    def test_clock_test_names_each_wrong_switch(self):
+        board, replies, error = self.clock_test(bad=(5,), COUNT=3)
+        self.assertIn("it stayed off 1 time (a live run would have fired nothing). WRONG: switch 2 to stock: "
+                      "18.491 MHz", error)
+        self.assertIn("stock clock (2.857 MHz) measured 2.817-18.491 MHz", error)
+        self.assertEqual((board.pulse, board.clock), (9, 'ours'))
+        # Older board firmware, PolyDye on: refused before anything is switched.
+        pd, board = self.make(fail_on="NOTHING")
+        with self.assertRaisesRegex(RuntimeError, "POLYDYE_CLOCK_TEST needs newer PolyDye board firmware"):
+            pd.cmd_POLYDYE_CLOCK_TEST(self.gcmd())
+        pd.check_clock_cmd = types.SimpleNamespace(send=lambda args: self.fail("checked"))
+        board.boost = True
+        with self.assertRaisesRegex(RuntimeError, "turn PolyDye off first"):
+            pd.cmd_POLYDYE_CLOCK_TEST(self.gcmd())
+        self.assertEqual(board.sent, [])
+
+    def test_fire_test_prints_the_random_pattern(self):
+        pd, board = self.make(fail_on="NOTHING")
+        pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b_late:6:stock", X=80., Y=60., SPACING=20., COLUMNS=601,
+                                           UPLOAD=1, LAYER=0, PASS=0, DENSITY=25., PER_PULSE=0))
+        # Whole repeats of each random column: 300 random columns, each twice.
+        self.assertIn("POLYDYE_UPLOAD_TEST_PASS LAYER=0 PASS=0 COLUMNS=300 PATTERN=stock DENSITY=25.0 REPEAT=2 "
+                      "COLORS=cmy FIRST=14 LAST=85 PER_PULSE=0", board.sent)
+        self.assertEqual((board.boost, board.template, board.pulse, board.clock), (False, 'color_a', 8, 'ours'))
+        with self.assertRaisesRegex(RuntimeError, "go with PATTERN=stock"):
+            pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:6", X=80., Y=60., SPACING=20., COLUMNS=600,
+                                               UPLOAD=1, LAYER=0, PASS=0, PATTERN='all', COLORS='c'))
+
     def test_column_times_match_the_board(self):
         # printcart_column_us() in the board firmware's host tests: 148 us for color_b at our clock, 295 us at half.
         self.assertEqual(polydye.column_us('color_b', 6, 'ours'), 148)
@@ -813,10 +967,9 @@ class TestCleanup(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "PERIOD_US needs newer PolyDye board firmware"):
             pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., PATTERN='all', PERIOD_US=508, CONFIRM=1))
         self.assertEqual(board.sent, [])
-        # The fire test has no stock pattern.
-        with self.assertRaisesRegex(RuntimeError, "PATTERN must be all, mid or sparse"):
+        with self.assertRaisesRegex(RuntimeError, "PATTERN must be all, mid, sparse or stock"):
             pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:6", X=80., Y=60., SPACING=20., COLUMNS=600,
-                                               UPLOAD=1, LAYER=0, PASS=0, PATTERN='stock'))
+                                               UPLOAD=1, LAYER=0, PASS=0, PATTERN='dots'))
 
     def test_fire_test_uploads_sparse_on_any_board_firmware(self):
         pd, board = self.make(fail_on="NOTHING")
@@ -896,6 +1049,75 @@ class TestCleanup(unittest.TestCase):
         pd.testing, pd.query_run_cmd = False, None
         pd._handle_shutdown()
         self.assertEqual((callbacks, len(replies)), ([], 1))
+        # A pass refused at a wrong bus clock never ran: the board's measurement says why.
+        pd, _ = self.with_run_report()
+        pd.printer = types.SimpleNamespace(get_reactor=lambda: reactor, lookup_object=lambda name: objects[name])
+        pd.status_timer, pd.testing, pd.bus_hz_check = None, False, (5, 8)
+        pd.query_clock_cmd = types.SimpleNamespace(send=lambda args: {'stock': 1, 'nominal_hz': 2857142,
+                                                                      'measured_hz': 18491000})
+        pd._handle_shutdown()
+        with self.assertLogs(level='WARNING'):
+            callbacks.pop()(0.)
+        self.assertTrue(replies[-1].startswith("PolyDye board: bus clock measured 18.491 MHz (stock clock 2.857 MHz"))
+
+
+class RandomPattern(unittest.TestCase):
+    """The random pattern's columns are the board's (printcart_pattern_random), so a fire test prints what a spit test
+    fires."""
+
+    @staticmethod
+    def crc(r, columns=64):
+        plan, crc = polydye.random_plan(r), 0
+        for k in range(columns):
+            crc = zlib.crc32(polydye.random_column(k, r, plan), crc)
+        return crc
+
+    @staticmethod
+    def fired(col):
+        """The (colour, position) of every heater a column fires."""
+        out = set()
+        for c in range(3):
+            for p in range(polydye.COLOR_POSITIONS):
+                if col[polydye.COLOR_BYTE_ORDER[c][p % 14] + 14 * c] >> (p // 14) & 1:
+                    out.add((c, p))
+        return out
+
+    def test_columns_match_the_board_firmware(self):
+        # The vectors of test_random_pattern in the board firmware's host tests.
+        self.assertEqual(self.crc(polydye.STOCK_RANDOM), 0xfc3951e1)
+        self.assertEqual(self.crc(dict(density=512, repeat=1, colors=1, first=0, last=111, per_pulse=0)), 0x502d7ac6)
+        self.assertEqual(self.crc(dict(density=0, repeat=2, colors=6, first=10, last=99, per_pulse=3)), 0xebc10779)
+
+    def test_stock_settings(self):
+        r = polydye.STOCK_RANDOM
+        cols = [polydye.random_column(k, r) for k in range(400)]
+        self.assertTrue(all(cols[k] == cols[k + 1] for k in range(0, 400, 2)))
+        fired = [self.fired(col) for col in cols[::2]]
+        self.assertTrue(all(14 <= p <= 85 for f in fired for _, p in f))
+        rate = sum(map(len, fired)) / (200. * 3 * 72)
+        self.assertAlmostEqual(rate, 255 / 1024., delta=0.01)
+
+    def test_knobs(self):
+        r = dict(polydye.STOCK_RANDOM, colors=2, first=30, last=40, repeat=3, density=1024)
+        cols = [polydye.random_column(k, r) for k in range(6)]
+        self.assertEqual(self.fired(cols[0]), {(1, p) for p in range(30, 41)})
+        self.assertEqual(cols[0], cols[2])
+        # PER_PULSE: exactly that many of the eligible heaters on every F3 and every F5 pulse.
+        r = dict(polydye.STOCK_RANDOM, per_pulse=2, repeat=1)
+        for k in range(20):
+            col = polydye.random_column(k, r)
+            for packet in range(14):
+                for half in (0x0f, 0xf0):
+                    self.assertEqual(sum(bin(col[14 * line + packet] & half).count('1') for line in range(3)), 2)
+
+    def test_test_pass_data(self):
+        data, total = polydye.test_pass_data('stock', 5, 2)
+        self.assertEqual(total, 10)
+        self.assertEqual(data, b"".join(polydye.random_column(k, polydye.STOCK_RANDOM) for k in range(10)))
+        r = dict(polydye.STOCK_RANDOM, colors=4)
+        data, total = polydye.test_pass_data('stock', 3, 1, r)
+        self.assertEqual(data, b"".join(polydye.random_column(k, dict(r, repeat=1)) for k in range(3)))
+        self.assertEqual(polydye.parse_colors("yC"), 5)
 
 
 class BuildConfig(unittest.TestCase):
@@ -908,6 +1130,10 @@ class BuildConfig(unittest.TestCase):
         pd.oid, pd.cartridge_template, pd.bus_clock, pd.pulse_words = 0, template, bus_clock, pulse_words
         pd.spit_patterns = pd.clock_count = pd.template_count = 0
         pd.spit_ext_cmd = pd.spit_run_cmd = None
+        pd.spit_random_cmd = None
+        pd.warm_max_words, pd.warm_max_us, pd.warm_max_s = polydye.WARM_OLD_WORDS, polydye.WARM_OLD_US, polydye.WARM_OLD_S
+        pd.warm_duty_ppm = None
+        pd.bus_hz_check = None
         pd.pulse_max_ext_us = polydye.PULSE_MAX_EXT_US
         pd.printer = types.SimpleNamespace(config_error=ConfigError)
         sent = []
@@ -949,6 +1175,21 @@ class BuildConfig(unittest.TestCase):
         self.assertIn("polydye_set_template oid=0 template=5", pd.test_sent)
         pd.last_status, pd.last_pass, pd.pass_axis, pd.offset_x, pd.offset_y, pd.direction_trim = {}, None, 'y', 0, 0, 0
         self.assertEqual(pd.get_status(0.)['templates'][-1], 'deskjet')
+
+    def test_warm_up_and_clock_check_follow_the_board(self):
+        pd, _ = self.build({}, None, None)
+        self.assertEqual((pd.warm_max_words, pd.warm_max_us, pd.warm_max_s, pd.warm_duty_ppm, pd.bus_hz_check),
+                         (2, 0.75, 10., None, None))
+        pd, _ = self.build({'POLYDYE_WARM_MAX_WORDS': 12, 'POLYDYE_WARM_MAX_NS': 2900, 'POLYDYE_WARM_MAX_DUTY_PPM': 5800,
+                            'POLYDYE_WARM_MAX_MS': 30000, 'POLYDYE_BUS_HZ_FAST_PCT': 5, 'POLYDYE_BUS_HZ_SLOW_PCT': 8},
+                           None, None)
+        self.assertEqual((pd.warm_max_words, pd.warm_max_us, pd.warm_max_s, pd.warm_duty_ppm, pd.bus_hz_check),
+                         (12, 2.9, 30., 5800, (5, 8)))
+        self.assertIsNotNone(pd.spit_random_cmd)
+        pd.last_status, pd.last_pass, pd.pass_axis, pd.offset_x, pd.offset_y, pd.direction_trim = {}, None, 'y', 0, 0, 0
+        st = pd.get_status(0.)
+        self.assertEqual((st['spit_random'], st['warm_max_us'], st['warm_max_s'], st['warm_duty_ppm']),
+                         (True, 2.9, 30., 5800))
 
     def test_extended_limit_follows_the_board(self):
         # The board says how long an extended pulse may be; firmware with the extended spit but no constant has 4.0 us.

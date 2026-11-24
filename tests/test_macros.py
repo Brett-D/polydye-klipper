@@ -124,6 +124,15 @@ class FireTest(unittest.TestCase):
         lines = run(self.macros, "PD_FIRE_TEST", homed="xyz")
         self.assertEqual(lines, ["POLYDYE_FIRE_TEST X=70.0 Y=60.0 Z=0.5 SPACING=18.0 PATTERN=all"])
 
+    def test_passes_the_random_pattern_knobs(self):
+        # Any knob means the stock pattern unless PATTERN says otherwise (POLYDYE_FIRE_TEST refuses the mix).
+        lines = run(self.macros, "PD_FIRE_TEST", "DENSITY=50 COLORS=m PER_PULSE=2 COLUMNS=300", homed="xyz")
+        self.assertEqual(lines, ["POLYDYE_FIRE_TEST X=70.0 Y=60.0 Z=0.5 SPACING=18.0 PATTERN=stock COLUMNS=300 "
+                                 "DENSITY=50 COLORS=m PER_PULSE=2"])
+        lines = run(self.macros, "PD_FIRE_TEST", "PATTERN=Stock REPEAT=3 FIRST=20 LAST=40", homed="xyz")
+        self.assertEqual(lines, ["POLYDYE_FIRE_TEST X=70.0 Y=60.0 Z=0.5 SPACING=18.0 PATTERN=stock REPEAT=3 "
+                                 "FIRST=20 LAST=40"])
+
     def test_refuses_during_a_print_before_homing(self):
         for state in ("printing", "paused"):
             with self.assertRaisesRegex(MacroError, "not during a print"):

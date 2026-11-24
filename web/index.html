@@ -188,7 +188,9 @@
       <p class="hint">Prints a stripe for each template, fire pulse and bus clock, side by side, so you can see which
         settings put ink down. The default stripes compare our timing with the stock PolyDye firmware's (color_b vs
         color_b_late, our clock vs stock) at pulse 6 and the longest allowed (9 words, 8 with the stock clock); add
-        stripes such as color_b:3:half,color_b:4:half to try half the bus clock. Tape paper on the bed and fit the
+        stripes such as color_b:3:half,color_b:4:half to try half the bus clock. &ldquo;Like stock&rdquo; prints the
+        stock firmware's random pattern, the one that ejects ink on a cold head, with the same knobs as the spit test.
+        Tape paper on the bed and fit the
         cartridge first. The
         test homes if needed, lowers the nozzle to Z and puts the settings back afterwards. Stripes run along the
         pass axis.</p>
@@ -201,8 +203,19 @@
           <select name="pattern">
             <option value="all">all</option><option value="mid">positions 14-90 (as stock)</option>
             <option value="sparse">sparse: one per fire pulse</option>
+            <option value="stock">like stock: random, each column twice</option>
           </select>
         </label>
+        <label class="knob">Density (%)<input name="density" type="number" step="any" min="0" max="100"
+          placeholder="24.9"></label>
+        <label class="knob">Repeat<input name="repeat" type="number" step="1" min="1" max="16" placeholder="2"></label>
+        <label class="knob">Colours<input name="colors" maxlength="3" placeholder="cmy"></label>
+        <label class="knob">First position<input name="first" type="number" step="1" min="0" max="111"
+          placeholder="14"></label>
+        <label class="knob">Last position<input name="last" type="number" step="1" min="0" max="111"
+          placeholder="85"></label>
+        <label class="knob">Heaters per pulse<input name="per_pulse" type="number" step="1" min="0" max="12"
+          placeholder="by density"></label>
         <label class="wide">Stripes (template:pulse words[:clock], &hellip;)
           <input name="stripes" value="color_b:6:ours,color_b_late:6:ours,color_b:6:stock,color_b_late:6:stock,color_b:9:ours,color_b_late:9:ours,color_b:8:stock,color_b_late:8:stock"></label>
       </form>
@@ -219,9 +232,12 @@
         heaters' supply. The bus clock &ldquo;half&rdquo; (1.667 MHz) gives the level shifters twice the time for every
         edge; use a 3 or 4-word pulse with it (1.8 or 2.4 µs). The deskjet template copies a real HP DeskJet's
         timing. &ldquo;Like stock&rdquo; fires the way the stock PolyDye firmware does: a random quarter of positions
-        14-85, each column twice, with color_b_late, the stock clock and 6 words unless you pick others. The column
-        period is 1000 µs unless you set one (the stock firmware's is about 508 µs; at least the column plus 20 µs,
-        and at most 10000 columns).</p>
+        14-85, each column twice, with color_b_late, the stock clock and 6 words unless you pick others; its knobs
+        (density, repeat, colours, positions, or an exact number of heaters per fire pulse) start from those values.
+        The column period is 1000 µs unless you set one (the stock firmware's is about 508 µs; at least the column plus
+        20 µs, and at most 10000 columns). A warm-up first fires every nozzle for that many seconds right before the
+        spit, in the same run, so the head doesn't cool in between: short pulses by default, up to 2.9 µs (8 words at
+        the stock clock) with a heater duty of at most 0.58 % (e.g. 8 words every 508 µs).</p>
       <form id="spit-form" class="compact">
         <label>Seconds<input name="seconds" type="number" step="0.5" min="0.5" max="10" value="2"></label>
         <label>Template
@@ -249,6 +265,21 @@
         </label>
         <label>Column period (µs)<input name="period" type="number" step="1" min="1" max="65535"
           placeholder="1000"></label>
+        <label class="knob">Density (%)<input name="density" type="number" step="any" min="0" max="100"
+          placeholder="24.9"></label>
+        <label class="knob">Repeat<input name="repeat" type="number" step="1" min="1" max="16" placeholder="2"></label>
+        <label class="knob">Colours<input name="colors" maxlength="3" placeholder="cmy"></label>
+        <label class="knob">First position<input name="first" type="number" step="1" min="0" max="111"
+          placeholder="14"></label>
+        <label class="knob">Last position<input name="last" type="number" step="1" min="0" max="111"
+          placeholder="85"></label>
+        <label class="knob">Heaters per pulse<input name="per_pulse" type="number" step="1" min="0" max="12"
+          placeholder="by density"></label>
+        <label>Warm-up first (s)<input name="warm" type="number" step="any" min="0" max="30" placeholder="0"></label>
+        <label>Warm-up pulse (words)<input name="warm_pulse" type="number" step="1" min="1" max="12"
+          placeholder="short"></label>
+        <label>Warm-up period (µs)<input name="warm_period" type="number" step="1" min="1" max="65535"
+          placeholder="fastest"></label>
       </form>
       <div class="buttons">
         <button id="spit-btn" class="danger">Spit test&hellip;</button>
