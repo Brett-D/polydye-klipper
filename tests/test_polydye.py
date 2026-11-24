@@ -375,6 +375,7 @@ class TestCleanup(unittest.TestCase):
         pd.clock_count = len(polydye.CLOCKS)
         pd.template_count = len(polydye.TEMPLATES)
         pd.spit_ext_cmd = pd.spit_run_cmd = None
+        pd.query_run_cmd = None
         pd.pulse_max_ext_us = polydye.PULSE_MAX_EXT_US
 
         def mode(args):
@@ -824,6 +825,77 @@ class TestCleanup(unittest.TestCase):
                                            UPLOAD=1, LAYER=0, PASS=0, PATTERN='sparse'))
         self.assertIn("POLYDYE_UPLOAD_TEST_PASS LAYER=0 PASS=0 COLUMNS=600 PATTERN=sparse", board.sent)
         self.assertEqual((board.boost, board.template, board.pulse), (False, 'color_a', 8))
+
+    NOT_READY = "polydye: cartridge driver fault: a column wasn't ready at its time (columns prepared too slowly)"
+
+    def with_run_report(self, fault='none', columns=6640, warm_left=0, underruns=0, overruns=0):
+        """A board with polydye_query_run that reports this run (10 MHz clock ticks)."""
+        pd, board = self.make(fail_on="NOTHING")
+        pd.mcu = types.SimpleNamespace(get_constant_float=lambda name: 10000000.)
+        pd.query_run_cmd = types.SimpleNamespace(send=lambda args: {
+            'fault_static_string_id': fault, 'columns': columns, 'warm_left': warm_left, 'underruns': underruns,
+            'overruns': overruns, 'late_max': 23, 'fill_max': 1041})
+        return pd, board
+
+    def test_spit_reports_how_the_board_ran_it(self):
+        pd, board = self.with_run_report(columns=6640)
+        _, replies, _ = self.spit(pd, board, SECONDS=1., PATTERN='all', WARM=1.)
+        self.assertEqual(replies[-2], "PolyDye board: 6640 columns sent, worst lateness 2.3 us, slowest column "
+                                      "preparation 104.1 us")
+        self.assertTrue(replies[-1].startswith("PolyDye spit test done (faults=0)"))
+        self.assertFalse(pd.testing)
+
+    def test_a_fault_during_the_warm_up_says_what_and_where(self):
+        pd, board = self.with_run_report(fault=self.NOT_READY, columns=17, warm_left=33096, underruns=1)
+        shut = []
+        pd.printer.is_shutdown = lambda: bool(shut)
+        pd.spit_cmd = pd.spit_ext_cmd = types.SimpleNamespace(send=lambda args: None)
+        pd.spit_run_cmd = types.SimpleNamespace(send=lambda args: shut.append(1))
+        gcmd = self.gcmd(SECONDS=3., TEMPLATE='deskjet', PULSE=12, PATTERN='sparse', EXTENDED=1, WARM=5., CONFIRM=1)
+        with self.assertRaises(RuntimeError) as e:
+            pd.cmd_POLYDYE_SPIT(gcmd)
+        self.assertEqual(str(e.exception),
+                         "POLYDYE_SPIT: Klipper shut down during the warm-up: cartridge driver fault: a column wasn't "
+                         "ready at its time (columns prepared too slowly), after 17 columns sent (33096 warm-up "
+                         "columns not sent), 1 column time missed (1 with no column ready, 0 with the bus busy), "
+                         "worst lateness 2.3 us, slowest column preparation 104.1 us")
+        self.assertFalse(pd.testing)
+        # Past the warm-up it is the spit test's; and older board firmware can't say more than that it shut down.
+        pd.query_run_cmd = types.SimpleNamespace(send=lambda args: {
+            'fault_static_string_id': self.NOT_READY, 'columns': 40000, 'warm_left': 0, 'underruns': 1,
+            'overruns': 0, 'late_max': 0, 'fill_max': 0})
+        self.assertTrue(pd._test_shutdown_text("POLYDYE_SPIT", "spit test", 5.).startswith(
+            "POLYDYE_SPIT: Klipper shut down during the spit test: cartridge driver fault: a column wasn't ready"))
+        pd.query_run_cmd = None
+        self.assertEqual(pd._test_shutdown_text("POLYDYE_WARM", "warm-up", 5.),
+                         "POLYDYE_WARM: Klipper shut down during the warm-up")
+
+    def test_a_pass_fault_is_reported_after_the_shutdown(self):
+        pd, board = self.with_run_report(fault=self.NOT_READY, columns=212, underruns=1)
+        callbacks, replies = [], []
+        reactor = types.SimpleNamespace(NEVER=9e99, register_callback=callbacks.append)
+        objects = {'gcode': types.SimpleNamespace(respond_info=replies.append)}
+        pd.printer = types.SimpleNamespace(get_reactor=lambda: reactor, lookup_object=lambda name: objects[name])
+        pd.status_timer, pd.testing = None, False
+        pd._handle_shutdown()
+        self.assertEqual(len(callbacks), 1)
+        with self.assertLogs(level='WARNING'):
+            callbacks.pop()(0.)
+        self.assertEqual(replies, ["PolyDye board: cartridge driver fault: a column wasn't ready at its time (columns "
+                                   "prepared too slowly), after 212 columns sent, 1 column time missed (1 with no "
+                                   "column ready, 0 with the bus busy), worst lateness 2.3 us, slowest column "
+                                   "preparation 104.1 us"])
+        # No fault (an M112, say), a spit test that reports it itself, older board firmware: nothing.
+        pd, _ = self.with_run_report()
+        pd.printer = types.SimpleNamespace(get_reactor=lambda: reactor, lookup_object=lambda name: objects[name])
+        pd.status_timer, pd.testing = None, False
+        pd._handle_shutdown()
+        callbacks.pop()(0.)
+        pd.testing = True
+        pd._handle_shutdown()
+        pd.testing, pd.query_run_cmd = False, None
+        pd._handle_shutdown()
+        self.assertEqual((callbacks, len(replies)), ([], 1))
 
 
 class BuildConfig(unittest.TestCase):

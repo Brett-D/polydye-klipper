@@ -419,6 +419,21 @@ and the spit's first column follows the last warm-up column with no gap (the boa
 POLYDYE_SPIT SECONDS=3 TEMPLATE=deskjet PULSE=12 PATTERN=sparse EXTENDED=1 WARM=5 CONFIRM=1
 ```
 
+### What the board says about a run
+
+Each spit test and warm-up ends with the board's account of it, e.g. `PolyDye board: 36113 columns sent, worst lateness
+2.3 us, slowest column preparation 104.1 us`. The preparation is the board rendering a column and checking it for safety
+before it goes out; it has to stay below the column period.
+
+If the cartridge driver stops a run (a spit test, a warm-up, a pass or the fire test), Klipper shuts down with the fault
+it was, e.g. `MCU 'polydye' shutdown: polydye: cartridge driver fault: a column wasn't ready at its time (columns
+prepared too slowly)`, and the add-on adds the board's account: the columns sent, the warm-up columns not sent, the
+column times missed with no column ready or the bus still busy, the worst lateness and the slowest preparation. Use
+`FIRMWARE_RESTART` to carry on. A spit test (no motion, so no position to keep) doesn't stop for a missed column time:
+the column goes at the next one and the account counts it. This needs board firmware with it (this add-on's bundled
+firmware). Older firmware says only "cartridge driver fault", and up to 7601ba6 it couldn't prepare columns fast enough
+for a warm-up or a column period of 254 µs, so those stopped with that fault.
+
 ### Experimental: extended spit test
 
 > **Warning: `POLYDYE_SPIT ... EXTENDED=1` can burn out nozzles.** It is for one question only: are the heaters

@@ -26,6 +26,11 @@ LEVEL = "polydye_level oid=%c line=%c state=%c remaining=%hu"
 TEMPLATES = ('color_a', 'color_b', 'black_a', 'black_b', 'color_b_late', 'deskjet')
 TEMPLATES_BASIC, TEMPLATES_OLD = 4, 5
 CLOCK = "polydye_clock oid=%c stock=%c nominal_hz=%u measured_hz=%u"
+# The board's last column run (board firmware with polydye_query_run, also answered after a shutdown): why it stopped
+# (a shutdown reason, or "none"), columns sent, warm-up columns not sent, column times missed with no column ready
+# (underruns) or the bus still busy (overruns), and its worst lateness and slowest column preparation in clock ticks.
+RUN = ("polydye_run oid=%c fault_static_string_id=%hu columns=%u warm_left=%u underruns=%u overruns=%u late_max=%u "
+       "fill_max=%u")
 # Bus clocks in polydye_set_clock numbering: ours (POLYDYE_BUS_HZ), the stock firmware's setup, and half ours. The
 # stock setup's divider of 1 acts as 2 on the board (measured 2.82-2.83 MHz), so it runs at 2.857 MHz, not the 5.714 MHz
 # it looks like on paper. Half (1.667 MHz) gives every template edge twice the time to settle; it needs board firmware
@@ -315,6 +320,27 @@ def spit_rate_text(period_us):
     return "every %d us (%.0f Hz)" % (period_us, 1e6 / period_us)
 
 
+def run_fault(run):
+    """Why the board's last run stopped (its shutdown reason without the "polydye: " prefix), or None."""
+    fault = run['fault']
+    if fault == 'none':
+        return None
+    return fault[len("polydye: "):] if fault.startswith("polydye: ") else fault
+
+
+def run_text(run):
+    """The board's account of its last run (polydye_run), for messages."""
+    text = "%d columns sent" % (run['columns'],)
+    if run['warm_left']:
+        text += " (%d warm-up columns not sent)" % (run['warm_left'],)
+    missed = run['underruns'] + run['overruns']
+    if missed:
+        text += ", %d column time%s missed (%d with no column ready, %d with the bus busy)" % (
+            missed, "" if missed == 1 else "s", run['underruns'], run['overruns'])
+    return text + ", worst lateness %.1f us, slowest column preparation %.1f us" % (run['late_max_us'],
+                                                                                   run['fill_max_us'])
+
+
 def pulse_limit_error(words, clock):
     """None, or why `words` at `clock` is longer than the live-ink limit."""
     clock = clock or 'ours'
@@ -469,6 +495,8 @@ class PolyDye:
         self.spit_run_cmd = None  # a spit test with its own column period and a warm-up, on board firmware with it
         self.pulse_max_ext_us = PULSE_MAX_EXT_US  # the board's extended-spit limit (POLYDYE_PULSE_MAX_EXT_NS)
         self.set_clock_cmd = self.query_clock_cmd = None
+        self.query_run_cmd = None  # the board's last run, on board firmware with polydye_query_run
+        self.testing = False  # a spit test or warm-up is running: it reports a shutdown itself
         self.clock_count = 0  # bus clocks the board offers (CLOCKS[:clock_count]); 0: no clock choice
         self.template_count = 0  # templates the board offers (TEMPLATES[:template_count]); 0: no template choice
         self.board_soft_reset = None  # does Klipper's reset keep the board on USB? None until connected
@@ -512,6 +540,9 @@ class PolyDye:
             "polydye_schedule oid=%c clock=%u period=%u frac=%hu layer=%hu pass=%hu", cq=cq)
         self.mode_cmd = self.mcu.lookup_command("polydye_set_mode oid=%c boost=%c live=%c", cq=cq)
         self.cancel_cmd = self.mcu.lookup_command("polydye_cancel oid=%c", cq=cq)
+        # What stopped a run, with its column counts, came after the warm-up.
+        if self.mcu.try_lookup_command("polydye_query_run oid=%c") is not None:
+            self.query_run_cmd = self.mcu.lookup_query_command("polydye_query_run oid=%c", RUN, oid=self.oid, cq=cq)
         # The signal check came after the cartridge commands; older board firmware just doesn't offer it.
         if self.mcu.try_lookup_command("polydye_query_level oid=%c") is not None:
             self.set_level_cmd = self.mcu.lookup_command("polydye_set_level oid=%c line=%c state=%c", cq=cq)
@@ -593,6 +624,32 @@ class PolyDye:
         if self.status_timer is not None:
             logging.info("polydye: Klipper shut down; board status updates stopped until a restart")
             self.printer.get_reactor().update_timer(self.status_timer, self.printer.get_reactor().NEVER)
+        # A pass or the fire test stopped by a cartridge driver fault: show what the board says about it. A spit test
+        # or warm-up puts it in its own error.
+        if self.query_run_cmd is not None and not self.testing:
+            self.printer.get_reactor().register_callback(self._report_fault)
+
+    def _report_fault(self, eventtime):
+        run = self._last_run()
+        if run is None or run_fault(run) is None:
+            return
+        msg = "PolyDye board: %s, after %s" % (run_fault(run), run_text(run))
+        logging.warning("polydye: %s", msg)
+        self.printer.lookup_object('gcode').respond_info(msg)
+
+    def _last_run(self):
+        """The board's account of its last run (polydye_run), or None: also works after a shutdown."""
+        if self.query_run_cmd is None:
+            return None
+        try:
+            params = self.query_run_cmd.send([self.oid])
+        except Exception as e:  # the board gone (unplugged): nothing to report
+            logging.info("polydye: couldn't ask the board about its last run: %s", e)
+            return None
+        ticks_us = 1e6 / self.mcu.get_constant_float('CLOCK_FREQ')
+        return {'fault': str(params['fault_static_string_id']), 'columns': params['columns'],
+                'warm_left': params['warm_left'], 'underruns': params['underruns'], 'overruns': params['overruns'],
+                'late_max_us': params['late_max'] * ticks_us, 'fill_max_us': params['fill_max'] * ticks_us}
 
     def _status_event(self, eventtime):
         # Klipper ignores update_timer() for a timer whose callback is running. Unplugging the board shuts Klipper down
@@ -1211,7 +1268,9 @@ class PolyDye:
                                                                     fire_tpl, fire_clock)
         pattern_no = SPIT_PATTERNS.index(pattern)
         used = board = {}
+        what = "warm-up" if warm_only else "spit test"
         try:
+            self.testing = True
             self.mode_cmd.send([self.oid, 0, 0])
             self._wait_off_and_idle()
             if name is not None or cart_pulse is not None or clock is not None:
@@ -1250,16 +1309,18 @@ class PolyDye:
             while True:
                 reactor.pause(reactor.monotonic() + 0.2)
                 if self.printer.is_shutdown():
-                    raise gcmd.error("%s: Klipper shut down during the %s" % (cmd, "warm-up" if warm_only
-                                                                                else "spit test"))
+                    raise gcmd.error(self._test_shutdown_text(cmd, what, warm))
                 if not self._fresh_status()['running']:
                     break
                 if reactor.monotonic() > end:
-                    raise gcmd.error("%s: the board didn't finish the %s" % (cmd, "warm-up" if warm_only
-                                                                              else "spit test"))
+                    raise gcmd.error("%s: the board didn't finish the %s" % (cmd, what))
         finally:
+            self.testing = False
             self._restore_after_test(before)
         st = self._fresh_status()
+        run = self._last_run()
+        if run is not None:
+            gcmd.respond_info("PolyDye board: %s" % (run_text(run),))
         # The bus rate the board measured is that of the spit's last column: it goes with the settings it fired with.
         # Compare the settings, not the text, to tell whether they were put back to something else.
         settings = ('cartridge_template', 'pulse_words', 'bus_clock')
@@ -1271,6 +1332,16 @@ class PolyDye:
         gcmd.respond_info("PolyDye spit test done (faults=%d): fired %swith %s%s" % (
             st['faults'], "EXTENDED " if extended else "",
             cartridge_text(dict(used, bus_hz_measured=st.get('bus_hz_measured'))), back))
+
+    def _test_shutdown_text(self, cmd, what, warm):
+        """Why Klipper shut down during a spit test or warm-up: with what the board says stopped it, if it says."""
+        run = self._last_run()
+        fault = None if run is None else run_fault(run)
+        if fault is None:
+            return "%s: Klipper shut down during the %s" % (cmd, what)
+        if warm and run['warm_left']:
+            what = "warm-up"
+        return "%s: Klipper shut down during the %s: %s, after %s" % (cmd, what, fault, run_text(run))
 
     def _warm_plan(self, gcmd, cmd, warm, words, period, template, clock):
         """The warm-up's pulse, period and column count for `warm` seconds: by default the longest pulse within
