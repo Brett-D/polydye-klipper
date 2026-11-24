@@ -906,7 +906,14 @@ $('spit-btn').addEventListener('click', () => {
   // PATTERN=stock fires at the stock clock and 1.8 µs there unless another clock or pulse is picked.
   const clock = f.clock.value || (stock ? 'stock' : pd.bus_clock || 'ours');
   const words = pulse >= 3 ? pulse : (stock ? minPulseWords(clock) : pd.pulse_words);
-  const period = parseInt(f.period.value, 10);
+  const periodText = f.period.value.trim();
+  const period = periodText ? Number(periodText) : 0;
+  // Only whole µs in the board's range; an empty field is the default (1000 µs).
+  if (periodText && !(/^\d+$/.test(periodText) && period >= 1 && period <= 65535)) {
+    log(`! spit test: the column period must be a whole number of µs from 1 to 65535 (or empty for 1000), not `
+      + `"${periodText}"`);
+    return;
+  }
   if (words && !pulseOk(words, clock)) {
     log(`! spit test: ${pulseRangeText(words, clock)}${pulse >= 3 ? '' : ': enter a fire pulse'}`);
     return;
