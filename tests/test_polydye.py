@@ -371,10 +371,11 @@ class TestCleanup(unittest.TestCase):
         pd = object.__new__(polydye.PolyDye)
         pd.oid, pd.pass_axis = 0, 'y'
         pd.query_cartridge_cmd = object()
-        pd.spit_patterns = len(polydye.TEST_PATTERNS)
+        pd.spit_patterns = len(polydye.SPIT_PATTERNS)
         pd.clock_count = len(polydye.CLOCKS)
         pd.template_count = len(polydye.TEMPLATES)
-        pd.spit_ext_cmd = None
+        pd.spit_ext_cmd = pd.spit_run_cmd = None
+        pd.pulse_max_ext_us = polydye.PULSE_MAX_EXT_US
 
         def mode(args):
             board.boost, board.live = bool(args[1]), bool(args[2])
@@ -659,10 +660,10 @@ class TestCleanup(unittest.TestCase):
 
     def test_extended_spit_limits(self):
         for params, message in ((dict(SECONDS=3.5, PULSE=13), "at most 3 s"),
-                                (dict(SECONDS=1., PULSE=14), "use 6-13 words there"),
-                                (dict(SECONDS=1., PULSE=12, CLOCK='stock'), "use 6-11 words there"),
-                                (dict(SECONDS=1., PULSE=7, CLOCK='half'), "use 3-6 words there"),
-                                (dict(SECONDS=1., PULSE=5), "less than|use 6-13"),
+                                (dict(SECONDS=1., PULSE=17), "use 6-16 words there \\(1.8-5.0 us\\)"),
+                                (dict(SECONDS=1., PULSE=15, CLOCK='stock'), "use 6-14 words there"),
+                                (dict(SECONDS=1., PULSE=9, CLOCK='half'), "use 3-8 words there"),
+                                (dict(SECONDS=1., PULSE=5), "less than|use 6-16"),
                                 (dict(SECONDS=1.), "needs PULSE")):
             with self.assertRaisesRegex(RuntimeError, message):
                 self.extended(PATTERN='all', **params)
@@ -675,6 +676,146 @@ class TestCleanup(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "EXTENDED=1 needs newer PolyDye board firmware"):
             pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., PULSE=11, EXTENDED=1, PATTERN='all', CONFIRM=1))
         self.assertEqual(board.sent, [])
+
+    def spit(self, pd=None, board=None, command='cmd_POLYDYE_SPIT', **params):
+        """Runs POLYDYE_SPIT (or `command`) on a board with every spit command; returns (board, replies, commands
+        sent)."""
+        if pd is None:
+            pd, board = self.make(fail_on="NOTHING")
+        sent = []
+        pd.spit_cmd = types.SimpleNamespace(send=lambda args: sent.append(('spit',) + tuple(args[1:])))
+        pd.spit_ext_cmd = types.SimpleNamespace(send=lambda args: sent.append(('ext',) + tuple(args[1:])))
+        pd.spit_run_cmd = types.SimpleNamespace(send=lambda args: sent.append(('run',) + tuple(args[1:])))
+        gcmd = self.gcmd(CONFIRM=1, **params)
+        replies = []
+        gcmd.respond_info = replies.append
+        getattr(pd, command)(gcmd)
+        return board, replies, sent
+
+    def test_stock_spit_fires_with_the_stock_timing(self):
+        board, replies, sent = self.spit(SECONDS=3., PATTERN='stock', PERIOD_US=508)
+        self.assertIn("POLYDYE_CARTRIDGE TEMPLATE=color_b_late PULSE=6 CLOCK=stock", board.sent)
+        self.assertEqual(sent, [('run', 5906, 3, 0, 508, 0, 0, 0)])
+        self.assertIn("5906 stock-emulation (a random 24.9 % of positions 14-85, each column twice) columns every "
+                      "508 us (1969 Hz)", replies[0])
+        self.assertIn("cartridge template color_b_late, fire pulse 6 words", replies[0])
+        self.assertIn("bus clock stock", replies[0])
+        self.assertIn("now back to cartridge template color_a, fire pulse 8 words", replies[-1])
+        self.assertEqual((board.boost, board.template, board.pulse, board.clock), (False, 'color_a', 8, 'ours'))
+        self.assertEqual(board.violations, [])
+
+    def test_stock_spit_with_its_own_settings_and_the_default_period(self):
+        board, replies, sent = self.spit(PATTERN='stock', TEMPLATE='deskjet', CLOCK='half')
+        # 1.8 us at the half clock is 3 words.
+        self.assertIn("POLYDYE_CARTRIDGE TEMPLATE=deskjet PULSE=3 CLOCK=half", board.sent)
+        self.assertEqual(sent, [('spit', 2000, 3)])
+        self.assertIn("columns at 1000 Hz", replies[0])
+        with self.assertRaisesRegex(RuntimeError, "PATTERN=stock is for a colour cartridge template"):
+            self.spit(PATTERN='stock', TEMPLATE='black_b')
+
+    def test_spit_period_limits(self):
+        # color_b_late at the stock clock: 172 us on the bus, so at least 192 us.
+        with self.assertRaisesRegex(RuntimeError, "the column takes 172 us on the bus, so the period must be at least "
+                                                  "192 us"):
+            self.spit(SECONDS=1., PATTERN='stock', PERIOD_US=191)
+        _, _, sent = self.spit(SECONDS=1., PATTERN='stock', PERIOD_US=192)
+        self.assertEqual(sent, [('run', 5208, 3, 0, 192, 0, 0, 0)])
+        # At most 10000 columns (3000 extended) whatever the period.
+        with self.assertRaisesRegex(RuntimeError, "at a 254 us column period a spit test lasts at most 2.54 s "
+                                                  "\\(10000 columns\\)"):
+            self.spit(SECONDS=3., PATTERN='stock', PERIOD_US=254)
+        with self.assertRaisesRegex(RuntimeError, "an EXTENDED=1 spit test lasts at most 1.52 s \\(3000 columns\\)"):
+            self.spit(SECONDS=2., PULSE=11, PATTERN='stock', PERIOD_US=508, EXTENDED=1)
+        # An 11-word extended pulse at the stock clock lengthens the column to 221 us.
+        with self.assertRaisesRegex(RuntimeError, "at least 241 us"):
+            self.spit(SECONDS=0.5, PULSE=11, PATTERN='stock', PERIOD_US=240, EXTENDED=1)
+        _, _, sent = self.spit(SECONDS=1.5, PULSE=11, PATTERN='stock', PERIOD_US=508, EXTENDED=1)
+        self.assertEqual(sent, [('run', 2953, 3, 11, 508, 0, 0, 0)])
+        # Any pattern takes a period; the configured color_a, 8 words at our clock needs 184 us.
+        _, _, sent = self.spit(SECONDS=1., PATTERN='mid', PERIOD_US=400)
+        self.assertEqual(sent, [('run', 2500, 1, 0, 400, 0, 0, 0)])
+        with self.assertRaisesRegex(RuntimeError, "at least 184 us"):
+            self.spit(SECONDS=1., PATTERN='mid', PERIOD_US=183)
+
+    def test_extended_spit_up_to_five_us(self):
+        board, replies, sent = self.spit(SECONDS=3., PULSE=16, PATTERN='sparse', EXTENDED=1)
+        self.assertEqual(sent, [('ext', 3000, 2, 16)])
+        # 4.8 us at 12.6 V: 165 % of Sprite_tm's 1.8 us at 16 V.
+        self.assertIn("fire pulse 16 words = 4.80 us (165 % energy)", replies[0])
+        _, _, sent = self.spit(SECONDS=1., PULSE=8, CLOCK='half', PATTERN='all', EXTENDED=1)
+        self.assertEqual(sent, [('ext', 1000, 0, 8)])
+        # Board firmware with the 4.0 us limit: the add-on follows its POLYDYE_PULSE_MAX_EXT_NS.
+        pd, board = self.make(fail_on="NOTHING")
+        pd.pulse_max_ext_us = 4.0
+        with self.assertRaisesRegex(RuntimeError, "use 6-13 words there \\(1.8-4.0 us\\)"):
+            self.spit(pd, board, SECONDS=1., PULSE=14, PATTERN='all', EXTENDED=1)
+
+    def test_warm_up_right_before_an_extended_spit(self):
+        board, replies, sent = self.spit(SECONDS=3., TEMPLATE='deskjet', PULSE=12, PATTERN='sparse', EXTENDED=1,
+                                         WARM=5.)
+        # deskjet at our clock: a 131 us column, so a warm-up column every 151 us, 2 words (0.6 us) by default.
+        self.assertEqual(sent, [('run', 3000, 2, 12, 1000, 33113, 2, 151)])
+        self.assertIn("warm-up 5.0 s: 33113 all-nozzle columns every 151 us, 2-word pulses of 0.60 us (21 % energy "
+                      "each, too short to boil ink); per nozzle 19868 us of heating in all, the energy of 6845 "
+                      "reference pulses (heater duty 0.40 %)", replies[0])
+        self.assertIn("EXTENDED spit test", replies[1])
+        self.assertEqual((board.boost, board.template, board.pulse), (False, 'color_a', 8))
+
+    def test_warm_up_pulse_and_period(self):
+        # At half our clock 2 words are 1.2 us, too long: 1 word (0.6 us), every 315 us (color_a's column).
+        board, replies, sent = self.spit(SECONDS=1., CLOCK='half', PULSE=3, PATTERN='all', WARM=2.)
+        self.assertIn("POLYDYE_CARTRIDGE PULSE=3 CLOCK=half", board.sent)
+        self.assertEqual(sent, [('run', 1000, 0, 0, 1000, 6349, 1, 315)])
+        with self.assertRaisesRegex(RuntimeError, "WARM_PULSE=2 is 1.20 us at the half clock"):
+            self.spit(SECONDS=1., CLOCK='half', PULSE=3, PATTERN='all', WARM=2., WARM_PULSE=2)
+        with self.assertRaisesRegex(RuntimeError, "warm-up period must be at least 168 us"):
+            self.spit(SECONDS=1., PATTERN='all', WARM=1., WARM_PERIOD_US=150)
+        _, _, sent = self.spit(SECONDS=1., PATTERN='all', WARM=1., WARM_PULSE=1, WARM_PERIOD_US=500)
+        self.assertEqual(sent, [('run', 1000, 0, 0, 1000, 2000, 1, 500)])
+
+    def test_warm_up_on_its_own(self):
+        board, replies, sent = self.spit(command='cmd_POLYDYE_WARM', SECONDS=5.)
+        self.assertEqual(sent, [('run', 0, 0, 0, 1000, 29762, 2, 168)])
+        self.assertIn("warm-up 5.0 s: 29762 all-nozzle columns every 168 us", replies[0])
+        self.assertEqual(replies[-1], "PolyDye warm-up done (faults=0)")
+        self.assertFalse([s for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_CARTRIDGE")])
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append('spit'))
+        pd.spit_run_cmd = types.SimpleNamespace(send=lambda args: board.sent.append('run'))
+        with self.assertRaisesRegex(RuntimeError, "POLYDYE_WARM heats every nozzle's heater"):
+            pd.cmd_POLYDYE_WARM(self.gcmd(SECONDS=5.))
+        # Older board firmware has no warm-up.
+        pd.spit_run_cmd = None
+        with self.assertRaisesRegex(RuntimeError, "POLYDYE_WARM: it needs newer PolyDye board firmware"):
+            pd.cmd_POLYDYE_WARM(self.gcmd(SECONDS=5., CONFIRM=1))
+        with self.assertRaisesRegex(RuntimeError, "POLYDYE_SPIT: WARM needs newer PolyDye board firmware"):
+            pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., PATTERN='all', WARM=2., CONFIRM=1))
+        self.assertEqual(board.sent, [])
+
+    def test_column_times_match_the_board(self):
+        # printcart_column_us() in the board firmware's host tests: 148 us for color_b at our clock, 295 us at half.
+        self.assertEqual(polydye.column_us('color_b', 6, 'ours'), 148)
+        self.assertEqual(polydye.column_us('color_b', 4, 'half'), 295)
+        self.assertEqual(polydye.column_us('color_b', 9, None), 173)
+        self.assertEqual(polydye.column_us('color_b_late', 6, 'stock'), 172)
+        self.assertEqual(polydye.column_us('deskjet', 6, 'ours'), 131)
+        self.assertEqual(polydye.min_spit_period_us('color_b_late', 6, 'stock'), 192)
+
+    def test_stock_spit_and_period_need_newer_board_firmware(self):
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_patterns = 3  # board firmware with the sparse pattern but no stock one
+        with self.assertRaisesRegex(RuntimeError, "PATTERN=stock needs newer PolyDye board firmware.*Update to "
+                                                  "bundled firmware\\)$"):
+            self.spit(pd, board, PATTERN='stock')
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append('spit'))
+        with self.assertRaisesRegex(RuntimeError, "PERIOD_US needs newer PolyDye board firmware"):
+            pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., PATTERN='all', PERIOD_US=508, CONFIRM=1))
+        self.assertEqual(board.sent, [])
+        # The fire test has no stock pattern.
+        with self.assertRaisesRegex(RuntimeError, "PATTERN must be all, mid or sparse"):
+            pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:6", X=80., Y=60., SPACING=20., COLUMNS=600,
+                                               UPLOAD=1, LAYER=0, PASS=0, PATTERN='stock'))
 
     def test_fire_test_uploads_sparse_on_any_board_firmware(self):
         pd, board = self.make(fail_on="NOTHING")
@@ -694,7 +835,8 @@ class BuildConfig(unittest.TestCase):
         pd = object.__new__(polydye.PolyDye)
         pd.oid, pd.cartridge_template, pd.bus_clock, pd.pulse_words = 0, template, bus_clock, pulse_words
         pd.spit_patterns = pd.clock_count = pd.template_count = 0
-        pd.spit_ext_cmd = None
+        pd.spit_ext_cmd = pd.spit_run_cmd = None
+        pd.pulse_max_ext_us = polydye.PULSE_MAX_EXT_US
         pd.printer = types.SimpleNamespace(config_error=ConfigError)
         sent = []
         pd.test_sent = sent
@@ -735,6 +877,20 @@ class BuildConfig(unittest.TestCase):
         self.assertIn("polydye_set_template oid=0 template=5", pd.test_sent)
         pd.last_status, pd.last_pass, pd.pass_axis, pd.offset_x, pd.offset_y, pd.direction_trim = {}, None, 'y', 0, 0, 0
         self.assertEqual(pd.get_status(0.)['templates'][-1], 'deskjet')
+
+    def test_extended_limit_follows_the_board(self):
+        # The board says how long an extended pulse may be; firmware with the extended spit but no constant has 4.0 us.
+        for constants, cap, words in (({'POLYDYE_PULSE_MAX_EXT_NS': 5000}, 5.0, (16, 14, 8)),
+                                      ({'POLYDYE_PULSE_MAX_EXT_NS': 4000}, 4.0, (13, 11, 6)),
+                                      ({}, 4.0, (13, 11, 6))):
+            pd, _ = self.build(constants, None, None)
+            self.assertIsNotNone(pd.spit_ext_cmd)
+            self.assertEqual(pd.pulse_max_ext_us, cap)
+            self.assertEqual(tuple(polydye.max_ext_pulse_words(c, pd.pulse_max_ext_us)
+                                   for c in ('ours', 'stock', 'half')), words)
+            self.assertIsNone(polydye.ext_pulse_range_error(words[0], 'ours', pd.pulse_max_ext_us))
+            self.assertIn("use 6-%d words there" % words[0],
+                          polydye.ext_pulse_range_error(words[0] + 1, 'ours', pd.pulse_max_ext_us))
 
     def test_half_clock_needs_newer_board_firmware(self):
         pd, error = self.build({}, 'half', 4)
