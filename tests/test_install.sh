@@ -115,6 +115,13 @@ zero_fill scripts/polydye_files.py
 "$A/scripts/polydye-toggle.sh" "$T/config" "$T/klipper" > "$T/toggle8.log" 2>&1
 check '[ ! -e "$T/config/polydye-active.cfg" ] && grep -q "DAMAGED: couldn.t check them" "$T/toggle8.log"' \
     "a damaged file checker: PolyDye left off too"
+(cd "$A" && git ls-files -z | xargs -0 touch && git checkout-index -f -a)
+# Cut off mid-line, so Python's error message quotes 'print("result: ...'.
+python3 -c 'import sys; p = sys.argv[1]; s = open(p).read(); open(p, "w").write(s[:s.index("print(\"result: ") + 25])' \
+    "$A/scripts/polydye_files.py"
+"$A/scripts/polydye-toggle.sh" "$T/config" "$T/klipper" > "$T/toggle9.log" 2>&1
+check '[ ! -e "$T/config/polydye-active.cfg" ] && grep -q "DAMAGED: couldn.t check them" "$T/toggle9.log"' \
+    "a truncated file checker isn't trusted either"
 unset POLYDYE_BY_ID_DIR
 
 bash "$REPO/uninstall.sh" > /dev/null

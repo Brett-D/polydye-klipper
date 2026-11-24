@@ -113,6 +113,7 @@ class PolyDye:
         # The service that carries the plug-in toggle hook (install.sh's KLIPPER_SERVICE).
         self.klipper_service = config.get("klipper_service", "klipper")
         self.updating = False
+        self.update_task = None
         self.server.register_notification("polydye:polydye_firmware")
         self.server.register_endpoint("/server/polydye/firmware", RequestType.GET, self._handle_firmware_info)
         self.server.register_endpoint("/server/polydye/firmware/update", RequestType.POST,
@@ -120,6 +121,14 @@ class PolyDye:
 
     async def component_init(self) -> None:
         await self._check_files()
+
+    async def on_exit(self) -> None:
+        """Moonraker is shutting down (before it closes its components): end a running firmware update, whose cleanup
+        terminates the uploader and starts Klipper again (_run_update_steps)."""
+        task = self.update_task
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.wait([task], timeout=30.)
 
     async def _check_files(self) -> None:
         """Compares the add-on's files with git's record and raises a Moonraker warning (shown by Mainsail) for
@@ -226,7 +235,7 @@ class PolyDye:
         except BaseException:
             self.updating = False
             raise
-        self.server.get_event_loop().create_task(self._run_update(ports[0], path, force))
+        self.update_task = self.server.get_event_loop().create_task(self._run_update(ports[0], path, force))
         return {"started": True, "version": info["version"]}
 
     def _notify(self, state: str, message: str, progress=None) -> None:
@@ -269,9 +278,8 @@ class PolyDye:
             await asyncio.sleep(0.25)
 
     async def _run_update_steps(self, port: str, path: str, force: bool) -> None:
-        ok, last = False, ""
+        ok, last, proc, start_klipper = False, "", None, False
         machine = self.server.lookup_component("machine")
-        start_klipper = False
         try:
             self._notify("running", "writing pending files to the SD card", 0)
             await self._sync()
@@ -300,27 +308,35 @@ class PolyDye:
                     logging.info(f"polydye firmware: {last}")
                     self._notify("running", last)
             ok = await proc.wait() == 0
-        except Exception as e:
+        except Exception as e:  # not a cancellation: that is a BaseException, and goes straight to the cleanup
             last = f"error: {e}"
             logging.exception("polydye: firmware update failed")
-        try:
-            await self._sync()
-        except Exception:
-            logging.exception("polydye: sync after the firmware update failed")
-        if start_klipper:
-            # Also after a failed update: the board is back (or gone), and Klipper's start hook picks that up.
+        finally:
+            # Also after a failure, and when Moonraker shuts down mid-update (on_exit cancels this): the uploader
+            # mustn't reboot the board once Klipper has its port again, and Klipper mustn't be left stopped.
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
             try:
-                self._notify("running", f"starting {self.klipper_service}")
-                await machine.do_service_action("start", self.klipper_service)
-            except Exception as e:
-                logging.exception(f"polydye: couldn't start {self.klipper_service} after the firmware update")
-                if ok:
-                    ok, last = False, f"the board was updated, but {self.klipper_service} didn't start: {e}"
+                await self._sync()
+            except Exception:
+                logging.exception("polydye: sync after the firmware update failed")
+            if start_klipper:
+                # The board is back (or gone); Klipper's start hook picks that up.
+                try:
+                    self._notify("running", f"starting {self.klipper_service}")
+                    await machine.do_service_action("start", self.klipper_service)
+                except Exception as e:
+                    logging.exception(f"polydye: couldn't start {self.klipper_service} after the firmware update")
+                    if ok:
+                        ok, last = False, f"the board was updated, but {self.klipper_service} didn't start: {e}"
         if ok:
             self._notify("done", last or "firmware updated", 100)
         else:
             self._notify("error", re.sub(r"^error: ", "", last) or "the update failed")
-
 
 def load_component(config) -> PolyDye:
     return PolyDye(config)

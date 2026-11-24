@@ -85,33 +85,48 @@ class FakeUploader:
 
 
 class FakeProc:
-    def __init__(self, lines, rc):
-        self.lines, self.rc = [line.encode() + b"\n" for line in lines], rc
-        self.stdout = self
+    """The uploader. With hang=True it keeps running (waiting for the board) until terminated."""
+
+    def __init__(self, events, lines, rc, hang=False):
+        self.events, self.lines, self.rc, self.hang = events, [line.encode() + b"\n" for line in lines], rc, hang
+        self.stdout, self.returncode, self.ended = self, None, asyncio.Event()
 
     async def readline(self):
-        return self.lines.pop(0) if self.lines else b""
+        if self.lines:
+            return self.lines.pop(0)
+        if self.hang:
+            await self.ended.wait()
+        return b""
 
     async def wait(self):
+        if self.hang:
+            await self.ended.wait()
+        self.returncode = self.rc
         return self.rc
+
+    def terminate(self):
+        self.events.append("terminate")
+        self.rc = -15
+        self.ended.set()
 
 
 class Update(unittest.TestCase):
     def run_update(self, state="active", fail=None, rc=0, lines=("progress: 50%", "the board runs 9ba5def; confirmed"),
-                   holders=([(812, "klippy")],)):
+                   holders=([(812, "klippy")],), scenario=None):
         events = []
         comp = object.__new__(pd.PolyDye)
         comp.server = FakeServer(events, state, fail)
         comp.klipper_service = "klipper"
         comp.uploader = FakeUploader(events, holders)
         comp.uploader_path = "/home/pi/polydye-klipper/scripts/polydye_upload.py"
+        comp.update_task = None
 
         async def fake_exec(*args, **kw):
             events.append(("upload", args[-2] if args[-1] == "--force" else args[-1]))
-            return FakeProc(lines, rc)
+            return FakeProc(events, lines, rc, hang=scenario is not None)
         with mock.patch.object(pd.os, "sync", side_effect=lambda: events.append("sync")), \
                 mock.patch.object(pd.asyncio, "create_subprocess_exec", fake_exec):
-            asyncio.run(comp._run_update_steps(DATA_PORT, "/fw.bin", False))
+            asyncio.run(scenario(comp, events) if scenario else comp._run_update_steps(DATA_PORT, "/fw.bin", False))
         return [e for e in events if e[0] != "notify"], [e for e in events if e[0] == "notify"]
 
     def test_sync_stop_klipper_wait_for_its_port_update_sync_start(self):
@@ -136,6 +151,17 @@ class Update(unittest.TestCase):
         self.assertEqual(steps, ["sync", ("stop", "klipper"), "sync"])
         self.assertEqual(notes[-1][1], "error")
         self.assertIn("Service Actions Not Available", notes[-1][2])
+
+    def test_moonraker_shutting_down_mid_update_ends_the_uploader_then_starts_klipper(self):
+        async def shut_down_mid_update(comp, events):
+            comp.update_task = asyncio.get_running_loop().create_task(
+                comp._run_update_steps(DATA_PORT, "/fw.bin", False))
+            while ("upload", "/fw.bin") not in events:
+                await asyncio.sleep(0)
+            await comp.on_exit()
+            self.assertTrue(comp.update_task.cancelled())
+        steps, _ = self.run_update(scenario=shut_down_mid_update)
+        self.assertEqual(steps[-4:], [("upload", "/fw.bin"), "terminate", "sync", ("start", "klipper")])
 
     def test_no_update_while_something_keeps_the_klipper_port_open(self):
         with mock.patch.object(pd, "PORT_FREE_TIMEOUT", 0.), self.assertLogs(level="ERROR"):

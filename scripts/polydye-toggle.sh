@@ -48,8 +48,10 @@ fi
 # The add-on's own files against git's record of them (git status only compares sizes and times).
 files_ok=1
 files=$(python3 "$REPO_DIR/scripts/polydye_files.py" "$REPO_DIR" 2>&1)
-case "$files" in
-    *"result: "*)
+rc=$?
+# Trusted only from a checker that ran to the end: a damaged one can print a traceback quoting its own code.
+case "$rc $(printf '%s\n' "$files" | tail -n 1)" in
+    "0 result: "*)
         corrupt=$(printf '%s\n' "$files" | sed -n 's/^corrupt //p' | tr '\n' ' ')
         changed=$(printf '%s\n' "$files" | sed -n 's/^changed //p' | tr '\n' ' ')
         if [ -n "$corrupt" ]; then
@@ -62,8 +64,8 @@ case "$files" in
         [ -z "$changed" ] || echo "polydye: add-on files that differ from git (local edits?): $changed"
         ;;
     *)
-        # No result line: the checker itself is missing or damaged, most likely by the same shutdown. A copied
-        # install (not a git checkout) gets "result: unknown" instead and carries on.
+        # The checker itself is missing or damaged, most likely by the same shutdown. A copied install (not a git
+        # checkout) gets "result: unknown" instead and carries on.
         files_ok=""
         echo "polydye: ADD-ON FILES DAMAGED: couldn't check them ($files)." \
             "Recover them: Update Manager, polydye, Recover, Hard recovery; see the add-on's README." >&2
