@@ -218,7 +218,10 @@
         pulse instead of up to 12, going through every nozzle in turn, in case a full column starves the
         heaters' supply. The bus clock &ldquo;half&rdquo; (1.667 MHz) gives the level shifters twice the time for every
         edge; use a 3 or 4-word pulse with it (1.8 or 2.4 µs). The deskjet template copies a real HP DeskJet's
-        timing.</p>
+        timing. &ldquo;Like stock&rdquo; fires the way the stock PolyDye firmware does: a random quarter of positions
+        14-85, each column twice, with color_b_late, the stock clock and 6 words unless you pick others. The column
+        period is 1000 µs unless you set one (the stock firmware's is about 508 µs; at least the column plus 20 µs,
+        and at most 10000 columns).</p>
       <form id="spit-form" class="compact">
         <label>Seconds<input name="seconds" type="number" step="0.5" min="0.5" max="10" value="2"></label>
         <label>Template
@@ -241,8 +244,11 @@
           <select name="pattern">
             <option value="all">all</option><option value="mid">positions 14-90 (as stock)</option>
             <option value="sparse">sparse: one per fire pulse</option>
+            <option value="stock">like stock: random, each column twice</option>
           </select>
         </label>
+        <label>Column period (µs)<input name="period" type="number" step="1" min="1" max="65535"
+          placeholder="1000"></label>
       </form>
       <div class="buttons">
         <button id="spit-btn" class="danger">Spit test&hellip;</button>

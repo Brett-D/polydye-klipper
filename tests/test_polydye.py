@@ -371,10 +371,10 @@ class TestCleanup(unittest.TestCase):
         pd = object.__new__(polydye.PolyDye)
         pd.oid, pd.pass_axis = 0, 'y'
         pd.query_cartridge_cmd = object()
-        pd.spit_patterns = len(polydye.TEST_PATTERNS)
+        pd.spit_patterns = len(polydye.SPIT_PATTERNS)
         pd.clock_count = len(polydye.CLOCKS)
         pd.template_count = len(polydye.TEMPLATES)
-        pd.spit_ext_cmd = None
+        pd.spit_ext_cmd = pd.spit_period_cmd = None
 
         def mode(args):
             board.boost, board.live = bool(args[1]), bool(args[2])
@@ -675,6 +675,90 @@ class TestCleanup(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "EXTENDED=1 needs newer PolyDye board firmware"):
             pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., PULSE=11, EXTENDED=1, PATTERN='all', CONFIRM=1))
         self.assertEqual(board.sent, [])
+
+    def spit(self, pd=None, board=None, **params):
+        """Runs POLYDYE_SPIT on a board with every spit command; returns (board, replies, commands sent)."""
+        if pd is None:
+            pd, board = self.make(fail_on="NOTHING")
+        sent = []
+        pd.spit_cmd = types.SimpleNamespace(send=lambda args: sent.append(('spit',) + tuple(args[1:])))
+        pd.spit_ext_cmd = types.SimpleNamespace(send=lambda args: sent.append(('ext',) + tuple(args[1:])))
+        pd.spit_period_cmd = types.SimpleNamespace(send=lambda args: sent.append(('period',) + tuple(args[1:])))
+        gcmd = self.gcmd(CONFIRM=1, **params)
+        replies = []
+        gcmd.respond_info = replies.append
+        pd.cmd_POLYDYE_SPIT(gcmd)
+        return board, replies, sent
+
+    def test_stock_spit_fires_with_the_stock_timing(self):
+        board, replies, sent = self.spit(SECONDS=3., PATTERN='stock', PERIOD_US=508)
+        self.assertIn("POLYDYE_CARTRIDGE TEMPLATE=color_b_late PULSE=6 CLOCK=stock", board.sent)
+        self.assertEqual(sent, [('period', 5906, 3, 0, 508)])
+        self.assertIn("5906 stock-emulation (a random 24.9 % of positions 14-85, each column twice) columns every "
+                      "508 us (1969 Hz)", replies[0])
+        self.assertIn("cartridge template color_b_late, fire pulse 6 words", replies[0])
+        self.assertIn("bus clock stock", replies[0])
+        self.assertIn("now back to cartridge template color_a, fire pulse 8 words", replies[-1])
+        self.assertEqual((board.boost, board.template, board.pulse, board.clock), (False, 'color_a', 8, 'ours'))
+        self.assertEqual(board.violations, [])
+
+    def test_stock_spit_with_its_own_settings_and_the_default_period(self):
+        board, replies, sent = self.spit(PATTERN='stock', TEMPLATE='deskjet', CLOCK='half')
+        # 1.8 us at the half clock is 3 words.
+        self.assertIn("POLYDYE_CARTRIDGE TEMPLATE=deskjet PULSE=3 CLOCK=half", board.sent)
+        self.assertEqual(sent, [('spit', 2000, 3)])
+        self.assertIn("columns at 1000 Hz", replies[0])
+        with self.assertRaisesRegex(RuntimeError, "PATTERN=stock is for a colour cartridge template"):
+            self.spit(PATTERN='stock', TEMPLATE='black_b')
+
+    def test_spit_period_limits(self):
+        # color_b_late at the stock clock: 172 us on the bus, so at least 192 us.
+        with self.assertRaisesRegex(RuntimeError, "the column takes 172 us on the bus, so the period must be at least "
+                                                  "192 us"):
+            self.spit(SECONDS=1., PATTERN='stock', PERIOD_US=191)
+        _, _, sent = self.spit(SECONDS=1., PATTERN='stock', PERIOD_US=192)
+        self.assertEqual(sent, [('period', 5208, 3, 0, 192)])
+        # At most 10000 columns (3000 extended) whatever the period.
+        with self.assertRaisesRegex(RuntimeError, "at a 254 us column period a spit test lasts at most 2.54 s "
+                                                  "\\(10000 columns\\)"):
+            self.spit(SECONDS=3., PATTERN='stock', PERIOD_US=254)
+        with self.assertRaisesRegex(RuntimeError, "an EXTENDED=1 spit test lasts at most 1.52 s \\(3000 columns\\)"):
+            self.spit(SECONDS=2., PULSE=11, PATTERN='stock', PERIOD_US=508, EXTENDED=1)
+        # An 11-word extended pulse at the stock clock lengthens the column to 221 us.
+        with self.assertRaisesRegex(RuntimeError, "at least 241 us"):
+            self.spit(SECONDS=0.5, PULSE=11, PATTERN='stock', PERIOD_US=240, EXTENDED=1)
+        _, _, sent = self.spit(SECONDS=1.5, PULSE=11, PATTERN='stock', PERIOD_US=508, EXTENDED=1)
+        self.assertEqual(sent, [('period', 2953, 3, 11, 508)])
+        # Any pattern takes a period; the configured color_a, 8 words at our clock needs 184 us.
+        _, _, sent = self.spit(SECONDS=1., PATTERN='mid', PERIOD_US=400)
+        self.assertEqual(sent, [('period', 2500, 1, 0, 400)])
+        with self.assertRaisesRegex(RuntimeError, "at least 184 us"):
+            self.spit(SECONDS=1., PATTERN='mid', PERIOD_US=183)
+
+    def test_column_times_match_the_board(self):
+        # printcart_column_us() in the board firmware's host tests: 148 us for color_b at our clock, 295 us at half.
+        self.assertEqual(polydye.column_us('color_b', 6, 'ours'), 148)
+        self.assertEqual(polydye.column_us('color_b', 4, 'half'), 295)
+        self.assertEqual(polydye.column_us('color_b', 9, None), 173)
+        self.assertEqual(polydye.column_us('color_b_late', 6, 'stock'), 172)
+        self.assertEqual(polydye.column_us('deskjet', 6, 'ours'), 131)
+        self.assertEqual(polydye.min_spit_period_us('color_b_late', 6, 'stock'), 192)
+
+    def test_stock_spit_and_period_need_newer_board_firmware(self):
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_patterns = 3  # board firmware with the sparse pattern but no stock one
+        with self.assertRaisesRegex(RuntimeError, "PATTERN=stock needs newer PolyDye board firmware.*Update to "
+                                                  "bundled firmware\\)$"):
+            self.spit(pd, board, PATTERN='stock')
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append('spit'))
+        with self.assertRaisesRegex(RuntimeError, "PERIOD_US needs newer PolyDye board firmware"):
+            pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=1., PATTERN='all', PERIOD_US=508, CONFIRM=1))
+        self.assertEqual(board.sent, [])
+        # The fire test has no stock pattern.
+        with self.assertRaisesRegex(RuntimeError, "PATTERN must be all, mid or sparse"):
+            pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:6", X=80., Y=60., SPACING=20., COLUMNS=600,
+                                               UPLOAD=1, LAYER=0, PASS=0, PATTERN='stock'))
 
     def test_fire_test_uploads_sparse_on_any_board_firmware(self):
         pd, board = self.make(fail_on="NOTHING")

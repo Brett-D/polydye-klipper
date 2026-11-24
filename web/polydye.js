@@ -902,24 +902,30 @@ $('spit-btn').addEventListener('click', () => {
   const seconds = Math.min(10, Math.max(0.5, parseFloat(f.seconds.value) || 2));
   const pulse = parseInt(f.pulse.value, 10);
   const pd = state.printer.polydye || {};
-  const clock = f.clock.value || pd.bus_clock || 'ours';
-  const words = pulse >= 3 ? pulse : pd.pulse_words;
+  const stock = f.pattern.value === 'stock';
+  // PATTERN=stock fires at the stock clock and 1.8 µs there unless another clock or pulse is picked.
+  const clock = f.clock.value || (stock ? 'stock' : pd.bus_clock || 'ours');
+  const words = pulse >= 3 ? pulse : (stock ? minPulseWords(clock) : pd.pulse_words);
+  const period = parseInt(f.period.value, 10);
   if (words && !pulseOk(words, clock)) {
     log(`! spit test: ${pulseRangeText(words, clock)}${pulse >= 3 ? '' : ': enter a fire pulse'}`);
     return;
   }
-  const rate = `${SPIT_HZ} times a second for ${seconds} s`;
+  const each = period > 0 ? `a column every ${period} µs` : `${SPIT_HZ} columns a second`;
+  const rate = period > 0 ? `every ${period} µs for ${seconds} s` : `${SPIT_HZ} times a second for ${seconds} s`;
   const which = {
     mid: `Nozzle positions 14-90 fire ${rate}.`,
-    sparse: `${SPIT_HZ} columns a second for ${seconds} s, each firing one nozzle per fire pulse, a different one `
+    sparse: `${each} for ${seconds} s, each firing one nozzle per fire pulse, a different one `
       + 'each column, so every nozzle fires in turn.',
+    stock: `A random quarter of positions 14-85 fires in each column, each column twice, like the stock firmware, `
+      + `${each} for ${seconds} s.`,
   }[f.pattern.value] || `Every nozzle fires ${rate}.`;
   const ok = window.confirm(`Spit test: LIVE INK, no motion.\n\nHold a folded paper towel under the cartridge, `
     + `against the nozzles. ${which}`);
   if (!ok) return;
   gcode(`POLYDYE_SPIT SECONDS=${seconds}${f.template.value ? ` TEMPLATE=${f.template.value}` : ''}`
     + `${pulse >= 3 && pulse <= 12 ? ` PULSE=${pulse}` : ''}${f.clock.value ? ` CLOCK=${f.clock.value}` : ''}`
-    + ` PATTERN=${f.pattern.value} CONFIRM=1`);
+    + ` PATTERN=${f.pattern.value}${period > 0 ? ` PERIOD_US=${period}` : ''} CONFIRM=1`);
 });
 
 function renderDiagnostics(pd, printing) {
@@ -938,6 +944,9 @@ function renderDiagnostics(pd, printing) {
   const sparseOld = diag && spit.pattern.value === 'sparse' && !(pd.spit_patterns || []).includes('sparse');
   const halfOld = diag && spit.clock.value === 'half' && !halfClockOk();
   const deskjetOld = diag && spit.template.value === 'deskjet' && !deskjetOk();
+  // The stock pattern and the column period came together.
+  const stockOld = diag && (spit.pattern.value === 'stock' || spit.period.value.trim() !== '')
+    && !(pd.spit_patterns || []).includes('stock');
   const oldText = [];
   if (sparseOld) {
     oldText.push('The sparse spit test needs newer board firmware: Update to bundled firmware under Board firmware. '
@@ -945,9 +954,13 @@ function renderDiagnostics(pd, printing) {
   }
   if (halfOld) oldText.push(HALF_OLD);
   if (deskjetOld) oldText.push(DESKJET_OLD);
+  if (stockOld) {
+    oldText.push('The stock-emulation spit test and the column period need newer board firmware: Update to bundled '
+      + 'firmware under Board firmware.');
+  }
   $('spit-fw-old').textContent = oldText.join(' ');
   $('spit-fw-old').classList.toggle('hidden', !oldText.length);
-  $('spit-btn').disabled = !diag || busy || sparseOld || halfOld || deskjetOld;
+  $('spit-btn').disabled = !diag || busy || sparseOld || halfOld || deskjetOld || stockOld;
   const cartOut = $('sig-cart-out').checked;
   const level = pd.level || null;
   $('sig-start').disabled = !diag || busy || !cartOut || !!pd.live;

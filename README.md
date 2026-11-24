@@ -344,7 +344,7 @@ If anything would print a pass wrongly, Klipper stops with a readable reason, fo
 | `POLYDYE_CARTRIDGE [TEMPLATE=color_a\|color_b\|black_a\|black_b\|color_b_late\|deskjet] [PULSE=3..9] [CLOCK=ours\|stock\|half]` | Switches the board's waveform template, fire pulse and bus clock until the next restart (to compare them at the nozzle check); without arguments, shows them. Only with PolyDye off and no passes queued |
 | `POLYDYE_UPLOAD_TEST_PASS [LAYER=0] [PASS=0] [COLUMNS=600] [PATTERN=alternate\|all\|none\|mid\|sparse] [REPEAT=1]` | Uploads a test pass over the board's data port. `mid` fires nozzle positions 14–90 of every colour (what the stock firmware fires; colour cartridges only); `sparse` fires one nozzle per fire pulse, a different one each column (12 columns go through them all); `REPEAT` sends each column that many times in a row, so the pass has `COLUMNS` × `REPEAT` columns (at most 65535). Not during a print: it briefly blocks Klipper while it sends |
 | `POLYDYE_FIRE_TEST [X=70] [Y=60] [Z=] [SPACING=18] [STRIPES=…] [PATTERN=all\|mid\|sparse] [COLUMNS=600] [UPLOAD=1] [LAYER=0] [PASS=0]` | **Live ink.** Prints one stripe per `TEMPLATE:PULSE[:CLOCK]` in `STRIPES` (`CLOCK` ours, stock or half, e.g. `color_b:4:half`): a pass of `COLUMNS` columns along the pass axis, the stripes `SPACING` mm apart across it, the first at `X`, `Y`. A stripe without a clock uses the one in effect. The default is the A/B matrix `color_b` / `color_b_late` × `ours` / `stock` × pulse 6 / the longest allowed (9 words with our clock, 8 with the stock one; with older board firmware: `color_b:6,color_b:8,color_b:9,color_a:6,color_a:9`). `UPLOAD=0` prints the pass already stored as `LAYER`, `PASS` instead. Moves to `Z` first if given. Refused during a print, also a paused one. Turns PolyDye off and puts the template, pulse, clock and G-code state back afterwards, also after an error. Doesn't home (`PD_FIRE_TEST` does) |
-| `POLYDYE_SPIT [SECONDS=2] [TEMPLATE=] [PULSE=] [CLOCK=ours\|stock\|half] [PATTERN=all\|mid\|sparse] [EXTENDED=1] CONFIRM=1` | **Live ink, no motion.** Fires every nozzle (or positions 14–90, or `sparse`: one nozzle per fire pulse in turn, which needs board firmware with it) at 1 kHz for `SECONDS` (at most 10) into a paper towel held under the cartridge, through the same waveform and safety checks as a pass, starting at least 0.1 s after the boost came on. Refused without `CONFIRM=1`, during a print (also a paused one) or with passes queued. Turns PolyDye off and puts the template, pulse and clock back afterwards. **`EXTENDED=1` is experimental and can burn out nozzles** (see below) |
+| `POLYDYE_SPIT [SECONDS=2] [TEMPLATE=] [PULSE=] [CLOCK=ours\|stock\|half] [PATTERN=all\|mid\|sparse\|stock] [PERIOD_US=1000] [EXTENDED=1] CONFIRM=1` | **Live ink, no motion.** Fires every nozzle (or positions 14–90, or `sparse`: one nozzle per fire pulse in turn, which needs board firmware with it, or `stock`: like the stock firmware, see below) at 1 kHz, or a column every `PERIOD_US`, for `SECONDS` (at most 10, and at most 10000 columns) into a paper towel held under the cartridge, through the same waveform and safety checks as a pass, starting at least 0.1 s after the boost came on. Refused without `CONFIRM=1`, during a print (also a paused one) or with passes queued. Turns PolyDye off and puts the template, pulse and clock back afterwards. **`EXTENDED=1` is experimental and can burn out nozzles** (see below) |
 | `POLYDYE_LEVEL LINE=D1\|D2\|D3\|CSYNC\|S1..S5\|DCLK [STATE=high\|low\|off]` | Signal check, **cartridge out**: holds one cartridge line at its rail voltage (`high`) or 0 V for a multimeter; `STATE=off` puts every line LOW. Needs `POLYDYE_ENABLE LIVE=0` first and nothing queued. The fire lines are never held. A line goes back to LOW after 5 minutes, or when a pass is scheduled or PolyDye turns off |
 
 Macros (Mainsail's Macros panel, while the board is plugged in):
@@ -373,8 +373,27 @@ remaining}` in seconds, or `null` (missing with older board firmware); and `bus_
 `bus_hz` (nominal) and `bus_hz_measured` (from the last column the board sent, `null` before one), missing with older
 board firmware. `pulse_us` follows the clock (2.857 MHz for stock, also with board firmware that reports 5.714).
 `bus_clocks` lists the clocks the board firmware offers, `templates` its templates and `spit_patterns` the spit test's
-patterns. It also has `last_pass`, `pass_axis`, `offset_x`, `offset_y` and `direction_trim`, the
+patterns (`stock` with board firmware that also takes `PERIOD_US`). It also has `last_pass`, `pass_axis`, `offset_x`, `offset_y` and `direction_trim`, the
 values in use including nudges.
+
+### Stock-emulation spit test
+
+`POLYDYE_SPIT PATTERN=stock` fires the way the stock PolyDye firmware does (from a behavioural reverse-engineering
+report): each of nozzle positions 14–85 of each colour fires with probability 255/1024 (24.9 %, its random dither at
+full ink), and every column goes out twice in a row. That is about 2.2 heaters per fire pulse on average, at most 9.
+Unless you give `TEMPLATE`, `CLOCK` or `PULSE`, it also uses the stock firmware's timing: `color_b_late`, the stock
+clock (2.857 MHz) and 6 words (2.10 µs; 1.8 µs at the clock you give). Colour templates only.
+
+`PERIOD_US` sets the column period for any spit test (default 1000 µs, 1 kHz). The stock firmware sends a column every
+508 µs or so, with the bus all LOW in between, the same as ours. The period must be at least the column's time on the
+bus plus 20 µs: 192 µs for `color_b_late` at the stock clock, more with a longer pulse; the add-on says the minimum. A
+spit test is at most 10000 columns (3000 with `EXTENDED=1`), so at 508 µs it lasts at most 5.08 s (1.52 s). Both need
+board firmware with them (this add-on's bundled firmware); older firmware refuses with the update hint.
+
+```
+POLYDYE_SPIT SECONDS=3 PATTERN=stock PERIOD_US=508 CONFIRM=1
+POLYDYE_SPIT SECONDS=2 PATTERN=stock PERIOD_US=254 CONFIRM=1
+```
 
 ### Experimental: extended spit test
 
