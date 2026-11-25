@@ -162,6 +162,12 @@ class CalibrationPrints(unittest.TestCase):
                          ["G28", "POLYDYE_TEST_PAGE Z=1.0 X=120.0 PRIME=0.5"])
         self.assertEqual(run(self.macros, "PD_TEST_PAGE", "Z=1.5", homed="xyz"), ["POLYDYE_TEST_PAGE Z=1.5"])
 
+    def test_the_head_clean_homes_only_when_needed_and_passes_the_values(self):
+        self.assertEqual(run(self.macros, "PD_CLEAN", "WARM=4 SECONDS=2 STROKES=5", homed="x"),
+                         ["G28", "POLYDYE_CLEAN WARM=4.0 SECONDS=2.0 STROKES=5"])
+        # During a print too (homed): POLYDYE_CLEAN waits for the passes before it.
+        self.assertEqual(run(self.macros, "PD_CLEAN", homed="xyz", print_state="printing"), ["POLYDYE_CLEAN"])
+
     def test_refused_during_a_print_before_homing(self):
         for name in ("PD_ALIGN_PRINT", "PD_OFFSET_PRINT", "PD_TEST_PAGE"):
             with self.assertRaisesRegex(MacroError, "not during a print"):

@@ -88,7 +88,8 @@ does. It shows:
   appears to bring Klipper back.
 - **Board status**, live: firmware, boost, dry run or live ink, passes queued and printed, faults, worst column
   lateness, stored passes, cartridge template and fire pulse.
-- **Controls:** dry-run test, cartridge wipe, status, off, and enabling live ink (with a confirmation).
+- **Controls:** dry-run test, cartridge wipe, head clean (live ink into the sponge, with a confirmation; also in a
+  paused print, never mid-layer; see "Cleaning the head"), status, off, and enabling live ink (with a confirmation).
 - **Settings:** pass axis, offsets, direction trim, cartridge template, fire pulse, resolution and pass speed, saved into the
   `[polydye]` section of `polydye.cfg`. Klipper applies them after a restart.
 - **Ink position:** live nudges for lining the ink up with the plastic. Pick a step (0.02–0.4 mm) and move the
@@ -259,6 +260,7 @@ offset_y: -8.7
 #warm_clearance: 10   # mm behind the pass's run-up start, for warm_position: pass
 #warm_prespit: 0      # s of stock-pattern spit at the warm spot right after a warm-up (0: none; up to 5)
 #prime_seconds: 0.3   # s of POLYDYE_PRIME's stock-pattern spit over the wipe sponge without SECONDS (up to 5)
+#clean_seconds: 1.5   # s of POLYDYE_CLEAN's stock-pattern spit over the wipe sponge without SECONDS (up to 5)
 #cyan_columns: 0      # colour registration (POLYDYE_ALIGN sets these): cyan's and yellow's dots against magenta's,
 #cyan_positions: 0    #   in bus columns along the pass (DIR=1's order) and nozzle positions across it
 #yellow_columns: 0
@@ -429,6 +431,7 @@ If anything would print a pass wrongly, Klipper stops with a readable reason, fo
 | `POLYDYE_PASS LAYER= PASS= X= Y= [DIR=1] [SPEED=] [WARM=] [WARM_PULSE=] [WARM_PERIOD_US=] [PRESPIT=]` | Prints one pass (above), after an automatic head warm-up off the print if live ink is on and the head is cold; `WARM` asks for one (seconds), `WARM=0` for none, `PRESPIT` adds a stock-pattern pre-spit after it (see "Automatic head warm-up") |
 | `POLYDYE_PREWARM [SECONDS=6]` | Warms the head in the background while the moves after it run, so it's hot for the next pass (see "Prewarm bursts"): `SECONDS` (default `prewarm_seconds`, 6) of every nozzle at 1 word (0.35 µs, which doesn't eject) every `warm_period_us`, from where the moves before it end, without stopping them. Turns live ink on. A pass never waits for it: one that comes first cuts it short, and needs no warm-up of its own. At most 16.6 s at 254 µs. Needs this add-on's bundled board firmware |
 | `POLYDYE_PRIME [SECONDS=0.3]` | Primes the nozzles over the wipe sponge before an ink layer whose colours have been idle (see "Priming"): waits for the passes before it, turns live ink on, goes up by `POLYDYE_WIPE`'s `z_hop` and over the sponge, spits `SECONDS` (default `prime_seconds`, 0.3; up to 5) of the stock pattern in every colour, then comes back. Allowed during a print, no `CONFIRM`. Colour templates only; needs the `POLYDYE_WIPE` macro and this add-on's bundled board firmware |
+| `POLYDYE_CLEAN [WARM=6] [SECONDS=1.5] [STROKES=3]` | Cleans the nozzles over the wipe sponge (see "Cleaning the head"): waits for the passes before it (refused if they're still running 5 s later), turns live ink on, goes up by `POLYDYE_WIPE`'s `z_hop` and over the sponge, warms the head for `WARM` s (default `prewarm_seconds`; 0: none), spits `SECONDS` (default `clean_seconds`, 1.5; up to 5) of the stock pattern in every colour, wipes with `POLYDYE_WIPE`'s strokes there (`STROKES`, default its `strokes`; 0: none), then comes back. Live ink is afterwards as it was before. Allowed during a print, no `CONFIRM`. Colour templates only; needs the `POLYDYE_WIPE` macro and this add-on's bundled board firmware. Doesn't home (`PD_CLEAN` does) |
 | `POLYDYE_JOB [FILE=]` | At the start of a print sliced with `polydye_post.py` (it puts it there): loads the print's ink job and uploads its passes to the board as the print runs (see "Colour prints from OrcaSlicer"). Refuses, before anything moves, a job sliced for another `dpi` or `nozzle_dpi`, one the colour registration would move off nozzle positions 14–85, ink beyond the axis limits (each pass's run-up at the acceleration the G-code sets for the ink) or above the Z axis (`--gap` over the top layer), or bursts and primes the board or macros can't run. While it's loaded the colour registration and `nozzle_skew` can't change. Needs `data_port` |
 | `POLYDYE_JOB_PASS N=` | Prints the job's pass `N` with `POLYDYE_PASS` once it's on the board (waits for it): one board pass, or two over the same ground where it's split by fire line (see "Colour prints from OrcaSlicer"); skipped if its object is excluded |
 | `POLYDYE_INK_MOTION [ACCEL=1000] [SCV=1] [RESTORE=1]` | Gentler moves for an ink block: acceleration and square corner velocity at most `ACCEL`, `SCV` (never raised), until `RESTORE=1` puts back the limits from before; a print that ends inside an ink block gets them back too. `polydye_post.py` puts it around each layer's ink |
@@ -456,6 +459,7 @@ Macros (Mainsail's Macros panel, while the board is plugged in):
 | `PD_STATUS` | `POLYDYE_STATUS` |
 | `PD_DRY_RUN_TEST [X=100] [Y=40]` | Homes if needed, lifts Z to 20 mm, uploads a test pass and prints it in both directions without ink, then reports status. The printer moves; nothing fires |
 | `PD_OFF` | Drops queued passes, then turns live output and the boost off |
+| `PD_CLEAN [WARM=] [SECONDS=] [STROKES=]` | **Live ink** into the wipe sponge. Homes if needed, then cleans the head (`POLYDYE_CLEAN`); also during a print |
 | `PD_TEST_PAGE [X=] [Y=] [Z=1] [WARM=] [PRIME=]` | **Live ink, on paper only.** Refused during a print. Homes if needed, then prints the test page (`POLYDYE_TEST_PAGE`) at `Z` |
 | `PD_ALIGN_PRINT [X=] [Y=] [Z=1] [SPACING=8]` | **Live ink, on paper only.** Refused during a print. Homes if needed, then prints the alignment page (`POLYDYE_ALIGN_PRINT`) at `Z` |
 | `PD_OFFSET_PRINT [X=] [Y=] [LAYERS=] [LAYER_HEIGHT=] [GAP=] [EXTRUDER_TEMP=] [BED_TEMP=]` | **PLA and live ink.** Refused during a print. Homes if needed, then runs `POLYDYE_OFFSET_PRINT` |
@@ -663,6 +667,22 @@ POLYDYE_PASS LAYER=5 PASS=0 X=120 Y=100 DIR=1
 
 On paper, a 6 s burst, then a 0.2 s prime, then one layer's eight wall passes printed all four walls; without the
 prime only the colour that had just fired did.
+
+### Cleaning the head
+
+HP's own service cycle for these cartridges is spit, wipe and cap. PolyDye has the first two at the wipe sponge:
+
+| | Fires | Wipes | For |
+|---|---|---|---|
+| `POLYDYE_WIPE` | nothing | 3 strokes | taking ink, fluff or plastic strings off the nozzle plate |
+| `POLYDYE_PRIME` | 0.3 s of the stock pattern | no | nozzles that have sat idle for a minute or two, right before ink (a print does it by itself) |
+| `POLYDYE_CLEAN` (`PD_CLEAN`, **Clean head** on the page) | a 6 s warm-up, then 1.5 s of the stock pattern | 3 strokes | nozzles that have dried or crusted: a cartridge that sat out, or gaps in the test page's nozzle check |
+
+So the sponge alone wipes but doesn't clear a nozzle: only firing does. `POLYDYE_CLEAN` warms first because the head
+only ejects when it's hot, then spits about 2950 columns (each nozzle fires about 700 times), all in one board run
+over the sponge, wipes the ink off the plate there and comes back. Keep the sponge damp. Then print the test page
+(`PD_TEST_PAGE`) again; a nozzle still missing after a few cleans is blocked for good. Capping the cartridge between
+prints, the third step, would need a parking spot on a damp sponge; there's none yet.
 
 ### Test page
 

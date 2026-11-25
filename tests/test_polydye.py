@@ -30,6 +30,7 @@ def bare_polydye():
     pd.job, pd.data_lock, pd.nozzle_skew, pd.ink_motion = None, threading.Lock(), 0., None
     pd.prewarm_cmd = pd.query_prewarm_cmd = pd.prewarm_sent = pd.prewarm_state = pd.boost_ready = None
     pd.prewarm_seconds, pd.prewarm_gen, pd.prime_seconds = polydye.AUTO_PREWARM_S, 0, polydye.PRIME_S
+    pd.clean_seconds = polydye.CLEAN_S
     return pd
 
 
@@ -1032,13 +1033,14 @@ class AutoWarm(unittest.TestCase):
         here = types.SimpleNamespace(x=10., y=20., z=0.3, e=0.)
         self.travel = []
         gcode_move = types.SimpleNamespace(
-            get_status=lambda eventtime: {'gcode_position': here, 'position': here},
+            get_status=lambda eventtime: {'gcode_position': here, 'position': here}, base_position=[0., 0., 0., 0.],
             last_position=[10., 20., 0.3, 0.], move_with_transform=lambda pos, speed: self.travel.append(pos[:2]),
             reset_last_position=lambda: None)
         board.queued_until = 0.  # print time the moves already queued end at
-        self.z_max = 250.
+        self.z_max, self.homed = 250., 'xyz'
         limits = lambda: {'axis_minimum': types.SimpleNamespace(x=0., y=-10., z=0.),
-                          'axis_maximum': types.SimpleNamespace(x=235., y=220., z=self.z_max)}
+                          'axis_maximum': types.SimpleNamespace(x=235., y=220., z=self.z_max),
+                          'homed_axes': self.homed}
         self.objects = {'toolhead': types.SimpleNamespace(
                             wait_moves=lambda: None, get_last_move_time=lambda: board.queued_until,
                             get_status=lambda eventtime: limits()),
@@ -1496,6 +1498,144 @@ class Prime(unittest.TestCase):
         self.assertIn("stays over the warm-up spot", self.said[-1])
         self.assertFalse(any(m.startswith("G1 X10.000") for m in moves if isinstance(m, str)))
         self.assertEqual((moves[-1], pd.last_fire), ("RESTORE_GCODE_STATE NAME=polydye_warm", None))
+
+
+class Clean(unittest.TestCase):
+    """POLYDYE_CLEAN: a warm-up and a longer stock-pattern spit over the wipe sponge, then POLYDYE_WIPE's strokes."""
+
+    make = AutoWarm.make
+
+    def gcmd(self, **params):
+        def get(name, default=None, **kw):
+            return params.get(name, default)
+        return types.SimpleNamespace(get=get, get_float=get, get_int=get, respond_info=self.said.append,
+                                     error=RuntimeError)
+
+    def clean(self):
+        pd, board, runs, moves = Prime.prime(self)
+        pd.warm_max_s = 30.
+        # Within the fixture's 235 mm X axis.
+        self.objects['gcode_macro POLYDYE_WIPE'].variables = {'x': 230, 'z_hop': 1}
+        return pd, board, runs, moves
+
+    def test_a_clean_warms_spits_and_wipes_over_the_sponge(self):
+        pd, board, runs, moves = self.clean()
+        pd.cmd_POLYDYE_CLEAN(self.gcmd())
+        # 6 s (prewarm_seconds) of the warm-up recipe, then 1.5 s (clean_seconds) of the stock pattern, in one run.
+        self.assertEqual(runs, [[0, 2953, polydye.SPIT_PATTERNS['stock'], 0, 508, 23622, 1, 254]])
+        # Up by the z_hop, over the sponge, warm and spit, POLYDYE_WIPE's 3 strokes of 25 mm at 50 mm/s there, back;
+        # then live ink off again, as it was before.
+        strokes = "\n".join(["G1 X205.000 F3000\nG1 X230.000 F3000"] * 3)
+        self.assertEqual(moves, [('mode', 1, 1), 'dwell', "SAVE_GCODE_STATE NAME=polydye_warm",
+                                 "G90\nG1 Z1.300 F900\nG1 X230.000 F9000", 'run', strokes,
+                                 "G1 X10.000 Y20.000 F9000\nG1 Z0.300 F900", "RESTORE_GCODE_STATE NAME=polydye_warm",
+                                 ('mode', 0, 0)])
+        self.assertEqual((board.live, pd.last_fire), (False, 100.))
+        self.assertIn("cleaning the head over the wipe sponge (X=230.0): a warm-up 6.0 s", self.said[0])
+        self.assertIn("1.5 s of the stock pattern (2953 columns every 508 us), then 3 wipe strokes of 25 mm",
+                      self.said[0])
+        self.assertIn("head cleaned", self.said[-1])
+        # During a print, with live ink on: it stays on. SECONDS, WARM=0 (no warm-up) and STROKES=0 (no wipe).
+        board.print_state, board.boost, board.live = 'printing', True, True
+        del moves[:]
+        pd.cmd_POLYDYE_CLEAN(self.gcmd(SECONDS=2., WARM=0., STROKES=0))
+        self.assertEqual(runs[-1], [0, 3937, polydye.SPIT_PATTERNS['stock'], 0, 508, 0, 0, 0])
+        self.assertEqual(moves, [('mode', 1, 1), "SAVE_GCODE_STATE NAME=polydye_warm",
+                                 "G90\nG1 Z1.300 F900\nG1 X230.000 F9000", 'run',
+                                 "G1 X10.000 Y20.000 F9000\nG1 Z0.300 F900", "RESTORE_GCODE_STATE NAME=polydye_warm"])
+        self.assertTrue(board.live)
+
+    def test_refused_before_anything_moves_or_fires(self):
+        def busy(pd, board):
+            pd._fresh_status = pd._query_status = lambda: dict(board.status(), running=True)
+        for setup, error in (
+                (lambda pd, board: setattr(pd, 'spit_run_cmd', None), "needs newer PolyDye board firmware"),
+                (lambda pd, board: setattr(pd, 'spit_patterns', ('all',)), "needs newer PolyDye board firmware"),
+                # Older board firmware warms for at most 10 s; Klipper doesn't bound a default (prewarm_seconds).
+                (lambda pd, board: setattr(pd, 'warm_max_s', 5.), r"a 6 s warm-up is longer than the board takes"),
+                (lambda pd, board: self.objects.pop('gcode_macro POLYDYE_WIPE'), "no POLYDYE_WIPE macro"),
+                (lambda pd, board: self.objects['gcode_macro POLYDYE_WIPE'].variables.update(length=240),
+                 r"strokes \(X 230.0 back to -10.0\) must stay within the X axis"),
+                (lambda pd, board: setattr(self, 'homed', 'xy'), r"home Z first \(G28\)"),
+                (busy, "still busy with passes, so the head can't be cleaned"),
+                (lambda pd, board: setattr(board, 'template', 'black_b'),
+                 "for a colour cartridge template, not black_b")):
+            pd, board, runs, moves = self.clean()
+            setup(pd, board)
+            with self.assertRaisesRegex(RuntimeError, "POLYDYE_CLEAN: .*" + error):
+                pd.cmd_POLYDYE_CLEAN(self.gcmd())
+            self.assertEqual((runs, moves, board.live, pd.last_fire), ([], [], False, None), error)
+
+    def test_live_ink_the_board_doesnt_take_or_a_failed_enable_goes_off_again(self):
+        # A board that doesn't turn live ink on: no trip, no spit, no wipe.
+        pd, board, runs, moves = self.clean()
+
+        def mode(args):
+            board.boost = bool(args[1])
+            board.sent.append(('mode', args[1], args[2]))
+        pd.mode_cmd = types.SimpleNamespace(send=mode)
+        with self.assertRaisesRegex(RuntimeError, "the board didn't turn live ink on, so it doesn't clean"):
+            pd.cmd_POLYDYE_CLEAN(self.gcmd())
+        self.assertEqual((runs, [m for m in moves if isinstance(m, str)], moves[-1]), ([], ['dwell'], ('mode', 0, 0)))
+        # The wait for the boost fails after live ink went on: off again.
+        pd, board, runs, moves = self.clean()
+
+        def dwell(t):
+            raise RuntimeError("Must home axis first")
+        self.objects['toolhead'].dwell = dwell
+        with self.assertRaisesRegex(RuntimeError, "Must home axis first"):
+            pd.cmd_POLYDYE_CLEAN(self.gcmd())
+        self.assertEqual((runs, moves, board.live), ([], [('mode', 1, 1), ('mode', 0, 0)], False))
+
+    def test_a_print_that_ends_while_it_waits_gets_no_clean(self):
+        pd, board, runs, moves = self.clean()
+        board.print_state = 'printing'
+
+        def wait_moves():  # the print is cancelled meanwhile
+            board.print_state = 'cancelled'
+        self.objects['toolhead'].wait_moves = wait_moves
+        with self.assertRaisesRegex(RuntimeError, "the print ended while it waited for the passes before it"):
+            pd.cmd_POLYDYE_CLEAN(self.gcmd())
+        self.assertEqual((runs, moves, board.live), ([], [], False))
+
+    def test_a_print_that_ends_during_the_board_run_gets_no_wipe(self):
+        # The status poll sees the print cancelled while the board warms: it stops the run and turns live ink off. The
+        # run isn't running any more, but it didn't finish: no strokes, and no "head cleaned".
+        pd, board, runs, moves = self.clean()
+        board.print_state, board.boost, board.live, board.running = 'printing', True, True, False
+        pd.printer.lookup_object('gcode').respond_info = self.said.append
+
+        def status():
+            if board.running and board.print_state == 'printing':
+                board.print_state = 'cancelled'
+                pd._check_print_end(0.)
+                board.running = False
+            return dict(board.status(), running=board.running)
+        pd._fresh_status = pd._query_status = status
+        pd.spit_run_cmd = types.SimpleNamespace(send=lambda args: (runs.append(args), setattr(board, 'running', True)))
+        with self.assertRaisesRegex(RuntimeError, "the clean was stopped before it finished"):
+            pd.cmd_POLYDYE_CLEAN(self.gcmd())
+        self.assertEqual(len(runs), 1)
+        self.assertFalse([m for m in moves if isinstance(m, str) and m.startswith("G1 X205")])
+        self.assertIn("G1 X10.000 Y20.000 F9000\nG1 Z0.300 F900", moves)  # back from the sponge: the board is idle
+        self.assertFalse([s for s in self.said if "head cleaned" in s])
+        self.assertEqual((board.live, pd.last_fire), (False, None))
+
+    def test_a_clean_the_board_cant_be_seen_to_finish_doesnt_wipe(self):
+        # In a print with live ink on: after the failure it goes off all the same.
+        pd, board, runs, moves = self.clean()
+        board.print_state, board.boost, board.live = 'printing', True, True
+        board.running = False
+        pd._fresh_status = pd._query_status = lambda: dict(board.status(), running=board.running)
+        pd.spit_run_cmd = types.SimpleNamespace(send=lambda args: (runs.append(args), setattr(board, 'running', True)))
+        with self.assertRaisesRegex(RuntimeError, "didn't finish the clean"):
+            pd.cmd_POLYDYE_CLEAN(self.gcmd())
+        # No strokes and no way back across the bed: it stays over the sponge. Live ink off was sent; the status poll
+        # makes sure of it once the board goes idle.
+        self.assertFalse([m for m in moves if isinstance(m, str) and m.startswith("G1 X")])
+        self.assertIn("stays over the warm-up spot", self.said[-1])
+        self.assertEqual((moves[-1], board.live, pd.live_off_pending, pd.last_fire),
+                         (('mode', 0, 0), False, True, None))
 
 
 class RandomPattern(unittest.TestCase):

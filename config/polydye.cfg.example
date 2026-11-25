@@ -55,6 +55,9 @@ offset_y: -8.7
 # Seconds of POLYDYE_PRIME's stock-pattern spit over the wipe sponge without SECONDS (up to 5): an ink layer whose
 # colours haven't ejected for 90 s or more starts with one (0.2 s left a full-width cyan bar's start ragged).
 #prime_seconds: 0.3
+# Seconds of POLYDYE_CLEAN's stock-pattern spit over the wipe sponge without SECONDS (up to 5), after its warm-up and
+# before the wipe strokes.
+#clean_seconds: 1.5
 # The nozzle row's yaw: position p's dots land nozzle_skew x (p - 50) nozzle pitches further along the pass than
 # position 50's, and every pass the add-on draws (calibration prints, ink jobs) moves them back. 0.03 measured on
 # Brett's mount; POLYDYE_OFFSET SKEW= SAVE=1 sets it. Print the alignment page again after changing it.
