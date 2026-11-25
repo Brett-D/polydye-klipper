@@ -88,8 +88,8 @@ does. It shows:
   appears to bring Klipper back.
 - **Board status**, live: firmware, boost, dry run or live ink, passes queued and printed, faults, worst column
   lateness, stored passes, cartridge template and fire pulse.
-- **Controls:** dry-run test, cartridge wipe, head clean (live ink into the sponge, with a confirmation; see
-  "Cleaning the head"), status, off, and enabling live ink (with a confirmation).
+- **Controls:** dry-run test, cartridge wipe, head clean (live ink into the sponge, with a confirmation; also in a
+  paused print, never mid-layer; see "Cleaning the head"), status, off, and enabling live ink (with a confirmation).
 - **Settings:** pass axis, offsets, direction trim, cartridge template, fire pulse, resolution and pass speed, saved into the
   `[polydye]` section of `polydye.cfg`. Klipper applies them after a restart.
 - **Ink position:** live nudges for lining the ink up with the plastic. Pick a step (0.02–0.4 mm) and move the

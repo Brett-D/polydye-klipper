@@ -50,13 +50,13 @@
       <p class="hint">The dry run homes if needed, lifts the nozzle to 20 mm and prints two test passes without firing
         any ink. Wipe moves the cartridge to the sponge at the right end of the X gantry, wipes it and comes back.
         Clean head fires live ink into the sponge: it warms the head, spits 1.5 s of every colour and then wipes,
-        for nozzles that have dried up (print the test page again afterwards). All three move the printer; keep the
-        bed clear. To stop the printer at once, press Emergency stop at the top of
+        for nozzles that have dried up (print the test page again afterwards); during a print, pause it first. All
+        three move the printer; keep the bed clear. To stop the printer at once, press Emergency stop at the top of
         the page; Off only turns PolyDye off once the queued moves are done.</p>
       <div class="buttons">
         <button data-gcode="PD_DRY_RUN_TEST" class="primary needs-board needs-idle">Dry run test</button>
         <button data-gcode="POLYDYE_WIPE" class="needs-board needs-idle">Wipe</button>
-        <button id="clean-btn" class="danger needs-board needs-idle">Clean head&hellip;</button>
+        <button id="clean-btn" class="danger needs-board needs-not-running">Clean head&hellip;</button>
         <button data-gcode="POLYDYE_STATUS" class="needs-board">Refresh status</button>
         <button data-gcode="PD_OFF" class="needs-board">Off</button>
         <button id="live-btn" class="danger needs-board needs-idle">Enable live ink&hellip;</button>

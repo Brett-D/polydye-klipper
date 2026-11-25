@@ -2383,7 +2383,7 @@ class PolyDye:
     cmd_POLYDYE_CLEAN_help = ("Clean the nozzles over the wipe sponge: a WARM s (prewarm_seconds) warm-up, SECONDS "
                               "(clean_seconds, 1.5) of the stock pattern, then POLYDYE_WIPE's strokes (STROKES), then "
                               "back. Allowed during a print, no CONFIRM; waits for the passes before it, refused if "
-                              "they're still running; live ink afterwards as it was before")
+                              "they're still running; live ink afterwards as it was before (off after a failure)")
 
     def cmd_POLYDYE_CLEAN(self, gcmd):
         cmd = "POLYDYE_CLEAN"
@@ -2423,7 +2423,7 @@ class PolyDye:
         spit = max(1, int(round(seconds * 1e6 / STOCK_PERIOD_US)))
         feed = speed * 60.
         then = "\n".join("G1 X%.3f F%d\nG1 X%.3f F%d" % (x - length, feed, x, feed) for _ in range(strokes))
-        was_live = st['live']
+        was_live, cleaned = st['live'], False
         # Live ink on; if the boost was off, the moves to the sponge wait for it to settle.
         self._enable(gcmd, cmd, True)
         try:
@@ -2433,8 +2433,10 @@ class PolyDye:
                 % (where, "a %s, then " % (warm_text(plan[2], plan[0], plan[1]),) if plan else "", seconds, spit,
                    STOCK_PERIOD_US, ", then %d wipe strokes of %g mm" % (strokes, length) if strokes else ""),
                 then=then or None)
+            cleaned = True
         finally:
-            if not was_live and not self.printer.is_shutdown():
+            # As it was before, once cleaned; after a failure (the board maybe still firing) off whatever it was.
+            if not (cleaned and was_live) and not self.printer.is_shutdown():
                 try:
                     self._live_off()
                 except Exception:

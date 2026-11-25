@@ -1578,7 +1578,9 @@ class Clean(unittest.TestCase):
         self.assertEqual((runs, moves, board.live), ([], [], False))
 
     def test_a_clean_the_board_cant_be_seen_to_finish_doesnt_wipe(self):
+        # In a print with live ink on: after the failure it goes off all the same.
         pd, board, runs, moves = self.clean()
+        board.print_state, board.boost, board.live = 'printing', True, True
         board.running = False
         pd._fresh_status = pd._query_status = lambda: dict(board.status(), running=board.running)
         pd.spit_run_cmd = types.SimpleNamespace(send=lambda args: (runs.append(args), setattr(board, 'running', True)))

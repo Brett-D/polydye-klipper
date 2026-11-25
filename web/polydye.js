@@ -223,8 +223,13 @@ function render() {
   text('s-head', known ? headText(pd) : '–');
   renderNudges(pd);
   // Idle-only controls also wait for a firmware update: the dry run uses the same data port. Off stays available.
+  // needs-not-running ones (the head clean) also work while a print is paused, never mid-layer.
+  const running = printing && p.print_stats.state === 'printing';
   document.querySelectorAll('.needs-board').forEach((b) => {
-    b.disabled = !state.board || (b.classList.contains('needs-idle') && (printing || state.fw.updating));
+    const idle = b.classList.contains('needs-idle');
+    const notRunning = b.classList.contains('needs-not-running');
+    b.disabled = !state.board || (idle && printing) || (notRunning && running)
+      || ((idle || notRunning) && state.fw.updating);
   });
   renderFirmware(printing);
   renderDiagnostics(pd, printing);
@@ -1254,8 +1259,8 @@ document.querySelectorAll('button[data-gcode]').forEach((b) => {
 
 $('clean-btn').addEventListener('click', () => {
   const ok = window.confirm('Clean the head with LIVE INK?\n\nIt homes if needed, moves the cartridge over the wipe '
-    + 'sponge, warms the head, spits about 1.5 s of every colour into the sponge and wipes it there, then comes back. '
-    + 'The sponge should be damp.');
+    + 'sponge, warms the head, spits about 1.5 s of every colour into the sponge and wipes it there, then comes back '
+    + '(in a paused print, to where it paused). The sponge should be damp.');
   if (ok) gcode('PD_CLEAN');
 });
 
