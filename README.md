@@ -481,7 +481,7 @@ lines detached (setting it up again, up to three times, if it is off), and fires
 fast or 8 % slow: Klipper shuts down with "the cartridge bus
 clock measured more than 5 % off its setting; nothing fired", and the add-on adds what it measured, e.g. `bus clock
 measured 18.491 MHz (stock clock 2.857 MHz, +547.2 %): WRONG, outside the board's +5/-8 % clock check, so it fires
-nothing at it`. It also holds every live column to those bounds. A spit test or warm-up says the clock its columns go
+nothing at it`. It also checks every live column against those bounds: single columns that look slow (interrupt latency, 16–20 % on hardware) are only counted, and the run stops after three in a row or one 1.5 times too fast (firmware 13c5d27 and later; a5bfdac stopped on single columns). A spit test or warm-up says the clock its columns go
 out at while it runs, and the add-on adds the board's last measurement to any driver fault. `POLYDYE_CLOCK_TEST
 COUNT=100` checks 100 switches each way without ink. If the clock is refused twice in a row after `FIRMWARE_RESTART`,
 power-cycle the board (unplug its USB).
