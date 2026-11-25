@@ -114,7 +114,7 @@ class StatusPoll(unittest.TestCase):
         state = {'shutdown': False}
         pd.printer = types.SimpleNamespace(is_shutdown=lambda: state['shutdown'], get_reactor=lambda: reactor,
                                            lookup_object=lambda name, default=None: default)
-        pd.querying = pd.query_failing = False
+        pd.querying = pd.query_failing = pd.print_live = False
         pd._query_status = lambda: query(state)
         return pd, state, reactor
 
@@ -153,32 +153,47 @@ class StatusPoll(unittest.TestCase):
 class PrintEnd(unittest.TestCase):
     def test_a_cancelled_or_failed_print_turns_live_ink_off(self):
         pd = object.__new__(polydye.PolyDye)
-        pd.oid, pd.boost_idle_s, pd.print_state, pd.last_fire = 0, 1800, None, 50.
+        pd.oid, pd.boost_idle_s, pd.print_live, pd.last_fire = 0, 1800, False, 50.
         sent, said = [], []
         pd.cancel_cmd = types.SimpleNamespace(send=lambda args: sent.append('cancel'))
         pd.mode_cmd = types.SimpleNamespace(send=lambda args: sent.append(('mode', args[1], args[2])))
+        pd._fresh_status = lambda: {'boost': True}
+        pd._check_current_pulse = lambda gcmd, name, st: None
         state = ['standby']
+        reactor = types.SimpleNamespace(monotonic=lambda: 0.)
         objects = {'print_stats': types.SimpleNamespace(get_status=lambda eventtime: {'state': state[0]}),
                    'gcode': types.SimpleNamespace(respond_info=said.append)}
-        pd.printer = types.SimpleNamespace(lookup_object=lambda name, default=None: objects.get(name, default))
+        pd.printer = types.SimpleNamespace(lookup_object=lambda name, default=None: objects.get(name, default),
+                                           get_reactor=lambda: reactor)
+        gcmd = types.SimpleNamespace(get_int=lambda name, default, **kw: 1, respond_info=lambda msg: None)
         off = ['cancel', ('mode', 1, 0)]  # passes dropped, live ink off, the boost kept as the board does
-        for now, expected in (('printing', []), ('complete', []), ('printing', []), ('cancelled', off),
-                              ('cancelled', []), ('printing', []), ('paused', []), ('error', off), ('printing', []),
-                              ('standby', off)):
-            state[0] = now
-            del sent[:]
-            pd._check_print_end(0.)
-            self.assertEqual(sent, expected, now)
-        self.assertEqual([s.split(", so")[0] for s in said], ["PolyDye: the print was cancelled",
-                                                              "PolyDye: the print stopped with an error",
-                                                              "PolyDye: the print ended"])
+
+        def run(steps):
+            for now, enable, expected in steps:
+                state[0] = now
+                if enable:
+                    pd.cmd_POLYDYE_ENABLE(gcmd)
+                del sent[:]
+                pd._check_print_end(0.)
+                self.assertEqual(sent, expected, now)
+        # Live ink outside a print (a fire test) is left alone; a print that turned it on is cleaned up however it
+        # ended, even between two polls.
+        run((('standby', True, []), ('printing', False, []), ('cancelled', False, []),
+             ('printing', True, []), ('paused', False, []), ('cancelled', False, off), ('cancelled', False, []),
+             ('printing', True, []), ('error', False, off),
+             ('printing', True, []), ('complete', False, off),
+             ('standby', False, [])))
+        state[0] = 'printing'
+        pd.cmd_POLYDYE_ENABLE(gcmd)
+        run((('error', False, off),))  # turned on and failed before a poll saw it printing
+        self.assertEqual([s.split(", so")[0] for s in said], [
+            "PolyDye: the print was cancelled", "PolyDye: the print stopped with an error",
+            "PolyDye: the print finished with live ink still on", "PolyDye: the print stopped with an error"])
         self.assertIsNone(pd.last_fire)
         # Older board firmware: the boost goes off too.
         pd.boost_idle_s, state[0] = None, 'printing'
-        pd._check_print_end(0.)
-        state[0], sent[:] = 'cancelled', []
-        pd._check_print_end(0.)
-        self.assertEqual(sent, ['cancel', ('mode', 0, 0)])
+        pd.cmd_POLYDYE_ENABLE(gcmd)
+        run((('cancelled', False, ['cancel', ('mode', 0, 0)]),))
 
 
 class StatusCommand(unittest.TestCase):

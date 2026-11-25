@@ -696,7 +696,7 @@ class PolyDye:
                                    "of the cartridge over printed plastic, off the print) or pass, not %r"
                                    % (position,))
         self.last_fire = None  # print time the head last fired (a live pass, spit test or warm-up); None: not yet
-        self.print_state = None  # print_stats' state at the last status poll (_check_print_end())
+        self.print_live = False  # a print turned live ink on and hasn't been seen to end yet (_check_print_end())
         self.dpi = config.getfloat('dpi', 847., above=0.)
         self.pass_speed = config.getfloat('pass_speed', 59.5, above=0.)
         self.travel_speed = config.getfloat('travel_speed', 150., above=0.)
@@ -903,24 +903,32 @@ class PolyDye:
             return self.printer.get_reactor().NEVER
         return eventtime + STATUS_INTERVAL
 
+    def _printing(self, eventtime):
+        """Whether a print is running or paused (virtual_sdcard, print_stats)."""
+        sdcard = self.printer.lookup_object('virtual_sdcard', None)
+        print_stats = self.printer.lookup_object('print_stats', None)
+        state = print_stats.get_status(eventtime).get('state') if print_stats is not None else None
+        return (sdcard is not None and sdcard.is_active()) or state in ('printing', 'paused')
+
     def _check_print_end(self, eventtime):
         """A print cancelled (CANCEL_PRINT waits for the command running, a pass's warm-up say) or ended by an error
-        never runs its own POLYDYE_ENABLE LIVE=0, and live ink stayed on (2026-11-25). So when print_stats leaves
-        printing or paused for cancelled, error or standby, the board drops its queued passes and stops any run (a
-        warm-up's, a pass's), and live ink goes off; the boost too unless the board keeps it on (boost_idle_s)."""
-        print_stats = self.printer.lookup_object('print_stats', None)
-        if print_stats is None or self.cancel_cmd is None:
+        never runs its own POLYDYE_ENABLE LIVE=0, and live ink stayed on (2026-11-25). So once a print that turned live
+        ink on (print_live, set by POLYDYE_ENABLE) is no longer running or paused, however it ended and however soon,
+        the board drops its queued passes and stops any run (a warm-up's, a pass's), and live ink goes off; the boost
+        too unless the board keeps it on (boost_idle_s)."""
+        if not self.print_live or self.cancel_cmd is None or self._printing(eventtime):
             return
-        state = print_stats.get_status(eventtime).get('state')
-        was, self.print_state = self.print_state, state
-        if was in ('printing', 'paused') and state in ('cancelled', 'error', 'standby'):
-            self.cancel_cmd.send([self.oid])
-            self.mode_cmd.send([self.oid, 0 if self.boost_idle_s is None else 1, 0])
-            self.last_fire = None  # the dropped passes never fired
-            msg = "PolyDye: the print %s, so its queued passes were dropped and live ink is off" % (
-                "was cancelled" if state == 'cancelled' else "stopped with an error" if state == 'error' else "ended")
-            logging.info("polydye: %s", msg)
-            self.printer.lookup_object('gcode').respond_info(msg)
+        self.print_live = False
+        print_stats = self.printer.lookup_object('print_stats', None)
+        state = print_stats.get_status(eventtime).get('state') if print_stats is not None else None
+        self.cancel_cmd.send([self.oid])
+        self.mode_cmd.send([self.oid, 0 if self.boost_idle_s is None else 1, 0])
+        self.last_fire = None  # the dropped passes never fired
+        msg = "PolyDye: the print %s, so its queued passes were dropped and live ink is off" % (
+            {'cancelled': "was cancelled", 'error': "stopped with an error",
+             'complete': "finished with live ink still on"}.get(state, "ended"),)
+        logging.info("polydye: %s", msg)
+        self.printer.lookup_object('gcode').respond_info(msg)
 
     def _query_status(self):
         if self.querying:
@@ -1266,6 +1274,9 @@ class PolyDye:
             self._check_current_pulse(gcmd, "POLYDYE_ENABLE", st)
             boost_was_on = st['boost']
         self.mode_cmd.send([self.oid, 1, live])
+        # Live ink turned on by a print: turned off again however the print ends (_check_print_end()).
+        if live and self._printing(self.printer.get_reactor().monotonic()):
+            self.print_live = True
         if not boost_was_on:
             # The rails need a moment after the boost turns on, and the board refuses live ink that comes sooner:
             # keep the next moves (and so the next pass) far enough out.
