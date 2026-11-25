@@ -2425,6 +2425,10 @@ class HeaterCap(unittest.TestCase):
             self.assertEqual({f for _, _, _, f in parts}, {-34 if direction > 0 else 226})
         colours, data = job_planes(bar(polydye.CYAN, 60, 28, 82) + bar(polydye.YELLOW, 60, 28, 82), 60)
         self.assertEqual(len(polydye.job_pass_parts(data, colours, 60, 1, (-34, 1, 27, 0))), 1)
+        # A lone dot doesn't eject, so the cap drops it: nothing left to send.
+        colours, data = job_planes(bar(polydye.MAGENTA, 1, 40, 40), 1)
+        self.assertEqual((polydye.job_pass_parts(data, colours, 1, 1), polydye.job_pass_data(data, colours, 1, 1)),
+                         ([], None))
 
     def test_reverse_passes_drop_the_same_dots(self):
         dots = [d for c in range(3) for d in bar(c, 61, 16, 83)]

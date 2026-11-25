@@ -1250,7 +1250,8 @@ def job_pass_data(data, colours, columns, direction, registration=(0, 0, 0, 0), 
     (data, columns, first), first the drawing column of the pass's first column (its X, Y name column 0). None if no
     dot is left. As one board pass: job_pass_parts() splits it by fire line where it needs to."""
     raw = _job_columns(data, colours, columns, registration, skew)
-    return None if raw is None else _job_part(raw[0], raw[1], direction)
+    built = None if raw is None else _job_part(raw[0], raw[1], direction)
+    return built if built and built[1] else None
 
 
 def job_pass_parts(data, colours, columns, direction, registration=(0, 0, 0, 0), skew=None):
@@ -1265,7 +1266,8 @@ def job_pass_parts(data, colours, columns, direction, registration=(0, 0, 0, 0),
         return []
     out, lo = raw
     if len(colours) < 2 or not needs_split(out):
-        return [(0,) + _job_part(out, lo, direction)]
+        built = _job_part(out, lo, direction)
+        return [(0,) + built] if built[1] else []  # the cap can drop every fire: a lone dot, say
     parts = []
     for offset, mask in ((0, 0x0f), (SPLIT_PASS, 0xf0)):
         half = out.translate(_mask_table(mask))
@@ -1505,7 +1507,7 @@ class JobStreamer:
         parts = job_pass_parts(job_record_data(f, rec), rec['colours'], rec['columns'], rec['dir'],
                                self.registration, self.skew)
         if not parts:
-            raise JobError("pass %d has no dots left after the colour registration" % (n,))
+            raise JobError("pass %d has no dots left after the colour registration and the heater cap" % (n,))
         ready = []
         for offset, data, columns, first in parts:
             number = rec['pass'] | offset
