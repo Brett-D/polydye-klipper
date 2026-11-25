@@ -27,7 +27,7 @@ import polydye_post  # noqa: E402  (its job writer, without numpy)
 def bare_polydye():
     """A PolyDye without its __init__ (no Klipper), with the state every command needs."""
     pd = object.__new__(polydye.PolyDye)
-    pd.job, pd.data_lock, pd.nozzle_skew = None, threading.Lock(), 0.
+    pd.job, pd.data_lock, pd.nozzle_skew, pd.ink_motion = None, threading.Lock(), 0., None
     pd.prewarm_cmd = pd.query_prewarm_cmd = pd.prewarm_sent = pd.prewarm_state = pd.boost_ready = None
     pd.prewarm_seconds, pd.prewarm_gen, pd.prime_seconds = polydye.AUTO_PREWARM_S, 0, polydye.PRIME_S
     return pd
@@ -2294,17 +2294,38 @@ def bar(c, columns, p0, p1):
 
 
 def capped(built, direction):
-    """pass_data()'s result with the heater cap job passes get (cap_heaters())."""
+    """pass_data()'s result with the heater cap job passes get (cap_heaters()), without the columns it empties at the
+    ends."""
     data, n, first = built
     cols = [data[i * polydye.NOZDATA_SIZE:(i + 1) * polydye.NOZDATA_SIZE] for i in range(n)]
+    lo = first if direction > 0 else first - n + 1
     if direction < 0:
         cols.reverse()
     buf = bytearray(b"".join(cols))
-    polydye.cap_heaters(buf, first if direction > 0 else first - n + 1)
+    polydye.cap_heaters(buf, lo)
     cols = [bytes(buf[i * polydye.NOZDATA_SIZE:(i + 1) * polydye.NOZDATA_SIZE]) for i in range(n)]
+    while cols and not any(cols[0]):
+        cols.pop(0)
+        lo += 1
+    while cols and not any(cols[-1]):
+        cols.pop()
     if direction < 0:
         cols.reverse()
-    return b"".join(cols), n, first
+    return b"".join(cols), len(cols), lo if direction > 0 else lo + len(cols) - 1
+
+
+def slot_load(data):
+    """Per column of nozzle data: the most heaters on one packet's two fire pulses together."""
+    out = []
+    for i in range(len(data) // polydye.NOZDATA_SIZE):
+        col = data[i * polydye.NOZDATA_SIZE:(i + 1) * polydye.NOZDATA_SIZE]
+        out.append(max(sum(bin(col[14 * c + k]).count('1') for c in range(3)) for k in range(14)))
+    return out
+
+
+def lines_used(data):
+    """The fire lines (3: bits 0-3, 5: bits 4-7) nozzle data fires on."""
+    return {line for b in data for line, mask in ((3, 0x0f), (5, 0xf0)) if b & mask}
 
 
 def pulse_load(data):
@@ -2343,15 +2364,27 @@ class HeaterCap(unittest.TestCase):
             self.assertLessEqual(max(pulse_load(built[0])), 4)
 
     def test_colours_together_share_four_per_pulse_evenly(self):
+        # As one board pass (job_pass_data()): at most 4 on a fire line, 5 on both together (3 + 2: F5 gives way).
         for colours in ((polydye.CYAN, polydye.YELLOW), (polydye.CYAN, polydye.MAGENTA, polydye.YELLOW)):
             for registration in ((0, 0, 0, 0), (-34, 1, 27, 0)):  # yellow 27 columns on: its pairs straddle ours
                 dots = [d for c in colours for d in bar(c, 120, 16, 83)]
                 data, n, first = self.build(dots, 120, registration)
-                self.assertEqual(max(pulse_load(data)), 4, (colours, registration))
+                self.assertEqual((max(pulse_load(data)), max(slot_load(data))), (3, 5), (colours, registration))
                 self.assertEqual(singles(data), [], (colours, registration))
-                # Every colour keeps a fair share of its dots.
-                kept = [sum(bin(data[i * 42 + 14 * c + k]).count('1') for i in range(n) for k in range(14))
-                        for c in colours]
+                # As the job sends it (job_pass_parts()): two board passes, one per fire line, each at most 4 per
+                # pulse with no fire on its own, and every colour keeps a fair share of its dots.
+                colour_planes, planes = job_planes(dots, 120)
+                parts = polydye.job_pass_parts(planes, colour_planes, 120, 1, registration)
+                self.assertEqual([(offset, lines_used(part)) for offset, part, _, _ in parts],
+                                 [(0, {3}), (polydye.SPLIT_PASS, {5})])
+                kept = [0] * 3
+                for _, part, columns, _ in parts:
+                    self.assertLessEqual(max(pulse_load(part)), 4)
+                    self.assertEqual(singles(part), [])
+                    for c in colours:
+                        kept[c] += sum(bin(part[i * 42 + 14 * c + k]).count('1') for i in range(columns)
+                                       for k in range(14))
+                kept = [kept[c] for c in colours]
                 self.assertLess(max(kept) / min(kept), 1.2, (colours, registration, kept))
         # Unshifted, each heater fires in runs of whole column pairs, as often as the others in its fire pulse.
         data, n, first = self.build([d for c in (0, 2) for d in bar(c, 120, 16, 83)], 120)
@@ -2366,6 +2399,30 @@ class HeaterCap(unittest.TestCase):
         for group in set(k[:2] for k in runs):
             counts = [v for k, v in runs.items() if k[:2] == group]
             self.assertLessEqual(max(counts) - min(counts), 4, (group, counts))
+
+    def test_a_pass_is_split_by_fire_line_only_where_it_must_be(self):
+        # One ink at positions 28-82 (cyan 29-83): 2 + 2 per packet, one board pass, nothing dropped. At 14-84 the
+        # densest packet has 3 + 2 (or 3 + 3 where position 84 shares it): still one pass, 3 + 3 capped to 3 + 2.
+        for c, (p0, p1), registration in ((polydye.MAGENTA, (28, 82), (0, 0, 0, 0)), (polydye.CYAN, (28, 82),
+                                                                                     (-34, 1, 27, 0))):
+            colours, data = job_planes(bar(c, 60, p0, p1), 60)
+            parts = polydye.job_pass_parts(data, colours, 60, 1, registration)
+            self.assertEqual(len(parts), 1)
+            self.assertEqual(parts[0][1:], polydye.job_pass_data(data, colours, 60, 1, registration))
+            self.assertEqual(sum(bin(b).count('1') for b in parts[0][1]), 60 * 55)
+        # Two inks there, where the registration lays them over each other: 4 + 4, so two board passes, each with
+        # every dot of its fire line (data positions 28-55 and 56-83), in both directions; the second stored as
+        # pass | SPLIT_PASS. Where they don't meet (60 columns, 61 apart), one pass.
+        dots = bar(polydye.CYAN, 200, 28, 82) + bar(polydye.YELLOW, 200, 28, 82)
+        colours, data = job_planes(dots, 200)
+        for direction in (1, -1):
+            parts = polydye.job_pass_parts(data, colours, 200, direction, (-34, 1, 27, 0))
+            self.assertEqual([(o, lines_used(d), n) for o, d, n, _ in parts],
+                             [(0, {3}, 261), (polydye.SPLIT_PASS, {5}, 261)])
+            self.assertEqual(sum(bin(b).count('1') for _, d, _, _ in parts for b in d), 2 * 200 * 55)
+            self.assertEqual({f for _, _, _, f in parts}, {-34 if direction > 0 else 226})
+        colours, data = job_planes(bar(polydye.CYAN, 60, 28, 82) + bar(polydye.YELLOW, 60, 28, 82), 60)
+        self.assertEqual(len(polydye.job_pass_parts(data, colours, 60, 1, (-34, 1, 27, 0))), 1)
 
     def test_reverse_passes_drop_the_same_dots(self):
         dots = [d for c in range(3) for d in bar(c, 61, 16, 83)]
@@ -2440,7 +2497,8 @@ class InkJobData(unittest.TestCase):
                          {'n': 0, 'layer': 0, 'pass': 0, 'object': '-', 'dir': 1, 'x': 100., 'y': 100., 'columns': 4,
                           'colours': 'm'})
         text = open(path).read()
-        for broken, error in ((text.replace("version=1", "version=2"), "version 2, this add-on reads version 1"),
+        for broken, error in ((text.replace("version=2", "version=3"), "version 3, this add-on reads version 2 or "
+                                                                       "older"),
                               (text.replace("passes=1", "passes=2"), "says 2 passes but has 1"),
                               (text.replace("positions=16-83", "positions=10-83"), "beyond the 14-85"),
                               (re.sub(r";PDD \S+", ";PDD AAAA", text), "data is corrupt")):
@@ -2547,12 +2605,65 @@ class InkJobs(unittest.TestCase):
         pd.cmd_POLYDYE_JOB_END(self.gcmd())
         self.assertEqual(self.said[-1], "PolyDye ink job done: 4 of 6 passes printed, 2 skipped (objects excluded)")
 
+    def test_a_split_pass_prints_as_two_and_is_deleted_as_two(self):
+        # Pass 1 (cyan and yellow, positions 28-55 and 56-82) goes to the board as passes 1 and 1 | SPLIT_PASS, and
+        # POLYDYE_JOB_PASS prints both over the same ground; excluded, both are deleted.
+        two = bar(0, 120, 28, 82) + bar(2, 120, 28, 82)
+        passes = [(0, 0, 'A', 120., 100., 1, 40, bar(1, 40, 30, 33)), (0, 1, 'A', 125., 100., -1, 120, two),
+                  (0, 2, 'B', 130., 100., 1, 120, two)]
+        pd, board = self.make(passes)
+        pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
+        self.wait_for(lambda: len(self.puts()) == 5)
+        self.assertEqual([struct.unpack("<HH", p[:4]) for p in [f[1] for f in self.puts()]],
+                         [(0, 0), (0, 1), (0, 1 | polydye.SPLIT_PASS), (0, 2), (0, 2 | polydye.SPLIT_PASS)])
+        self.excluded = ['B']
+        for n in range(3):
+            pd.cmd_POLYDYE_JOB_PASS(self.gcmd(N=n))
+        script = [s for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_PASS")]
+        self.assertEqual([s.split(" X=")[0] for s in script],
+                         ["POLYDYE_PASS LAYER=0 PASS=0", "POLYDYE_PASS LAYER=0 PASS=1",
+                          "POLYDYE_PASS LAYER=0 PASS=%d" % (1 | polydye.SPLIT_PASS)])
+        self.assertEqual(script[1].split(" PASS=")[1].split(" ", 1)[1], script[2].split(" PASS=")[1].split(" ", 1)[1])
+        self.wait_for(lambda: len([f for f in self.frames if f[0] == polydye.DATA_DELETE]) == 2)
+        self.assertEqual([struct.unpack("<HH", f[1]) for f in self.frames if f[0] == polydye.DATA_DELETE],
+                         [(0, 2), (0, 2 | polydye.SPLIT_PASS)])
+        pd.cmd_POLYDYE_JOB_END(self.gcmd())
+        self.assertEqual(self.said[-1], "PolyDye ink job done: 2 of 3 passes printed, 1 skipped (objects excluded)")
+
+    def test_ink_blocks_move_gently_and_put_the_limits_back(self):
+        pd, board = self.make()
+        st = self.objects['toolhead'].get_status(0.)
+        st['square_corner_velocity'] = 5.
+        pd.cmd_POLYDYE_INK_MOTION(self.gcmd())
+        pd.cmd_POLYDYE_INK_MOTION(self.gcmd(ACCEL=500., SCV=0.5))  # a second one keeps the limits from before both
+        pd.cmd_POLYDYE_INK_MOTION(self.gcmd(RESTORE=1))
+        pd.cmd_POLYDYE_INK_MOTION(self.gcmd(RESTORE=1))  # nothing left to put back
+        # Never faster than the limits already in force.
+        st['max_accel'] = 800.
+        pd.cmd_POLYDYE_INK_MOTION(self.gcmd())
+        self.assertEqual([s for s in board.sent if isinstance(s, str) and s.startswith("SET_VELOCITY_LIMIT")], [
+            "SET_VELOCITY_LIMIT ACCEL=1000.000 SQUARE_CORNER_VELOCITY=1.000",
+            "SET_VELOCITY_LIMIT ACCEL=500.000 SQUARE_CORNER_VELOCITY=0.500",
+            "SET_VELOCITY_LIMIT ACCEL=3000.000 SQUARE_CORNER_VELOCITY=5.000",
+            "SET_VELOCITY_LIMIT ACCEL=800.000 SQUARE_CORNER_VELOCITY=1.000"])
+        # A print that ends inside an ink block gets its limits back (from a reactor callback).
+        callbacks, scripts = [], []
+        pd.printer.get_reactor().register_callback = callbacks.append
+        lookup = pd.printer.lookup_object
+        gcode = types.SimpleNamespace(run_script=scripts.append)
+        pd.printer.lookup_object = lambda name, default=None: gcode if name == 'gcode' else lookup(name, default)
+        board.print_state = 'cancelled'
+        pd._check_job_end(0.)
+        callbacks[0](0.)
+        self.assertEqual((scripts, pd.ink_motion), (["SET_VELOCITY_LIMIT ACCEL=800.000 SQUARE_CORNER_VELOCITY=5.000"],
+                                                    None))
+
     def test_a_new_job_stops_the_old_ones_uploads_before_it_clears_the_board(self):
         # The first job's thread is still making its first pass's data when a second job is loaded and clears the
         # board: that pass never goes up, so the board has only the second job's passes after the clear.
         pd, board = self.make()
         making, release = threading.Event(), threading.Event()
-        real = polydye.job_pass_data
+        real = polydye.job_pass_parts
 
         def slow(*args, **kw):
             if not making.is_set():
@@ -2561,7 +2672,7 @@ class InkJobs(unittest.TestCase):
             return real(*args, **kw)
         second = os.path.join(self.tmp, "second.gcode")
         write_job(second, [(7, 0, 'A', 120., 100., 1, 40, bar(1, 40, 30, 33))])
-        with mock.patch.object(polydye, "job_pass_data", slow):
+        with mock.patch.object(polydye, "job_pass_parts", slow):
             pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
             self.assertTrue(making.wait(5.))
             pd.cmd_POLYDYE_JOB(self.gcmd(FILE=second))
@@ -2593,7 +2704,7 @@ class InkJobs(unittest.TestCase):
         # Room for the largest pass (121 columns with the registration's spread) and no more: the next pass goes up
         # only once the one before it is printed.
         pd, board = self.make()
-        self.hello['free'] = 2 * 121 * 42
+        self.hello['free'] = 4 * 121 * 42  # the largest pass may be two board passes: room for that, twice
         pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
         self.wait_for(lambda: len(self.puts()) == 1)
         time.sleep(0.2)

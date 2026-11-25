@@ -337,16 +337,30 @@ colour painting in OrcaSlicer itself (the OrcaSlicer wiki's texture-to-colour-pa
 another way.
 
 **What the post-processor does:** the tool changes go; per layer, where each coloured filament's lines are becomes
-ink, one object at a time, cut into passes along Y about 5.8 mm wide (68 nozzle positions), in alternating directions.
+ink, one object at a time.
+- **Long sweeps:** each object's ink in a layer is printed as sweeps along Y over its whole footprint, every colour in
+  each, side by side about 4.6 mm apart (55 nozzle positions, 28–82, sharing one with the next: `--overlap 1`, so the
+  seams don't show white), in alternating directions, each trimmed to its first and last ink. The sweep grid shifts
+  every layer (by multiples of the golden ratio over the spare width), so the seams don't stack up the walls. Long
+  sweeps held the head steadier than short passes (P box #4, 2026-11-25).
+- **Gentle moves while the ink prints:** `POLYDYE_INK_MOTION ACCEL=1000 SCV=1` before the passes (acceleration and
+  square corner velocity at most that), `POLYDYE_INK_MOTION RESTORE=1` after them puts the print's limits back
+  (`--ink-accel`, `--ink-scv`; 0: the print's own).
 - **Solid colours fire every dot of their inks, in one coat** (`--ink-limit 100`, `--wall-coats 1`, `--top-coats 1`):
   on paper 100 % in one coat was the cleanest and most vivid; 60 % in two coats came close, 35 % was pale and grainy.
 - **Partial tones** (a colour's ink between 0 and 100 %) are an ordered dither (an 8 × 8 Bayer matrix fixed on the
   plate), decided per pair of columns: every nozzle fires at least two columns running, because a fire on its own
   doesn't eject. Cyan, magenta and yellow read the matrix shifted, so up to 25 % each they fall on different dots.
-- **At most 4 heaters fire on each fire pulse** (a packet, one fire line, across the colours): the add-on keeps that
-  when it sends a job's passes, sharing them out by an even rotation, the same for both columns of a pair, and drops
-  any fire left on its own. Cyan and yellow together at full width printed solid green at 3–4 per pulse and failed at
-  6; one colour at full width is about 3.
+- **At most 4 heaters on each fire pulse, and 5 on a packet's two pulses together** (a packet fires its F3 and F5
+  pulses in the same slot from the one 12.6 V rail; across the colours). Cyan and yellow together at full width
+  printed solid green at 3–4 per pulse and failed at 6; each line alone takes 4, but with F3 at 4 the F5 half
+  streaked even at 3, while 3 + 2 printed solid (ladder 904). So where a sweep would need more (two or three inks
+  solid), the add-on sends it to the board as **two passes, one per fire line**, over the same ground: data positions
+  0–55 (F3), then 56–111 (F5) as pass number + 32768. Each then fires at full density up to 4 per pulse. Positions
+  28–82 put two groups of 14 positions on each line, so two inks want exactly 4 per line; one ink stays one pass
+  (2 + 2). Where more than 4 still want a pulse (three inks), they share by an even rotation, the same for both columns
+  of a pair; a fire left on its own is dropped. The add-on does this when it sends a job's passes, after the colour
+  registration (which moves cyan one position).
 - **Prewarm and prime:** `POLYDYE_PREWARM SECONDS=6` goes in about 6 s of moves before each ink layer's end (the moves
   timed as Klipper plans them; within 3 % of Orca's estimate), so the burst ends as the ink starts; a layer shorter
   than that warms through. `POLYDYE_PRIME` comes before the first ink layer's passes, and before any layer using a
@@ -360,8 +374,9 @@ ink, one object at a time, cut into passes along Y about 5.8 mm wide (68 nozzle 
 
 **Options** (all optional): `--ink-limit` %, `--wall-coats`, `--top-coats`, `--gap` mm, `--dry` s (5: the ink dries
 before the next layer), `--retract` mm (1.5), `--travel` mm/s (150), `--edge-margin` mm (0.5), `--inset` mm (0.05: the ink stops that far
-inside the model's surface, so none lands on a base or brim below it), `--positions` (16-83:
-two to spare each way for the colour registration), `--one-direction`, `--prewarm` s (6; 0: none), `--prime-idle` s
+inside the model's surface, so none lands on a base or brim below it), `--positions` (28-82: two groups of positions
+on each fire line, with room for the colour registration), `--overlap` (1), `--ink-accel` mm/s² (1000), `--ink-scv`
+mm/s (1), `--one-direction`, `--prewarm` s (6; 0: none), `--prime-idle` s
 (90; 0: never), `--dpi`, `--nozzle-dpi`, `--pass-speed` (polydye.cfg's), and `--accel`, `--scv`, `--max-velocity` for
 the timing (default: the profile's). `--dry-run` runs the passes with live ink off, and without bursts or primes.
 
@@ -408,7 +423,8 @@ If anything would print a pass wrongly, Klipper stops with a readable reason, fo
 | `POLYDYE_PREWARM [SECONDS=6]` | Warms the head in the background while the moves after it run, so it's hot for the next pass (see "Prewarm bursts"): `SECONDS` (default `prewarm_seconds`, 6) of every nozzle at 1 word (0.35 µs, which doesn't eject) every `warm_period_us`, from where the moves before it end, without stopping them. Turns live ink on. A pass never waits for it: one that comes first cuts it short, and needs no warm-up of its own. At most 16.6 s at 254 µs. Needs this add-on's bundled board firmware |
 | `POLYDYE_PRIME [SECONDS=0.3]` | Primes the nozzles over the wipe sponge before an ink layer whose colours have been idle (see "Priming"): waits for the passes before it, turns live ink on, goes up by `POLYDYE_WIPE`'s `z_hop` and over the sponge, spits `SECONDS` (default `prime_seconds`, 0.3; up to 5) of the stock pattern in every colour, then comes back. Allowed during a print, no `CONFIRM`. Colour templates only; needs the `POLYDYE_WIPE` macro and this add-on's bundled board firmware |
 | `POLYDYE_JOB [FILE=]` | At the start of a print sliced with `polydye_post.py` (it puts it there): loads the print's ink job and uploads its passes to the board as the print runs (see "Colour prints from OrcaSlicer"). Refuses, before anything moves, a job sliced for another `dpi` or `nozzle_dpi`, one the colour registration would move off nozzle positions 14–85, ink beyond the axis limits (each pass's run-up at the acceleration the G-code sets for the ink) or above the Z axis (`--gap` over the top layer), or bursts and primes the board or macros can't run. While it's loaded the colour registration and `nozzle_skew` can't change. Needs `data_port` |
-| `POLYDYE_JOB_PASS N=` | Prints the job's pass `N` with `POLYDYE_PASS` once it's on the board (waits for it); skipped if its object is excluded |
+| `POLYDYE_JOB_PASS N=` | Prints the job's pass `N` with `POLYDYE_PASS` once it's on the board (waits for it): one board pass, or two over the same ground where it's split by fire line (see "Colour prints from OrcaSlicer"); skipped if its object is excluded |
+| `POLYDYE_INK_MOTION [ACCEL=1000] [SCV=1] [RESTORE=1]` | Gentler moves for an ink block: acceleration and square corner velocity at most `ACCEL`, `SCV` (never raised), until `RESTORE=1` puts back the limits from before; a print that ends inside an ink block gets them back too. `polydye_post.py` puts it around each layer's ink |
 | `POLYDYE_JOB_END` | Stops the job's uploads and says what was printed (also done when the print ends, however it ends) |
 | `POLYDYE_CANCEL` | Drops passes that are scheduled but not started (for a cancel macro). The add-on does this itself, and turns live ink off, within 2 s of a print being cancelled or stopping with an error: the print's own `POLYDYE_ENABLE LIVE=0` never runs then (`CANCEL_PRINT` waits for the command running, such as a pass's warm-up) |
 | `POLYDYE_STATUS` | Board status: boost, live, passes printed and queued, worst column lateness, faults, stored passes, cartridge template, fire pulse, the last prewarm burst; and the offsets and direction trim in use |
