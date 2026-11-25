@@ -22,7 +22,7 @@ def bare_polydye():
     """A PolyDye without its __init__ (no Klipper), with the state every command needs."""
     pd = object.__new__(polydye.PolyDye)
     pd.prewarm_cmd = pd.query_prewarm_cmd = pd.prewarm_sent = pd.prewarm_state = pd.boost_ready = None
-    pd.prewarm_seconds = polydye.AUTO_PREWARM_S
+    pd.prewarm_seconds, pd.prewarm_gen = polydye.AUTO_PREWARM_S, 0
     return pd
 
 
@@ -1324,6 +1324,17 @@ class Prewarm(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "SECONDS=20 is too long: a burst is at most 65535 columns, 16.6 s"):
             pd.cmd_POLYDYE_PREWARM(self.gcmd(SECONDS=20.))
         self.assertEqual(len(self.callbacks), 2)
+        # Cancelled, or live ink off, before its moves were planned: the burst isn't sent.
+        for cancel in (lambda: pd.cmd_POLYDYE_CANCEL(self.gcmd()),
+                       lambda: pd.cmd_POLYDYE_ENABLE(self.gcmd(LIVE=0))):
+            sent = len(self.sent)
+            pd.cmd_POLYDYE_PREWARM(self.gcmd())
+            cancel()
+            self.callbacks[-1](600.)
+            self.assertEqual(len(self.sent), sent)
+        pd.cmd_POLYDYE_PREWARM(self.gcmd())
+        self.callbacks[-1](700.)
+        self.assertEqual(self.sent[-1][0][1], 7000000000 & 0xffffffff)
         pd.prewarm_cmd = None
         with self.assertRaisesRegex(RuntimeError, "POLYDYE_PREWARM: needs newer PolyDye board firmware"):
             pd.cmd_POLYDYE_PREWARM(self.gcmd())

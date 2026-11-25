@@ -1145,6 +1145,9 @@ class PolyDye:
         self.prewarm_sent = None  # the last burst sent: {'start', 'end'} print times, 'seconds'; None: none yet
         self.prewarm_state = None  # the board's account of it, as last asked (_query_prewarm())
         self.boost_ready = None  # print time the boost has settled after the add-on last turned it on
+        # Bumped by everything that drops the board's bursts (a cancel, live ink off, a shutdown): a POLYDYE_PREWARM
+        # still waiting for its moves to be planned then sends nothing.
+        self.prewarm_gen = 0
         self.print_live = False  # a print turned live ink on and hasn't been seen to end yet (_check_print_end())
         self.live_off_pending = False  # a test's cleanup failed: live ink may be on (_check_print_end() retries)
         self.dpi = config.getfloat('dpi', 847., above=0.)
@@ -1305,6 +1308,7 @@ class PolyDye:
         self.status_timer = reactor.register_timer(self._status_event, reactor.NOW)
 
     def _handle_shutdown(self):
+        self.prewarm_gen += 1
         if self.status_timer is not None:
             logging.info("polydye: Klipper shut down; board status updates stopped until a restart")
             self.printer.get_reactor().update_timer(self.status_timer, self.printer.get_reactor().NEVER)
@@ -1384,6 +1388,7 @@ class PolyDye:
             return
         print_stats = self.printer.lookup_object('print_stats', None)
         state = print_stats.get_status(eventtime).get('state') if print_stats is not None else None
+        self.prewarm_gen += 1
         self.cancel_cmd.send([self.oid])
         self.mode_cmd.send([self.oid, 0 if self.boost_idle_s is None else 1, 0])
         # Done only once both went out: if one fails, the next poll tries again.
@@ -1640,11 +1645,16 @@ class PolyDye:
         # Live ink on, without POLYDYE_ENABLE's pause for the boost to settle: the moves go on, and the board starts
         # the burst only once the boost has settled.
         self._enable(gcmd, cmd, True, settle=False)
+        gen = self.prewarm_gen
         self.printer.lookup_object('toolhead').register_lookahead_callback(
-            lambda print_time: self._send_prewarm(print_time, columns, period))
+            lambda print_time: self._send_prewarm(print_time, columns, period, gen))
 
-    def _send_prewarm(self, print_time, columns, period):
-        """Schedules a burst to start at `print_time` (the moves before POLYDYE_PREWARM done)."""
+    def _send_prewarm(self, print_time, columns, period, gen):
+        """Schedules a burst to start at `print_time` (the moves before POLYDYE_PREWARM done), unless a cancel, live
+        ink going off or a shutdown came since POLYDYE_PREWARM (`gen`)."""
+        if gen != self.prewarm_gen:
+            logging.info("polydye: prewarm burst at print_time %.3f not sent: cancelled before its moves", print_time)
+            return
         clock = self.mcu.print_time_to_clock(print_time)
         self.prewarm_cmd.send([self.oid, clock & 0xffffffff, columns, period], reqclock=clock)
         self.prewarm_sent = {'start': print_time, 'end': print_time + columns * period / 1e6,
@@ -1822,6 +1832,8 @@ class PolyDye:
         # ink off yet: do it now, so it can't come later and turn off what's enabled here (a fire test, say).
         self._check_print_end(self.printer.get_reactor().monotonic())
         boost_was_on = True
+        if not live:
+            self.prewarm_gen += 1  # live ink off drops the board's bursts, and one not sent yet
         if live:
             st = self._fresh_status()
             self._check_current_pulse(gcmd, cmd, st)
@@ -1851,6 +1863,7 @@ class PolyDye:
 
     def cmd_POLYDYE_DISABLE(self, gcmd):
         self.printer.lookup_object('toolhead').wait_moves()
+        self.prewarm_gen += 1
         self.mode_cmd.send([self.oid, 0, 0])
         self.print_live = False
         gcmd.respond_info("PolyDye off")
@@ -1858,6 +1871,7 @@ class PolyDye:
     cmd_POLYDYE_CANCEL_help = "Drop PolyDye passes that are queued but not started"
 
     def cmd_POLYDYE_CANCEL(self, gcmd):
+        self.prewarm_gen += 1  # a POLYDYE_PREWARM whose moves aren't planned yet is cancelled too
         self.cancel_cmd.send([self.oid])
         # The passes dropped never fired, but last_fire counted them: forget it, so the next live pass warms the head.
         self.last_fire = None
