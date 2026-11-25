@@ -217,6 +217,7 @@ function render() {
     if (pd.bus_hz_measured) clock += ` (measured ${(pd.bus_hz_measured / 1e6).toFixed(3)})`;
   }
   text('s-clock', clock);
+  text('s-head', known ? headText(pd) : '–');
   renderNudges(pd);
   // Idle-only controls also wait for a firmware update: the dry run uses the same data port. Off stays available.
   document.querySelectorAll('.needs-board').forEach((b) => {
@@ -225,6 +226,18 @@ function render() {
   renderFirmware(printing);
   renderDiagnostics(pd, printing);
   setConn();
+}
+
+// The head's warmth as the automatic warm-up sees it: when it last fired, and whether the next live pass warms it.
+function headText(pd) {
+  const warm = pd.auto_warm;
+  const idle = pd.head_idle_s;
+  const fired = idle === null || idle === undefined ? 'not fired since Klipper started'
+    : `last fired ${idle < 120 ? `${Math.round(idle)} s` : `${(idle / 60).toFixed(0)} min`} ago`;
+  if (!warm || !warm.seconds) return `${fired} (automatic warm-up off)`;
+  if (warm.available === false) return `${fired} (automatic warm-up needs newer board firmware: Update to bundled firmware)`;
+  const cold = idle === null || idle === undefined || idle > warm.idle_time;
+  return cold ? `${fired}: a live pass warms it first (${warm.seconds} s)` : `${fired}: warm`;
 }
 
 // ---- board firmware updates (moonraker/polydye.py runs them) --------------------------------------------------

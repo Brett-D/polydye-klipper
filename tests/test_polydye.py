@@ -265,6 +265,11 @@ class TestCleanup(unittest.TestCase):
         pd.warm_duty_ppm = None
         pd.query_clock_cmd = pd.bus_hz_check = None
         pd.boost_idle_s = None  # board firmware that turns PolyDye off after a test
+        pd.warm_seconds, pd.warm_pulse, pd.warm_period_us, pd.warm_idle_time = 10., 1, 254, 60.
+        pd.warm_position, pd.warm_clearance = 'pass', 10.
+        pd.last_fire, pd.auto_warm_off = None, False
+        pd.mcu = types.SimpleNamespace(estimated_print_time=lambda eventtime: board.print_time)
+        board.print_time = 100.
 
         def mode(args):
             board.boost, board.live = bool(args[1]), bool(args[2])
@@ -699,14 +704,23 @@ class TestCleanup(unittest.TestCase):
         pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b_late:6,color_b_late:8", X=130., Y=100.,
                                            SPACING=20., COLUMNS=600, UPLOAD=1, LAYER=0, PASS=0, PATTERN='stock',
                                            WARM=10., WARM_PULSE=8, WARM_PERIOD_US=508))
-        warm = "POLYDYE_WARM SECONDS=10 WARM_PULSE=8 WARM_PERIOD_US=508 CONFIRM=1"
         steps = [s for s in board.sent if isinstance(s, str)
                  and s.startswith(("POLYDYE_UPLOAD", "POLYDYE_WARM", "POLYDYE_ENABLE", "POLYDYE_PASS"))]
-        # After the stripe's settings and its upload, straight before live ink and the pass.
+        # After the stripe's settings and its upload, live ink on, then the pass with the warm-up asked for: it warms
+        # off the print just before its run-up (POLYDYE_PASS WARM), so only a short travel comes in between.
         self.assertEqual([s.split()[0] for s in steps],
-                         ["POLYDYE_UPLOAD_TEST_PASS", "POLYDYE_WARM", "POLYDYE_ENABLE", "POLYDYE_PASS",
-                          "POLYDYE_WARM", "POLYDYE_ENABLE", "POLYDYE_PASS"])
-        self.assertEqual(steps[1], warm)
+                         ["POLYDYE_UPLOAD_TEST_PASS", "POLYDYE_ENABLE", "POLYDYE_PASS", "POLYDYE_ENABLE",
+                          "POLYDYE_PASS"])
+        self.assertTrue(steps[2].endswith(" DIR=1 WARM=10 WARM_PULSE=8 WARM_PERIOD_US=508"))
+        # WARM=0: each pass told not to warm; no WARM: the passes decide (the automatic warm-up).
+        for warm, tail in ((0., " DIR=1 WARM=0"), (None, " DIR=1")):
+            pd, board = self.make(fail_on="NOTHING")
+            pd.spit_run_cmd = object()
+            self.newer_warm_up(pd)
+            kw = dict(self.FIRE) if warm is None else dict(self.FIRE, WARM=warm)
+            pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b_late:6", **kw))
+            passes = [s for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_PASS")]
+            self.assertTrue(len(passes) == 1 and passes[0].endswith(tail), passes)
         # A warm-up pulse over the limit is refused before anything moves: 9 words is 3.15 us.
         pd, board = self.make(fail_on="NOTHING")
         pd.spit_run_cmd = object()
@@ -790,7 +804,7 @@ class TestCleanup(unittest.TestCase):
     def with_run_report(self, fault='none', columns=6640, warm_left=0, underruns=0, overruns=0):
         """A board with polydye_query_run that reports this run (10 MHz clock ticks)."""
         pd, board = self.make(fail_on="NOTHING")
-        pd.mcu = types.SimpleNamespace(get_constant_float=lambda name: 10000000.)
+        pd.mcu = types.SimpleNamespace(get_constant_float=lambda name: 10000000., estimated_print_time=lambda e: 0.)
         pd.query_run_cmd = types.SimpleNamespace(send=lambda args: {
             'fault_static_string_id': fault, 'columns': columns, 'warm_left': warm_left, 'underruns': underruns,
             'overruns': overruns, 'late_max': 23, 'fill_max': 1041})
@@ -867,6 +881,231 @@ class TestCleanup(unittest.TestCase):
         self.assertTrue(replies[-1].startswith("PolyDye board: bus clock measured 18.491 MHz (stock clock 2.857 MHz"))
 
 
+class AutoWarm(unittest.TestCase):
+    """The warm-up before a live pass: when the head is cold (or asked for), off the print, then the pass."""
+
+    def make(self):
+        pd, board = TestCleanup.make(TestCleanup(), fail_on="NOTHING")
+        pd.warm_max_words, pd.warm_max_us, pd.warm_max_s, pd.warm_duty_ppm = 12, 2.9, 30., 5800
+        pd.offset_x, pd.offset_y, pd.pass_axis, pd.warm_clearance = 58.6, -8.7, 'y', 10.
+        runs = []
+        pd.spit_run_cmd = types.SimpleNamespace(send=runs.append)
+        here = types.SimpleNamespace(x=10., y=20., z=0.3, e=0.)
+        self.travel = []
+        gcode_move = types.SimpleNamespace(
+            get_status=lambda eventtime: {'gcode_position': here, 'position': here},
+            last_position=[10., 20., 0.3, 0.], move_with_transform=lambda pos, speed: self.travel.append(pos[:2]),
+            reset_last_position=lambda: None)
+        board.queued_until = 0.  # print time the moves already queued end at
+        self.z_max = 250.
+        limits = lambda: {'axis_minimum': types.SimpleNamespace(x=0., y=-10., z=0.),
+                          'axis_maximum': types.SimpleNamespace(x=235., y=220., z=self.z_max)}
+        self.objects = {'toolhead': types.SimpleNamespace(
+                            wait_moves=lambda: None, get_last_move_time=lambda: board.queued_until,
+                            get_status=lambda eventtime: limits()),
+                        'gcode_move': gcode_move,
+                        'gcode_macro POLYDYE_WIPE': types.SimpleNamespace(variables={'x': 245, 'z_hop': 1})}
+        lookup = pd.printer.lookup_object
+        pd.printer.lookup_object = lambda name, default=None: (self.objects[name] if name in self.objects
+                                                               else lookup(name, default))
+        pd.travel_speed = 150.
+        # A reactor whose clock moves on with each pause, so timeouts happen.
+        clock = [0.]
+        reactor = types.SimpleNamespace(monotonic=lambda: clock[0],
+                                        pause=lambda until: clock.__setitem__(0, max(clock[0], until)))
+        pd.printer.get_reactor = lambda: reactor
+        self.cancels = []
+        pd.cancel_cmd = types.SimpleNamespace(send=self.cancels.append)
+        self.said = []
+        # The G-code a sponge or bed-spot warm-up runs: to the spot and back.
+        return pd, board, runs, board.sent
+
+    def gcmd(self):
+        return types.SimpleNamespace(respond_info=self.said.append, error=RuntimeError)
+
+    def warm(self, pd, **kw):
+        # A pass along +Y whose run-up starts at toolhead (100, 50).
+        return pd._auto_warm(self.gcmd(), "POLYDYE_PASS", [100., 50.], 1, **kw)
+
+    def test_head_cold(self):
+        self.assertTrue(polydye.head_cold(None, 5., 60.))
+        self.assertFalse(polydye.head_cold(100., 160., 60.))
+        self.assertTrue(polydye.head_cold(100., 160.5, 60.))
+
+    def test_a_cold_head_is_warmed_just_before_a_live_pass(self):
+        pd, board, runs, moves = self.make()
+        # A dry run fires nothing: no warm-up, and it doesn't count as firing.
+        self.assertIs(self.warm(pd), False)
+        self.assertEqual((runs, pd.last_fire), ([], None))
+        board.live = True
+        # First live pass since Klipper started: 10 s of every nozzle at 1 word (0.35 us) every 254 us, no spit
+        # columns, live ink left on; 10 mm behind the run-up start along the pass axis, off the print, and the pass
+        # travels on from there.
+        self.assertIs(self.warm(pd), True)
+        self.assertEqual(runs, [[0, 0, polydye.SPIT_PATTERNS['all'], 0, polydye.SPIT_PERIOD_US, 39370, 1, 254]])
+        self.assertEqual((self.travel, moves), ([[100., 40.]], []))
+        self.assertIn("the head hasn't fired since Klipper started, so a head warm-up 10.0 s", self.said[0])
+        self.assertIn("10.0 mm before the pass starts", self.said[0])
+        self.assertEqual((pd.last_fire, board.live), (100., True))
+        # Warm now: the next pass goes straight on; a minute later it's warmed again.
+        board.print_time = 159.
+        self.warm(pd)
+        self.assertEqual(len(runs), 1)
+        board.print_time = 161.
+        self.warm(pd)
+        self.assertEqual(len(runs), 2)
+        self.assertIn("the head won't have fired for 61 s when the pass starts", self.said[-1])
+        # Idle enough only by the time the moves already queued are done: the pass starts then, so it warms.
+        pd.last_fire, board.print_time, board.queued_until = 100., 159., 161.
+        self.warm(pd)
+        self.assertEqual(len(runs), 3)
+
+    def test_the_warm_spot_stays_within_the_axis(self):
+        pd, board, runs, moves = self.make()
+        board.live = True
+        pd._auto_warm(self.gcmd(), "POLYDYE_PASS", [100., -5.], 1)
+        pd.last_fire = None
+        pd._auto_warm(self.gcmd(), "POLYDYE_PASS", [100., 215.], -1)
+        self.assertEqual(self.travel, [[100., -10.], [100., 220.]])
+
+    def test_a_warm_up_asked_for(self):
+        pd, board, runs, moves = self.make()
+        board.live, pd.last_fire, board.print_time = True, 100., 101.  # warm: the automatic one wouldn't run
+        self.warm(pd, warm=2., words=8, period=508)
+        self.assertEqual(runs, [[0, 0, 0, 0, polydye.SPIT_PERIOD_US, 3937, 8, 508]])
+        self.assertIn("a 2 s head warm-up was asked for", self.said[0])
+        # WARM=0: none, even on a cold head; it still counts as firing.
+        pd.last_fire = None
+        self.assertIs(self.warm(pd, warm=0.), True)
+        self.assertEqual(len(runs), 1)
+        board.live = False
+        with self.assertRaisesRegex(RuntimeError, "WARM needs live ink on"):
+            self.warm(pd, warm=2.)
+
+    def test_a_failed_warm_up_doesnt_cross_the_print_while_firing(self):
+        pd, board, runs, moves = self.make()
+        pd.warm_position = 'sponge'
+        board.live = True
+        status = board.status
+        board.running = False
+        pd._fresh_status = pd._query_status = lambda: dict(status(), running=board.running)
+        # The board never reports the warm-up done, and cancelling doesn't stop it.
+        pd.spit_run_cmd = types.SimpleNamespace(send=lambda args: (runs.append(args), setattr(board, 'running', True)))
+        with self.assertRaisesRegex(RuntimeError, "didn't finish the warm-up"):
+            self.warm(pd)
+        # Cancelled, still running: the cartridge stays over the sponge, with the G-code state put back.
+        self.assertEqual(len(self.cancels), 1)
+        self.assertEqual(moves[-1], "RESTORE_GCODE_STATE NAME=polydye_warm")
+        self.assertFalse(any(m.startswith("G1 X10.000") for m in moves))
+        self.assertIn("stays over the warm-up spot", self.said[-1])
+        # Cancelling stops it: then back across and down.
+        pd.cancel_cmd = types.SimpleNamespace(send=lambda args: setattr(board, 'running', False))
+        board.running, pd.last_fire = False, None
+        with self.assertRaisesRegex(RuntimeError, "didn't finish the warm-up"):
+            self.warm(pd)
+        self.assertEqual(moves[-2:], ["G1 X10.000 Y20.000 F9000\nG1 Z0.300 F900",
+                                      "RESTORE_GCODE_STATE NAME=polydye_warm"])
+
+    def test_a_warm_up_the_board_cant_be_seen_to_finish_stops_the_pass(self):
+        pd, board, runs, moves = self.make()
+        board.live = True
+        status, calls = board.status, [0]
+
+        def fresh():
+            calls[0] += 1
+            if calls[0] == 4:  # the check after the warm-up: the board doesn't answer
+                raise RuntimeError("timeout")
+            return status()
+        pd._fresh_status = pd._query_status = fresh
+        with self.assertRaisesRegex(RuntimeError, "may still be firing after the warm-up, so the cartridge stays over "
+                                                  "the warm-up spot and the pass doesn't run"), \
+                mock.patch.object(polydye.logging, "exception"):
+            self.warm(pd)
+        self.assertEqual((len(runs), pd.last_fire), (1, None))
+
+    def test_the_sponge_and_a_bed_spot(self):
+        pd, board, runs, moves = self.make()
+        board.live = True
+        pd.warm_position = 'sponge'
+        self.warm(pd)
+        # Up by POLYDYE_WIPE's z_hop, over the wipe sponge, warm, then back across and down.
+        self.assertEqual(moves, ["SAVE_GCODE_STATE NAME=polydye_warm", "G90\nG1 Z1.300 F900\nG1 X245.000 F9000",
+                                 "G1 X10.000 Y20.000 F9000\nG1 Z0.300 F900", "RESTORE_GCODE_STATE NAME=polydye_warm"])
+        self.assertIn("over the wipe sponge (X=245.0)", self.said[0])
+        # A bed spot: the toolhead goes to the spot minus the cartridge's offset; the hop stays below Z max.
+        pd.warm_position, pd.last_fire, self.z_max = (5., 200.), None, 0.8
+        del moves[:]
+        self.warm(pd)
+        self.assertEqual(moves[1], "G90\nG1 Z0.800 F900\nG1 X-53.600 Y208.700 F9000")
+        self.assertIn("over X=5.0 Y=200.0", self.said[-1])
+        # A sponge without its macro is refused before anything fires.
+        pd.warm_position, pd.last_fire = 'sponge', None
+        del self.objects['gcode_macro POLYDYE_WIPE']
+        with self.assertRaisesRegex(RuntimeError, "no POLYDYE_WIPE macro to say where it is"):
+            self.warm(pd)
+        self.assertEqual(len(runs), 2)
+
+    def test_a_refused_move_to_the_spot_puts_the_gcode_state_back(self):
+        pd, board, runs, moves = self.make()
+        board.live, pd.warm_position = True, 'sponge'
+        lookup = pd.printer.lookup_object
+        gcode = types.SimpleNamespace(run_script_from_command=lambda script: (
+            moves.append(script), script.startswith("G90") and (_ for _ in ()).throw(RuntimeError("Move out of range"))))
+        pd.printer.lookup_object = lambda name, default=None: gcode if name == 'gcode' else lookup(name, default)
+        with self.assertRaisesRegex(RuntimeError, "Move out of range"):
+            self.warm(pd)
+        self.assertEqual((moves[0], moves[-1], runs), ("SAVE_GCODE_STATE NAME=polydye_warm",
+                                                       "RESTORE_GCODE_STATE NAME=polydye_warm", []))
+
+    def test_a_refused_move_back_still_puts_the_gcode_state_back(self):
+        pd, board, runs, moves = self.make()
+        board.live, pd.warm_position = True, 'sponge'
+        lookup = pd.printer.lookup_object
+        gcode = types.SimpleNamespace(run_script_from_command=lambda script: (
+            moves.append(script),
+            script.startswith("G1 X10.000") and (_ for _ in ()).throw(RuntimeError("Move out of range"))))
+        pd.printer.lookup_object = lambda name, default=None: gcode if name == 'gcode' else lookup(name, default)
+        with self.assertRaisesRegex(RuntimeError, "Move out of range"):
+            self.warm(pd)
+        self.assertEqual(moves[-1], "RESTORE_GCODE_STATE NAME=polydye_warm")
+
+    def test_a_pass_warm_up_longer_than_the_board_takes_is_refused_before_anything_moves(self):
+        pd, board, runs, moves = self.make()
+        pd.warm_max_s, pd.warm_duty_ppm = 10., None  # older board firmware: warm-ups of at most 10 s
+        pd.query_pass_cmd = types.SimpleNamespace(send=lambda args: {'present': 1, 'columns': 600, 'cart': 0})
+        with self.assertRaisesRegex(RuntimeError, "POLYDYE_PASS: a warm-up lasts at most 10 s with this board firmware; "
+                                                  "newer firmware takes up to 30 s"):
+            pd.cmd_POLYDYE_PASS(TestCleanup.gcmd(self, LAYER=0, PASS=0, X=100., Y=40., WARM=20., WARM_PULSE=2,
+                                                 WARM_PERIOD_US=508))
+        self.assertEqual((runs, moves, self.travel), ([], [], []))
+
+    def test_cancelled_passes_dont_count_as_firing(self):
+        pd, board, runs, moves = self.make()
+        pd.last_fire = 99.
+        pd.cmd_POLYDYE_CANCEL(self.gcmd())
+        self.assertEqual((self.cancels, pd.last_fire), ([[0]], None))
+
+    def test_off_switches(self):
+        pd, board, runs, moves = self.make()
+        board.live = True
+        # With the automatic warm-up off a live pass still says it is live, so it counts as firing (last_fire).
+        pd.warm_seconds = 0.
+        self.assertIs(self.warm(pd), True)
+        pd.warm_seconds, pd.warm_duty_ppm = 10., None  # older board firmware: its warm-up can't take the limits
+        self.assertIs(self.warm(pd), True)
+        self.assertEqual(runs, [])
+
+    def test_config(self):
+        self.assertIsNone(polydye.auto_warm_error(10., 8, 508))
+        self.assertIsNone(polydye.auto_warm_error(polydye.AUTO_WARM_S, polydye.AUTO_WARM_WORDS,
+                                                  polydye.AUTO_WARM_PERIOD_US))
+        self.assertIsNone(polydye.auto_warm_error(0., 8, 508))
+        self.assertIn("heater duty: use a period of at least 483 us", polydye.auto_warm_error(10., 8, 400))
+        self.assertIn("shorter than the warm-up column (192 us", polydye.auto_warm_error(10., 2, 150))
+        self.assertIn("warm_pulse must be 1-8 words", polydye.auto_warm_error(10., 9, 508))
+        self.assertIn("warm_seconds must be 0 (off) to 30", polydye.auto_warm_error(31., 8, 508))
+
+
 class RandomPattern(unittest.TestCase):
     """The random pattern's columns are the board's (printcart_pattern_random), so a fire test prints what a spit test
     fires."""
@@ -926,7 +1165,8 @@ class RandomPattern(unittest.TestCase):
         self.assertEqual(polydye.parse_colors("yC"), 5)
 
 
-STOCK_ONLY = {'POLYDYE_STOCK_ONLY': 1, 'POLYDYE_SOFT_RESET': 1, 'POLYDYE_SPIT_PATTERNS': 5}
+STOCK_ONLY = {'POLYDYE_STOCK_ONLY': 1, 'POLYDYE_SOFT_RESET': 1, 'POLYDYE_SPIT_PATTERNS': 5, 'POLYDYE_WARM_MAX_WORDS': 12,
+              'POLYDYE_WARM_MAX_NS': 2900, 'POLYDYE_WARM_MAX_DUTY_PPM': 5800, 'POLYDYE_WARM_MAX_MS': 30000}
 
 
 class BuildConfig(unittest.TestCase):
@@ -946,13 +1186,16 @@ class BuildConfig(unittest.TestCase):
         pd.set_clock_cmd = pd.query_clock_cmd = None
         pd.bus_hz_check = None
         pd.boost_idle_s = None
+        pd.warm_seconds, pd.warm_pulse, pd.warm_period_us, pd.warm_idle_time, pd.warm_position = 10., 1, 254, 60., 'pass'
+        pd.warm_clearance = 10.
+        pd.last_fire = None
         pd.printer = types.SimpleNamespace(config_error=ConfigError)
         sent = []
         pd.mcu = types.SimpleNamespace(
             add_config_cmd=lambda cmd, is_init=False: sent.append(cmd), alloc_command_queue=lambda: None,
             lookup_command=lambda *a, **kw: object(), lookup_query_command=lambda *a, **kw: object(),
             try_lookup_command=lambda fmt, *a, **kw: None if fmt.startswith(tuple(missing)) else object(),
-            get_constants=lambda: dict(constants))
+            get_constants=lambda: dict(constants), estimated_print_time=lambda eventtime: eventtime)
         try:
             with mock.patch.object(polydye.logging, "warning") as warn:
                 pd._build_config()
@@ -1005,9 +1248,11 @@ class BuildConfig(unittest.TestCase):
         self.assertEqual((st['templates'], st['spit_patterns']), (['color_b_late', 'black_a', 'black_b'],
                                                                   ['all', 'stock']))
         self.assertNotIn('bus_clocks', st)
+        self.assertTrue(st['auto_warm']['available'])
         pd, _ = self.build({}, missing=("polydye_query_clock",))
         st = self.status(pd)
         self.assertEqual((st['templates'], st['spit_patterns']), (['black_a', 'black_b'], ['all']))
+        self.assertFalse(st['auto_warm']['available'])  # the page says it needs newer firmware
 
     def test_board_firmware_that_leaves_usb_on_reset_is_flagged(self):
         pd, _ = self.build(STOCK_ONLY)
@@ -1083,6 +1328,17 @@ class ConfigOptions(unittest.TestCase):
         # bus_clock: stock is still taken, as a no-op.
         pd = self.load(bus_clock='Stock', cartridge_template='black_b', pulse_words='8')
         self.assertEqual((pd.cartridge_template, pd.pulse_words), ('black_b', 8))
+
+    def test_auto_warm_options(self):
+        pd = self.load()
+        self.assertEqual((pd.warm_seconds, pd.warm_pulse, pd.warm_period_us, pd.warm_idle_time, pd.warm_position,
+                          pd.warm_clearance), (10., 1, 254, 60., 'pass', 10.))
+        pd = self.load(warm_seconds='0', warm_position=' 5, 200.5 ')
+        self.assertEqual((pd.warm_seconds, pd.warm_position), (0., (5., 200.5)))
+        self.assertEqual(self.load(warm_position='Sponge').warm_position, 'sponge')
+        self.assertIn("warm_position must be pass (the default), sponge, or X, Y", self.load(warm_position='here'))
+        self.assertIn("heater duty", self.load(warm_pulse='8', warm_period_us='400'))
+        self.assertIn("warm_position must be pass (the default), sponge, or X, Y", self.load(warm_position='5'))
 
 
 if __name__ == "__main__":
