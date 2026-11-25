@@ -265,6 +265,10 @@ class TestCleanup(unittest.TestCase):
         pd.warm_duty_ppm = None
         pd.query_clock_cmd = pd.bus_hz_check = None
         pd.boost_idle_s = None  # board firmware that turns PolyDye off after a test
+        pd.warm_seconds, pd.warm_pulse, pd.warm_period_us, pd.warm_idle_time, pd.warm_position = 10., 8, 508, 60., None
+        pd.last_fire, pd.auto_warm_off = None, False
+        pd.mcu = types.SimpleNamespace(estimated_print_time=lambda eventtime: board.print_time)
+        board.print_time = 100.
 
         def mode(args):
             board.boost, board.live = bool(args[1]), bool(args[2])
@@ -790,7 +794,7 @@ class TestCleanup(unittest.TestCase):
     def with_run_report(self, fault='none', columns=6640, warm_left=0, underruns=0, overruns=0):
         """A board with polydye_query_run that reports this run (10 MHz clock ticks)."""
         pd, board = self.make(fail_on="NOTHING")
-        pd.mcu = types.SimpleNamespace(get_constant_float=lambda name: 10000000.)
+        pd.mcu = types.SimpleNamespace(get_constant_float=lambda name: 10000000., estimated_print_time=lambda e: 0.)
         pd.query_run_cmd = types.SimpleNamespace(send=lambda args: {
             'fault_static_string_id': fault, 'columns': columns, 'warm_left': warm_left, 'underruns': underruns,
             'overruns': overruns, 'late_max': 23, 'fill_max': 1041})
@@ -865,6 +869,80 @@ class TestCleanup(unittest.TestCase):
         with self.assertLogs(level='WARNING'):
             callbacks.pop()(0.)
         self.assertTrue(replies[-1].startswith("PolyDye board: bus clock measured 18.491 MHz (stock clock 2.857 MHz"))
+
+
+class AutoWarm(unittest.TestCase):
+    """The automatic warm-up before a live pass: when the head is cold, the hardware recipe in one board run."""
+
+    def make(self):
+        pd, board = TestCleanup.make(TestCleanup(), fail_on="NOTHING")
+        pd.warm_max_words, pd.warm_max_us, pd.warm_max_s, pd.warm_duty_ppm = 12, 2.9, 30., 5800
+        pd.offset_x, pd.offset_y = 58.6, -8.7
+        runs, moves = [], []
+        pd.spit_run_cmd = types.SimpleNamespace(send=runs.append)
+        gcode_move = types.SimpleNamespace(last_position=[10., 20., 0.3, 0.], base_position=[0., 0., 0., 0.],
+                                           move_with_transform=lambda pos, speed: moves.append(pos[:2]),
+                                           reset_last_position=lambda: None)
+        objects = {'toolhead': types.SimpleNamespace(wait_moves=lambda: None), 'gcode_move': gcode_move}
+        lookup = pd.printer.lookup_object
+        pd.printer.lookup_object = lambda name, default=None: objects.get(name) or lookup(name, default)
+        pd.travel_speed = 150.
+        self.said = []
+        return pd, board, runs, moves
+
+    def gcmd(self):
+        return types.SimpleNamespace(respond_info=self.said.append, error=RuntimeError)
+
+    def test_head_cold(self):
+        self.assertTrue(polydye.head_cold(None, 5., 60.))
+        self.assertFalse(polydye.head_cold(100., 160., 60.))
+        self.assertTrue(polydye.head_cold(100., 160.5, 60.))
+
+    def test_a_cold_head_is_warmed_before_a_live_pass(self):
+        pd, board, runs, moves = self.make()
+        # A dry run fires nothing: no warm-up, and it doesn't count as firing.
+        self.assertIs(pd._auto_warm(self.gcmd(), "POLYDYE_PASS"), False)
+        self.assertEqual((runs, pd.last_fire), ([], None))
+        board.live = True
+        # First live pass since Klipper started: 10 s of every nozzle at 8 words (2.80 us) every 508 us, no spit
+        # columns, live ink left on.
+        self.assertIs(pd._auto_warm(self.gcmd(), "POLYDYE_PASS"), True)
+        self.assertEqual(runs, [[0, 0, polydye.SPIT_PATTERNS['all'], 0, polydye.SPIT_PERIOD_US, 19685, 8, 508]])
+        self.assertIn("the head hasn't fired since Klipper started, so a head warm-up 10.0 s", self.said[0])
+        self.assertEqual((pd.last_fire, board.live, moves), (100., True, []))
+        # Warm now: the next pass goes straight on; a minute later it's warmed again.
+        board.print_time = 159.
+        pd._auto_warm(self.gcmd(), "POLYDYE_PASS")
+        self.assertEqual(len(runs), 1)
+        board.print_time = 161.
+        pd._auto_warm(self.gcmd(), "POLYDYE_PASS")
+        self.assertEqual(len(runs), 2)
+        self.assertIn("the head hasn't fired for 61 s", self.said[-1])
+
+    def test_warm_position_and_off_switches(self):
+        pd, board, runs, moves = self.make()
+        board.live = True
+        pd.warm_position = (5., 200.)
+        pd._auto_warm(self.gcmd(), "POLYDYE_PASS")
+        # The cartridge over the waste spot: the toolhead goes to the spot minus the cartridge's offset.
+        self.assertEqual(moves, [[5. - 58.6, 200. + 8.7]])
+        self.assertIn("over X=5.0 Y=200.0", self.said[0])
+        pd.last_fire = None
+        pd.auto_warm_off = True  # a fire test with its own WARM
+        self.assertIsNone(pd._auto_warm(self.gcmd(), "POLYDYE_PASS"))
+        pd.auto_warm_off, pd.warm_seconds = False, 0.
+        self.assertIsNone(pd._auto_warm(self.gcmd(), "POLYDYE_PASS"))
+        pd.warm_seconds, pd.warm_duty_ppm = 10., None  # older board firmware: its warm-up can't take 2.80 us
+        self.assertIsNone(pd._auto_warm(self.gcmd(), "POLYDYE_PASS"))
+        self.assertEqual(len(runs), 1)
+
+    def test_config(self):
+        self.assertIsNone(polydye.auto_warm_error(10., 8, 508))
+        self.assertIsNone(polydye.auto_warm_error(0., 8, 508))
+        self.assertIn("heater duty: use a period of at least 483 us", polydye.auto_warm_error(10., 8, 400))
+        self.assertIn("shorter than the warm-up column (192 us", polydye.auto_warm_error(10., 2, 150))
+        self.assertIn("warm_pulse must be 1-8 words", polydye.auto_warm_error(10., 9, 508))
+        self.assertIn("warm_seconds must be 0 (off) to 30", polydye.auto_warm_error(31., 8, 508))
 
 
 class RandomPattern(unittest.TestCase):
@@ -946,13 +1024,15 @@ class BuildConfig(unittest.TestCase):
         pd.set_clock_cmd = pd.query_clock_cmd = None
         pd.bus_hz_check = None
         pd.boost_idle_s = None
+        pd.warm_seconds, pd.warm_pulse, pd.warm_period_us, pd.warm_idle_time, pd.warm_position = 10., 8, 508, 60., None
+        pd.last_fire = None
         pd.printer = types.SimpleNamespace(config_error=ConfigError)
         sent = []
         pd.mcu = types.SimpleNamespace(
             add_config_cmd=lambda cmd, is_init=False: sent.append(cmd), alloc_command_queue=lambda: None,
             lookup_command=lambda *a, **kw: object(), lookup_query_command=lambda *a, **kw: object(),
             try_lookup_command=lambda fmt, *a, **kw: None if fmt.startswith(tuple(missing)) else object(),
-            get_constants=lambda: dict(constants))
+            get_constants=lambda: dict(constants), estimated_print_time=lambda eventtime: eventtime)
         try:
             with mock.patch.object(polydye.logging, "warning") as warn:
                 pd._build_config()
@@ -1083,6 +1163,15 @@ class ConfigOptions(unittest.TestCase):
         # bus_clock: stock is still taken, as a no-op.
         pd = self.load(bus_clock='Stock', cartridge_template='black_b', pulse_words='8')
         self.assertEqual((pd.cartridge_template, pd.pulse_words), ('black_b', 8))
+
+    def test_auto_warm_options(self):
+        pd = self.load()
+        self.assertEqual((pd.warm_seconds, pd.warm_pulse, pd.warm_period_us, pd.warm_idle_time, pd.warm_position),
+                         (10., 8, 508, 60., None))
+        pd = self.load(warm_seconds='0', warm_position=' 5, 200.5 ')
+        self.assertEqual((pd.warm_seconds, pd.warm_position), (0., (5., 200.5)))
+        self.assertIn("heater duty", self.load(warm_period_us='400'))
+        self.assertIn("warm_position must be X, Y", self.load(warm_position='5'))
 
 
 if __name__ == "__main__":
