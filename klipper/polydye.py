@@ -2320,6 +2320,9 @@ class PolyDye:
         back, where = self._go_to_warm_spot(gcmd, cmd, start, direction, position)
         gcmd.respond_info(message(where))
         fired = False
+        # Bumped when live ink goes off or a print's passes are dropped (_check_print_end(), the status poll, can do it
+        # while this waits): the board's run was cut short then, though it isn't running any more.
+        gen = self.prewarm_gen
         self.testing = True
         try:
             self.spit_run_cmd.send([self.oid, spit, SPIT_PATTERNS['stock' if spit else 'all'], 0,
@@ -2333,6 +2336,9 @@ class PolyDye:
                     break
                 if reactor.monotonic() > deadline:
                     raise gcmd.error("%s: the board didn't finish the %s" % (cmd, what))
+            if self.prewarm_gen != gen:
+                raise gcmd.error("%s: the %s was stopped before it finished (the print ended, or live ink went off)"
+                                 % (cmd, what))
             fired = True
         finally:
             self.testing = False

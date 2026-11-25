@@ -1598,6 +1598,29 @@ class Clean(unittest.TestCase):
             pd.cmd_POLYDYE_CLEAN(self.gcmd())
         self.assertEqual((runs, moves, board.live), ([], [], False))
 
+    def test_a_print_that_ends_during_the_board_run_gets_no_wipe(self):
+        # The status poll sees the print cancelled while the board warms: it stops the run and turns live ink off. The
+        # run isn't running any more, but it didn't finish: no strokes, and no "head cleaned".
+        pd, board, runs, moves = self.clean()
+        board.print_state, board.boost, board.live, board.running = 'printing', True, True, False
+        pd.printer.lookup_object('gcode').respond_info = self.said.append
+
+        def status():
+            if board.running and board.print_state == 'printing':
+                board.print_state = 'cancelled'
+                pd._check_print_end(0.)
+                board.running = False
+            return dict(board.status(), running=board.running)
+        pd._fresh_status = pd._query_status = status
+        pd.spit_run_cmd = types.SimpleNamespace(send=lambda args: (runs.append(args), setattr(board, 'running', True)))
+        with self.assertRaisesRegex(RuntimeError, "the clean was stopped before it finished"):
+            pd.cmd_POLYDYE_CLEAN(self.gcmd())
+        self.assertEqual(len(runs), 1)
+        self.assertFalse([m for m in moves if isinstance(m, str) and m.startswith("G1 X205")])
+        self.assertIn("G1 X10.000 Y20.000 F9000\nG1 Z0.300 F900", moves)  # back from the sponge: the board is idle
+        self.assertFalse([s for s in self.said if "head cleaned" in s])
+        self.assertEqual((board.live, pd.last_fire), (False, None))
+
     def test_a_clean_the_board_cant_be_seen_to_finish_doesnt_wipe(self):
         # In a print with live ink on: after the failure it goes off all the same.
         pd, board, runs, moves = self.clean()
