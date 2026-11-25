@@ -1902,6 +1902,87 @@ class CalibrationDrawing(unittest.TestCase):
         self.assertEqual([round(call[0][0], 1) for call in sleep.call_args_list], [1., 2., 3.])
 
 
+def nozzle_fires(data, c, q):
+    """How many columns of nozzle data fire colour c's nozzle position q."""
+    byte, bit = polydye.COLOR_BYTE_ORDER[c][q % 14] + 14 * c, q // 14
+    return sum(data[i + byte] >> bit & 1 for i in range(0, len(data), polydye.NOZDATA_SIZE))
+
+
+def line_loads(data):
+    """The most heaters on one packet's fire line F3 and on F5, over the columns of nozzle data."""
+    n3 = n5 = 0
+    for i in range(0, len(data), polydye.NOZDATA_SIZE):
+        for k in range(14):
+            v = [data[i + 14 * c + k] for c in range(3)]
+            n3 = max(n3, sum(bin(b & 15).count('1') for b in v))
+            n5 = max(n5, sum(bin(b >> 4).count('1') for b in v))
+    return n3, n5
+
+
+class TestPageDrawing(unittest.TestCase):
+    """POLYDYE_TEST_PAGE's passes, as a colour print's: capped, split by fire line where two inks need it."""
+
+    REG = (-34, 1, 27, 0)
+
+    def page(self):
+        skew = polydye.skew_shifts(0.03, 847., 300.)
+        return [(d, direction, x, polydye.drawing_parts(d, direction, self.REG, skew))
+                for d, direction, x in polydye.test_page_drawings(847., 300., self.REG)]
+
+    def test_every_dot_prints_within_the_cap(self):
+        page = self.page()
+        # C, M, Y (a nozzle check and a square: one ink, one board pass), R, G, B (two inks: two, one per fire line),
+        # then the two feathered sweeps of blue (two each), directions alternating.
+        self.assertEqual([len(parts) for *_, parts in page], [1, 1, 1, 2, 2, 2, 2, 2])
+        self.assertEqual([direction for _, direction, _, _ in page], [1, -1] * 4)
+        for d, direction, x, parts in page:
+            self.assertEqual(sum(bin(b).count('1') for data, _, _ in parts for b in data), len(d.dots))
+            for data, columns, first in parts:
+                n3, n5 = line_loads(data)
+                self.assertTrue(n3 <= 4 and n5 <= 4 and n3 + n5 <= 5, (x, n3, n5))
+            if len(parts) == 2:
+                self.assertEqual([lines_used(data) for data, _, _ in parts], [{3}, {5}])
+
+    def test_the_nozzle_check_fires_every_nozzle_once_in_turn(self):
+        # Each colour's nozzles 14-85 a 16-column dash each (the registration moves cyan's drawing one position so
+        # that its own nozzles fire), and the ones under its square that square's 156 columns too.
+        for c, (d, direction, x, parts) in enumerate(self.page()[:3]):
+            data = parts[0][0]
+            across = (self.REG[1], 0, self.REG[3])[c]
+            self.assertEqual([nozzle_fires(data, c, q) for q in range(112)],
+                             [0 if not 14 <= q <= 85 else 16 + (156 if 28 <= q - across <= 82 else 0)
+                              for q in range(112)])
+            # Staircases of 8: nozzle q's dash starts 24 columns after nozzle q - 1's, back to the start every 8.
+            starts = [min(i for i, cc, p in d.dots if p + across == q and i < 200) for q in range(14, 86)]
+            self.assertEqual(starts, [(q - 14) % 8 * 24 for q in range(14, 86)])
+
+    def test_the_feathered_join_shares_its_band_once(self):
+        page = self.page()
+        (a, _, xa, _), (b, _, xb, _) = page[-2:]
+        self.assertAlmostEqual(xb - xa, 49 * 25.4 / 300)
+        # Across both sweeps, on positions counted towards +X: every dot of the 104-position block once.
+        dots = [(i, c, 82 - p) for i, c, p in a.dots] + [(i, c, 49 + 82 - p) for i, c, p in b.dots]
+        self.assertEqual(len(dots), len(set(dots)))
+        self.assertEqual(len(dots), 2 * 104 * max(i for i, _, _ in dots) + 2 * 104)
+        # A whole cell (4 columns, a position) to one sweep; the second's share rises across the 6 shared positions.
+        owner = {}
+        for k, sweep in enumerate((a, b)):
+            for i, c, p in sweep.dots:
+                owner.setdefault((i // 4, k * 49 + 82 - p), set()).add(k)
+        self.assertEqual({len(v) for v in owner.values()}, {1})
+        shares = [sum(1 in owner[cell] for cell in owner if cell[1] == g) / float(sum(cell[1] == g for cell in owner))
+                  for g in range(49, 55)]
+        self.assertEqual(shares, sorted(shares))
+        self.assertTrue(shares[0] < 0.3 and shares[-1] > 0.7, shares)
+
+    @unittest.skipIf(polydye_post.np is None, "needs numpy")
+    def test_the_feather_is_the_post_processors(self):
+        np = polydye_post.np
+        q, r = np.array([[0], [7], [123456]]), np.array([[0, 5, 49, 99999]])
+        self.assertEqual(polydye_post.cell_hash(q, r).tolist(),
+                         [[polydye.feather_hash(int(a), int(b)) for b in r[0]] for a in q[:, 0]])
+
+
 class CalibrationReadings(unittest.TestCase):
     """The calibration prints' readings, entered as printed, correct a simulated cartridge: a reprint reads 0."""
 
@@ -2159,6 +2240,121 @@ class CalibrationPrints(unittest.TestCase):
         pd.spit_run_cmd, pd.warm_duty_ppm, pd.warm_seconds = object(), 5800, 0.
         pd.cmd_POLYDYE_ALIGN_PRINT(self.gcmd(X=100., Y=50.))
         self.assertFalse([s for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_WARM")])
+
+    def test_test_page(self):
+        pd, board = self.make()
+        pd.spit_run_cmd, pd.warm_duty_ppm, pd.warm_max_s = object(), 5800, 30.
+        pd.offset_x, pd.offset_y = 58.6, -8.7
+        pd.cmd_POLYDYE_TEST_PAGE(self.gcmd(X=120., Y=100.))
+        puts = [u for u in self.uploads if u[0] == polydye.DATA_PUT]
+        self.assertEqual([struct.unpack("<HHBBH", u[1])[:4] for u in puts],
+                         [(polydye.CAL_LAYER, n, 0, 0) for n in range(13)])
+        script = [s for s in board.sent if isinstance(s, str)]
+        passes = [s for s in script if s.startswith("POLYDYE_PASS")]
+        # Z, then over the sponge: 6 s of warm-up (prewarm_seconds) and 0.3 s of prime (prime_seconds) at the passes'
+        # template and pulse in one board run; back over the first pass, down, live ink, gentle moves, the passes.
+        self.assertEqual(script[:4], ["SAVE_GCODE_STATE NAME=polydye_cal", "G90\nG1 Z1.000 F900",
+                                      "G90\nG1 Z2.000 F900\nG1 X245.000 F9000",
+                                      "POLYDYE_SPIT SECONDS=0.3 WARM=6 WARM_PULSE=1 WARM_PERIOD_US=254 "
+                                      "TEMPLATE=color_b_late PULSE=6 CONFIRM=1"])
+        x0, y0 = [float(v.split("=")[1]) for v in passes[0].split()[3:5]]
+        self.assertEqual(script[4:7], ["G1 X%.3f Y%.3f F9000\nG1 Z1.000 F900" % (x0 - 58.6, y0 + 8.7),
+                                       "POLYDYE_ENABLE LIVE=1", "POLYDYE_INK_MOTION"])
+        self.assertEqual(script[7:20], passes)
+        self.assertEqual(script[20], "POLYDYE_INK_MOTION RESTORE=1")
+        self.assertEqual(script[-1], "RESTORE_GCODE_STATE NAME=polydye_cal")
+        self.assertLessEqual({board.sent.index(passes[n]) for n in (4, 8, 12)}, set(self.waits))
+        self.assertEqual((board.boost, board.live), (False, False))
+        # Each board pass once, a split pass's two halves over the same ground; the columns 8 mm apart.
+        fields = [dict(w.split("=") for w in s.split()[1:]) for s in passes]
+        self.assertEqual([int(f['PASS']) for f in fields], list(range(13)))
+        self.assertEqual([f['DIR'] for f in fields], ["1", "-1", "1"] + ["-1"] * 2 + ["1"] * 2 + ["-1"] * 2
+                         + ["1"] * 2 + ["-1"] * 2)
+        xs = [float(f['X']) for f in fields]
+        self.assertEqual([round(v - xs[0], 3) for v in xs[:9]], [0., 8., 16., 0., 0., 8., 8., 16., 16.])
+        self.assertEqual((xs[9], xs[11], round(xs[11] - xs[9], 3)), (xs[10], xs[12], round(49 * 25.4 / 300, 3)))
+        said = [s for s in self.said if s.startswith("PolyDye test page, live ink")][0]
+        self.assertIn("8 passes (13 on the board) centred on X=120.0 Y=100.0, Z=1.00. Its ink spans X 103-137, "
+                      "Y 89-111: the paper must cover that with 5 mm to spare", said)
+        self.assertIn("PolyDye test page done.", self.said[-1])
+
+    def test_test_page_refused_before_anything_is_sent(self):
+        for homed, params, setup, error in (
+                ('xyz', {}, lambda pd, board: setattr(pd, 'pass_axis', 'x'), "needs pass_axis: y"),
+                ('xyz', {}, lambda pd, board: setattr(pd, 'spit_run_cmd', None), "needs newer PolyDye board firmware"),
+                ('xyz', dict(WARM=20.), None, r"at a 254 us warm-up period the warm-up lasts at most 16.65 s"),
+                # Older board firmware warms for at most 10 s; Klipper doesn't bound a default (prewarm_seconds).
+                ('xyz', {}, lambda pd, board: setattr(pd, 'warm_max_s', 5.),
+                 r"a 6 s warm-up is longer than the board takes \(5 s\)"),
+                ('xyz', {}, lambda pd, board: setattr(pd, 'registration', (0, 4, 0, 0)),
+                 r"cyan_positions 4, yellow_positions 0\) moves the page's squares"),
+                ('xy', {}, None, "home Z first"),
+                ('xyz', {}, lambda pd, board: setattr(board, 'print_state', 'paused'), "not during a print"),
+                ('xyz', {}, lambda pd, board: setattr(board, 'template', 'black_a'), "for the colour cartridge"),
+                ('xyz', {}, lambda pd, board: self.objects.pop('gcode_macro POLYDYE_WIPE'), "no POLYDYE_WIPE macro"),
+                ('xyz', dict(Y=222.), None, r"would take the toolhead to X=1\d\d.\d Y=2\d\d.\d, beyond the axis")):
+            pd, board = self.make(homed)
+            pd.spit_run_cmd, pd.warm_duty_ppm, pd.warm_max_s = object(), 5800, 30.
+            if setup:
+                setup(pd, board)
+            with self.assertRaisesRegex(RuntimeError, error):
+                pd.cmd_POLYDYE_TEST_PAGE(self.gcmd(**params))
+            self.assertEqual((board.sent, self.uploads), ([], []), error)
+        # No warm-up and no prime: no sponge, and board firmware without them is fine.
+        pd, board = self.make()
+        pd.spit_patterns = ('all',)
+        pd.cmd_POLYDYE_TEST_PAGE(self.gcmd(WARM=0., PRIME=0.))
+        script = [s for s in board.sent if isinstance(s, str)]
+        self.assertEqual(script[1:4], ["G90\nG1 Z1.000 F900", "POLYDYE_ENABLE LIVE=1", "POLYDYE_INK_MOTION"])
+
+    def test_the_test_page_moves_gently_within_a_console_ink_motion(self):
+        # POLYDYE_INK_MOTION from the console (500 mm/s^2, SCV 0.5): the page lowers no further and leaves it in force,
+        # still to be put back to 3000 and 5 by its RESTORE=1.
+        pd, board = self.make()
+        pd.spit_run_cmd, pd.warm_duty_ppm, pd.warm_max_s = object(), 5800, 30.
+        th = self.objects['toolhead'].get_status(0.)
+        th['square_corner_velocity'] = 5.
+        gcode = pd.printer.lookup_object('gcode')
+        run = gcode.run_script_from_command
+
+        def dispatch(script):
+            if script.startswith("POLYDYE_INK_MOTION"):
+                params = dict(w.split("=") for w in script.split()[1:])
+                pd.cmd_POLYDYE_INK_MOTION(self.gcmd(**dict((k, float(v)) for k, v in params.items())))
+                return
+            run(script)
+            if script.startswith("SET_VELOCITY_LIMIT"):
+                v = dict(w.split("=") for w in script.split()[1:])
+                th['max_accel'], th['square_corner_velocity'] = float(v['ACCEL']), float(v['SQUARE_CORNER_VELOCITY'])
+        gcode.run_script_from_command = dispatch
+        dispatch("POLYDYE_INK_MOTION ACCEL=500 SCV=0.5")
+        pd.cmd_POLYDYE_TEST_PAGE(self.gcmd(X=120., Y=100.))
+        self.assertEqual((th['max_accel'], th['square_corner_velocity'], pd.ink_motion),
+                         (500., 0.5, (3000., 5., False)))
+        dispatch("POLYDYE_INK_MOTION RESTORE=1")
+        self.assertEqual((th['max_accel'], th['square_corner_velocity'], pd.ink_motion), (3000., 5., None))
+        # Without one, the page's own goes and comes back.
+        pd.cmd_POLYDYE_TEST_PAGE(self.gcmd(X=120., Y=100.))
+        self.assertEqual((th['max_accel'], th['square_corner_velocity'], pd.ink_motion), (3000., 5., None))
+        self.assertIn("SET_VELOCITY_LIMIT ACCEL=1000.000 SQUARE_CORNER_VELOCITY=1.000", board.sent)
+
+    def test_a_failed_test_page_puts_the_motion_limits_back(self):
+        pd, board = self.make()
+        pd.spit_run_cmd, pd.warm_duty_ppm, pd.warm_max_s = object(), 5800, 30.
+        gcode = pd.printer.lookup_object('gcode')
+        run = gcode.run_script_from_command
+
+        def failing(script):
+            run(script)
+            if script.startswith("POLYDYE_PASS LAYER=65000 PASS=5"):
+                raise RuntimeError("Move out of range")
+        gcode.run_script_from_command = failing
+        with self.assertRaisesRegex(RuntimeError, "out of range"):
+            pd.cmd_POLYDYE_TEST_PAGE(self.gcmd(X=120., Y=100.))
+        script = [s for s in board.sent if isinstance(s, str)]
+        self.assertEqual(script[-2:], ["POLYDYE_INK_MOTION RESTORE=1", "RESTORE_GCODE_STATE NAME=polydye_cal"])
+        self.assertTrue(script[-3].startswith("POLYDYE_PASS LAYER=65000 PASS=5 "))
+        self.assertEqual((board.boost, board.live), (False, False))
 
     def test_offset_print(self):
         pd, board = self.make()

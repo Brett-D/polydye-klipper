@@ -170,6 +170,21 @@
 
     <section class="card">
       <h2>Calibration</h2>
+      <h3>Test page <span class="sub">live ink, on paper only</span></h3>
+      <p class="hint">Checks that the head prints the way a colour print needs it to, with the same rules: for cyan,
+        magenta and yellow a nozzle check (every nozzle a short dash in turn, in staircases of 8: a missing or faint
+        dash is a nozzle that didn't fire) and a solid square; red, green and blue squares (two inks, printed one fire
+        line at a time); and two sweeps of blue side by side, whose feathered join should show no line. Tape paper over
+        the glass first, about 45 &times; 35 mm where the page goes (the console says exactly where): no ink may land on
+        the glass. It homes if needed, warms and primes the head over the wipe sponge and prints at Z.</p>
+      <form id="test-form" class="compact">
+        <label>Centre X (mm)<input name="x" type="number" step="any" placeholder="centred"></label>
+        <label>Y (mm)<input name="y" type="number" step="any" placeholder="centred"></label>
+        <label>Z (mm)<input name="z" type="number" step="any" min="0.2" value="1"></label>
+      </form>
+      <div class="buttons">
+        <button type="button" id="test-btn" class="danger needs-board needs-idle">Print test page&hellip;</button>
+      </div>
       <h3>Fire test <span class="sub">live ink on paper</span></h3>
       <p class="hint">Prints a stripe for each template and fire pulse, side by side, so you can see which settings put
         ink down. The default is one stripe the way the stock PolyDye firmware prints: color_b_late, 6 words and its
@@ -324,8 +339,8 @@
       </div>
       <h3>Next steps</h3>
       <ol class="steps">
-        <li><b>Nozzle check</b>: print every nozzle once to find blocked ones (a black cartridge with both black_a and
-          black_b).</li>
+        <li><b>Black nozzle check</b>: the test page checks a colour cartridge's nozzles; a black cartridge's, with
+          both black_a and black_b, is still to come.</li>
       </ol>
     </section>
 

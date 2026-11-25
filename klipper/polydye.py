@@ -751,6 +751,20 @@ OFFSET_PLAQUE = (3.3 + OFFSET_MARGIN, 9.9 + OFFSET_MARGIN, 14.1 + OFFSET_MARGIN,
 OFFSET_SLOT_END = (7.35, 9.3)
 OFFSET_Y_SCALE_X = 6.5
 PLAQUE_RETRACT, PLAQUE_TRAVEL_F = 0.8, 9000
+# POLYDYE_TEST_PAGE: on paper, whether the head prints the way a colour print needs it to. Drawn here like the
+# calibration prints (test_page_drawings()) and printed as a colour print's passes are: the heater cap, split by fire
+# line where two inks need it (drawing_parts()), positions TEST_POSITIONS (polydye_post.py's default) and the ink
+# blocks' gentle moves (POLYDYE_INK_MOTION); first one warm-up and prime over the wipe sponge (POLYDYE_SPIT WARM=).
+# Seen from the front, left to right, a column each for cyan, magenta and yellow: at the front its nozzle check, every
+# nozzle 14-85 a TEST_DASH-column dash in turn, in staircases of TEST_STAIR nozzles (a missing or weak nozzle leaves a
+# gap in its staircase; all should look alike), then its solid square; at the back red, green and blue squares (two
+# inks: two passes each, one per fire line). On the right two sweeps of blue the page's length, their join feathered
+# over TEST_FEATHER positions like polydye_post.py's and printed in opposite directions like a print's sweeps.
+TEST_POSITIONS = (28, 82)
+TEST_Z = 1.
+TEST_COLUMN_MM, TEST_GAP_MM = 8., 3.
+TEST_DASH, TEST_STEP, TEST_STAIR = 16, 24, 8
+TEST_FEATHER = 6
 # Digits and row names in a 5 x 7 font.
 FONT = {
     '0': ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
@@ -830,14 +844,7 @@ def pass_data(drawing, direction, registration=(0, 0, 0, 0), skew=None):
     yellow_columns, yellow_positions; dots moved beyond the nozzle row are left out) and the nozzle row's skew (`skew`:
     skew_shifts(), or None). Returns (data, columns, first): first is the drawing column of the pass's first column, the
     one POLYDYE_PASS's X, Y name."""
-    along = (registration[0], 0, registration[2])
-    across = (registration[1], 0, registration[3])
-    cols = {}
-    for i, c, p in drawing.dots:
-        p += across[c]
-        if 0 <= p < COLOR_POSITIONS:
-            col = cols.setdefault(i + along[c] + (skew[p] if skew else 0), bytearray(NOZDATA_SIZE))
-            col[COLOR_BYTE_ORDER[c][p % 14] + 14 * c] |= 1 << (p // 14)
+    cols = _drawing_cols(drawing, registration, skew)
     for i, raw in drawing.raw.items():
         col = cols.setdefault(i, bytearray(NOZDATA_SIZE))
         for n, b in enumerate(raw):
@@ -847,6 +854,34 @@ def pass_data(drawing, direction, registration=(0, 0, 0, 0), skew=None):
     order = range(lo, hi + 1) if direction > 0 else range(hi, lo - 1, -1)
     empty = bytes(NOZDATA_SIZE)
     return b"".join(bytes(cols[i]) if i in cols else empty for i in order), hi - lo + 1, lo if direction > 0 else hi
+
+
+def _drawing_cols(drawing, registration, skew):
+    """`drawing`'s dots (not its priming blocks) as nozzle data with the colour registration and skew: {drawing column:
+    bytearray}."""
+    along = (registration[0], 0, registration[2])
+    across = (registration[1], 0, registration[3])
+    cols = {}
+    for i, c, p in drawing.dots:
+        p += across[c]
+        if 0 <= p < COLOR_POSITIONS:
+            col = cols.setdefault(i + along[c] + (skew[p] if skew else 0), bytearray(NOZDATA_SIZE))
+            col[COLOR_BYTE_ORDER[c][p % 14] + 14 * c] |= 1 << (p // 14)
+    return cols
+
+
+def drawing_parts(drawing, direction, registration=(0, 0, 0, 0), skew=None):
+    """The board passes that print `drawing`'s dots (not its priming blocks) the way a colour print's pass is printed
+    (job_pass_parts()): with the colour registration and skew like pass_data(), the heater cap, and split by fire line
+    where two or more inks need it. [(data, columns, first)] like pass_data()'s; empty if no dot is left."""
+    cols = _drawing_cols(drawing, registration, skew)
+    if not cols:
+        return []
+    lo, hi = min(cols), max(cols)
+    empty = bytes(NOZDATA_SIZE)
+    out = bytearray(b"".join(bytes(cols[i]) if i in cols else empty for i in range(lo, hi + 1)))
+    inks = len(set(c for _, c, _ in drawing.dots))
+    return [part[1:] for part in _pass_parts(out, lo, inks, direction)]
 
 
 def align_centre(k):
@@ -1027,6 +1062,65 @@ def plaque_gcode(layers, height, width, filament_area, first_width=None):
                     line(xb, y, w, height, f_fill)
     out.extend(["G1 E-2 F2700", "M106 S0"])
     return out
+
+
+def feather_hash(q, r):
+    """A fixed pseudo-random value 0-1 for cell q, r (integers): polydye_post.py's cell_hash(), in its 64-bit
+    arithmetic."""
+    def i64(v):
+        v &= 0xffffffffffffffff
+        return v - (1 << 64) if v >> 63 else v
+    h = i64((q * 73856093) ^ (r * 19349663))
+    h = i64((h ^ (h >> 13)) * 1274126177)
+    return ((h ^ (h >> 16)) & 0xffff) / 65536.
+
+
+def test_page_drawings(dpi, nozzle_dpi, registration=(0, 0, 0, 0)):
+    """POLYDYE_TEST_PAGE's passes in printing order, as (drawing, direction, x): directions alternating, x the pass's X
+    (mm; nozzle position SKEW_PIVOT's, the one POLYDYE_PASS names) from the first pass's. Every drawing's column 0 is
+    the page's front edge (the lowest Y)."""
+    pitch, nozzle = 25.4 / dpi, 25.4 / nozzle_dpi
+    lo, hi = TEST_POSITIONS
+    width = hi - lo + 1
+    # Whole column pairs throughout, so the cap keeps both columns of a pair alike.
+    square = 2 * max(1, int(round(width * nozzle / pitch / 2.)))
+    gap = 2 * max(1, int(round(TEST_GAP_MM / pitch / 2.)))
+    rows = (0, (TEST_STAIR - 1) * TEST_STEP + TEST_DASH + gap)  # the nozzle checks; the one-ink squares behind them
+    rows += (rows[1] + square + gap,)  # the two-ink squares
+    length = rows[2] + square
+    across = (registration[1], 0, registration[3])
+    out = []
+    for k, c in enumerate((CYAN, MAGENTA, YELLOW)):
+        d = PassDrawing()
+        for q in range(JOB_NOZZLES[0], JOB_NOZZLES[1] + 1):
+            # Nozzle q fires its dash: drawn where the colour registration takes it to that nozzle.
+            i = (q - JOB_NOZZLES[0]) % TEST_STAIR * TEST_STEP
+            d.bar(i, i + TEST_DASH - 1, c, q - across[c], q - across[c])
+        d.bar(rows[1], rows[1] + square - 1, c, lo, hi)
+        out.append((d, k * TEST_COLUMN_MM))
+    for k, inks in enumerate(((MAGENTA, YELLOW), (CYAN, YELLOW), (CYAN, MAGENTA))):  # red, green, blue
+        d = PassDrawing()
+        for c in inks:
+            d.bar(rows[2], rows[2] + square - 1, c, lo, hi)
+        out.append((d, k * TEST_COLUMN_MM))
+    # Two sweeps of blue the page's length, the second `step` positions towards +X, TEST_GAP_MM right of the yellow
+    # nozzle check. In the TEST_FEATHER positions they share, each cell (4 columns: two pairs; one position) goes to
+    # the second where its feather_hash() is under a ramp rising across the band, else to the first (polydye_post.py's
+    # feathered joins, here with the page's columns and grid positions g counted towards +X).
+    step = width - TEST_FEATHER
+    x = 2 * TEST_COLUMN_MM + (hi - JOB_NOZZLES[0]) * nozzle + TEST_GAP_MM
+    for j in (0, 1):
+        d = PassDrawing()
+        for p in range(lo, hi + 1):
+            g = j * step + hi - p
+            band = g - step
+            for i in range(0, length, 4):
+                if 0 <= band < TEST_FEATHER and (feather_hash(i // 4, g) < (band + .5) / TEST_FEATHER) != (j == 1):
+                    continue
+                for c in (CYAN, MAGENTA):
+                    d.bar(i, min(i + 3, length - 1), c, p, p)
+        out.append((d, x + j * step * nozzle))
+    return [(d, 1 if n % 2 == 0 else -1, x) for n, (d, x) in enumerate(out)]
 
 
 def cfg_number(v):
@@ -1262,10 +1356,13 @@ def job_pass_parts(data, colours, columns, direction, registration=(0, 0, 0, 0),
     and capped. A single ink stays one pass, capped (3 + 3 at positions 14-84 becomes 3 + 2): splitting it would double
     its time for a dot or two. Empty if no dot is left."""
     raw = _job_columns(data, colours, columns, registration, skew)
-    if raw is None:
-        return []
-    out, lo = raw
-    if len(colours) < 2 or not needs_split(out):
+    return [] if raw is None else _pass_parts(raw[0], raw[1], len(colours), direction)
+
+
+def _pass_parts(out, lo, inks, direction):
+    """job_pass_parts() for nozzle data `out` (bytearray, columns from drawing column `lo` on in DIR=1's order, with
+    the registration and skew, uncapped) of `inks` inks."""
+    if inks < 2 or not needs_split(out):
         built = _job_part(out, lo, direction)
         return [(0,) + built] if built[1] else []  # the cap can drop every fire: a lone dot, say
     parts = []
@@ -1702,6 +1799,8 @@ class PolyDye:
         gcode.register_command('POLYDYE_ALIGN_PRINT', self.cmd_POLYDYE_ALIGN_PRINT,
                                desc=self.cmd_POLYDYE_ALIGN_PRINT_help)
         gcode.register_command('POLYDYE_ALIGN', self.cmd_POLYDYE_ALIGN, desc=self.cmd_POLYDYE_ALIGN_help)
+        gcode.register_command('POLYDYE_TEST_PAGE', self.cmd_POLYDYE_TEST_PAGE,
+                               desc=self.cmd_POLYDYE_TEST_PAGE_help)
         gcode.register_command('POLYDYE_OFFSET_PRINT', self.cmd_POLYDYE_OFFSET_PRINT,
                                desc=self.cmd_POLYDYE_OFFSET_PRINT_help)
         gcode.register_command('POLYDYE_SAVE', self.cmd_POLYDYE_SAVE, desc=self.cmd_POLYDYE_SAVE_help)
@@ -2710,10 +2809,13 @@ class PolyDye:
                              "maximum" % (cmd, x))
         return x, float(variables.get('z_hop', 1.))
 
-    def _check_reach(self, gcmd, cmd, prints, columns):
+    def _check_reach(self, gcmd, cmd, prints, columns, accel=None):
         """Refuses, before anything moves, passes of `prints` ((pass, X, Y, direction)) that would take the toolhead
-        beyond the axis limits; columns[pass] is each pass's length."""
+        beyond the axis limits; columns[pass] is each pass's length. `accel`: the passes run at most that acceleration
+        (POLYDYE_INK_MOTION), so with longer run-ups."""
         th = self.printer.lookup_object('toolhead').get_status(self.printer.get_reactor().monotonic())
+        if accel:
+            th = dict(th, max_accel=min(th['max_accel'], accel))
         base = self.printer.lookup_object('gcode_move').base_position
         lo, hi = th['axis_minimum'], th['axis_maximum']
         pitch = 25.4 / self.dpi
@@ -2726,15 +2828,20 @@ class PolyDye:
                     raise gcmd.error("%s: the pass at X=%.1f Y=%.1f would take the toolhead to X=%.1f Y=%.1f, beyond "
                                      "the axis limits; choose another X, Y" % (cmd, x, y, px, py))
 
-    def _run_cal(self, gcmd, cmd, st, prints, sponge, setup=None, z=None):
+    def _run_cal(self, gcmd, cmd, st, prints, sponge, setup=None, z=None, warm=None, ink_motion=False):
         """Prints `prints` ((pass, X, Y, direction) of layer CAL_LAYER) with live ink, after the G-code `setup` (the
-        plaque), a move to `z` and, with `sponge` (_cal_sponge()), a head warm-up with the automatic warm-up's settings
-        over the wipe sponge: up by its Z hop (within the Z axis), across, warm, back over the first pass at that
-        height and down. The passes don't warm again. Afterwards, also after an error, live ink goes off
+        plaque), a move to `z` and, with `sponge` ((X, Z hop) of the wipe sponge), a head warm-up over the sponge: up by
+        its Z hop (within the Z axis), across, warm, back over the first pass at that height and down. The warm-up has
+        the automatic warm-up's settings, or with `warm` (seconds of warm-up, seconds of prime) that long with its pulse
+        and period, then that long of the stock pattern at the template and pulse the passes print with, in the same
+        board run (POLYDYE_SPIT WARM=). The passes don't warm again; with `ink_motion` they move gently
+        (POLYDYE_INK_MOTION, its own: one lowered from the console before carries on afterwards, from the limits it
+        set). Afterwards, also after an error, the motion limits are put back, live ink goes off
         (_restore_after_test()) and the G-code state back, and after a plaque the hotend and the part fan are off."""
         toolhead = self.printer.lookup_object('toolhead')
         run = self.printer.lookup_object('gcode').run_script_from_command
         before = (st['cartridge_template'], st['pulse_words'])
+        lowered, outer = False, self.ink_motion
         run("SAVE_GCODE_STATE NAME=polydye_cal")
         try:
             if setup:
@@ -2748,17 +2855,32 @@ class PolyDye:
                 top = toolhead.get_status(eventtime)['axis_maximum'].z - (gm['position'].z - here)
                 up = max(here, min(here + sponge[1], top))
                 run("G90\nG1 Z%.3f F900\nG1 X%.3f F%d" % (up, sponge[0], self.travel_speed * 60))
-                run("POLYDYE_WARM SECONDS=%g WARM_PULSE=%d WARM_PERIOD_US=%d CONFIRM=1"
-                    % (min(self.warm_seconds, self.warm_max_s), self.warm_pulse, self.warm_period_us))
+                seconds, spit = warm or (min(self.warm_seconds, self.warm_max_s), 0.)
+                if spit:
+                    run("POLYDYE_SPIT SECONDS=%g WARM=%g WARM_PULSE=%d WARM_PERIOD_US=%d%s CONFIRM=1"
+                        % (spit, seconds, self.warm_pulse, self.warm_period_us,
+                           "" if None in before else " TEMPLATE=%s PULSE=%d" % before))
+                else:
+                    run("POLYDYE_WARM SECONDS=%g WARM_PULSE=%d WARM_PERIOD_US=%d CONFIRM=1"
+                        % (seconds, self.warm_pulse, self.warm_period_us))
                 n, x, y, direction = prints[0]
                 run("G1 X%.3f Y%.3f F%d\nG1 Z%.3f F900" % (x - self.offset_x, y - self.offset_y,
                                                            self.travel_speed * 60, here))
             run("POLYDYE_ENABLE LIVE=1")
+            if ink_motion:
+                lowered, self.ink_motion = True, None
+                run("POLYDYE_INK_MOTION")
             for i, (n, x, y, direction) in enumerate(prints):
                 if i and i % 4 == 0:
                     toolhead.wait_moves()  # the board queues at most 8 passes
                 run("POLYDYE_PASS LAYER=%d PASS=%d X=%.3f Y=%.3f DIR=%d WARM=0" % (CAL_LAYER, n, x, y, direction))
         finally:
+            if lowered and not self.printer.is_shutdown():
+                try:
+                    run("POLYDYE_INK_MOTION RESTORE=1")
+                except Exception:
+                    logging.exception("polydye: %s couldn't put the motion limits back", cmd)
+                self.ink_motion = outer
             if setup and not self.printer.is_shutdown():
                 try:
                     run("M104 S0\nM106 S0")
@@ -2837,6 +2959,79 @@ class PolyDye:
         base = self.printer.lookup_object('gcode_move').base_position
         x, y = (across, along) if self.pass_axis == 'y' else (along, across)
         return "X %.0f-%.0f, Y %.0f-%.0f" % (x[0] + base[0], x[1] + base[0], y[0] + base[1], y[1] + base[1])
+
+    cmd_POLYDYE_TEST_PAGE_help = ("LIVE INK, on paper only: the test page, whether the head prints the way a colour "
+                                  "print needs: a nozzle check and a solid square per colour, red, green and blue "
+                                  "squares and two sweeps' feathered join, centred on X, Y, at Z (1), after a WARM s "
+                                  "(prewarm_seconds) warm-up and a PRIME s (prime_seconds) prime over the wipe sponge")
+
+    def cmd_POLYDYE_TEST_PAGE(self, gcmd):
+        cmd = "POLYDYE_TEST_PAGE"
+        if self.pass_axis != 'y':
+            raise gcmd.error("%s: needs pass_axis: y, like the colour prints it checks" % (cmd,))
+        z = gcmd.get_float('Z', TEST_Z, minval=0.2)
+        warm = gcmd.get_float('WARM', self.prewarm_seconds, minval=0., maxval=self.warm_max_s)
+        prime = gcmd.get_float('PRIME', self.prime_seconds, minval=0., maxval=PRESPIT_MAX_S)
+        if (warm and self.spit_run_cmd is None) or (prime and 'stock' not in self.spit_patterns):
+            raise gcmd.error("%s: warms and primes the head the way a colour print does, which needs newer PolyDye "
+                             "board firmware; update it from the PolyDye page (Board firmware: Update to bundled "
+                             "firmware)" % (cmd,))
+        if warm > self.warm_max_s + 1e-9:  # prewarm_seconds, which polydye.cfg bounds only by the newest board's
+            raise gcmd.error("%s: a %g s warm-up is longer than the board takes (%g s): set WARM, or a shorter "
+                             "prewarm_seconds" % (cmd, warm, self.warm_max_s))
+        if warm:
+            self._warm_plan(gcmd, cmd, warm, self.warm_pulse, self.warm_period_us)
+        lo, hi = TEST_POSITIONS
+        reg = self.registration
+        moves = (reg[1], reg[3], 0)
+        if lo + min(moves) < JOB_NOZZLES[0] or hi + max(moves) > JOB_NOZZLES[1]:
+            raise gcmd.error("%s: the colour registration (cyan_positions %d, yellow_positions %d) moves the page's "
+                             "squares, on positions %d-%d, beyond the %d-%d the cartridge fires"
+                             % (cmd, reg[1], reg[3], lo, hi, JOB_NOZZLES[0], JOB_NOZZLES[1]))
+        x = gcmd.get_float('X', None)
+        y = gcmd.get_float('Y', None)
+        st = self._cal_start(gcmd, cmd, 'xyz')
+        x = self._ink_centre(0) if x is None else x
+        y = self._ink_centre(1) if y is None else y
+        sponge = self._sponge_spot(gcmd, cmd, "the head warms and primes over the wipe sponge") if warm or prime \
+            else None
+        pitch, nozzle, wide = 25.4 / self.dpi, 25.4 / self.nozzle_dpi, 25.4 / self.nozzle_dpi * 1.1
+        skew = self._skew()
+        built, layout, across = [], [], []
+        for d, direction, px in test_page_drawings(self.dpi, self.nozzle_dpi, reg):
+            p0, p1 = min(p for _, _, p in d.dots), max(p for _, _, p in d.dots)
+            across.append((px, p0, p1))
+            for data, columns, first in drawing_parts(d, direction, reg, skew):
+                ends = (first, first + columns - 1) if direction > 0 else (first - columns + 1, first)
+                layout.append((len(built), px, first, direction, ends))
+                built.append((data, columns))
+        # Centred on X, Y; the paper it needs with the nozzle row up to 10 % wider than nozzle_dpi, and the reverse
+        # passes' ink moved by direction_trim.
+        x0 = min(px - (p1 - SKEW_PIVOT) * nozzle for px, p0, p1 in across)
+        x1 = max(px + (SKEW_PIVOT - p0) * nozzle for px, p0, p1 in across)
+        dx = x - (x0 + x1) / 2.
+        dy = y - (min(e[0] for *_, e in layout) + max(e[1] for *_, e in layout)) * pitch / 2.
+        prints = [(n, px + dx, dy + first * pitch, direction) for n, px, first, direction, _ in layout]
+        self._check_reach(gcmd, cmd, prints, [b[1] for b in built], accel=INK_ACCEL)
+        base = self.printer.lookup_object('gcode_move').base_position
+        trim = [self.direction_trim if direction < 0 else 0. for _, _, _, direction, _ in layout]
+        paper = (min(px - (p1 - SKEW_PIVOT) * wide for px, p0, p1 in across) + dx + base[0],
+                 max(px + (SKEW_PIVOT - p0) * wide for px, p0, p1 in across) + dx + base[0],
+                 min(dy + e[0] * pitch + t for (*_, e), t in zip(layout, trim)) + base[1],
+                 max(dy + e[1] * pitch + t for (*_, e), t in zip(layout, trim)) + base[1])
+        self._upload_cal(gcmd, cmd, built)
+        gcmd.respond_info("PolyDye test page, live ink on paper: %d passes (%d on the board) centred on X=%.1f Y=%.1f, "
+                          "Z=%.2f. Its ink spans X %.0f-%.0f, Y %.0f-%.0f: the paper must cover that with %g mm to "
+                          "spare" % (len(across), len(built), x, y, z, paper[0], paper[1], paper[2], paper[3],
+                                     ALIGN_PAPER_MARGIN))
+        self._run_cal(gcmd, cmd, st, prints, sponge, z=z, warm=(warm, prime), ink_motion=True)
+        gcmd.respond_info(
+            "PolyDye test page done. Seen from the front, left to right: cyan, magenta and yellow, each with its "
+            "nozzle check at the front (9 staircases of 8 dashes, one per nozzle 14-85: a missing or faint dash is a "
+            "nozzle that didn't fire; every staircase should look alike) and a solid square behind it; red, green "
+            "and blue squares at the back (two inks, each printed as two passes, one per fire line); on the right two "
+            "sweeps of blue whose join should show no line. Pale or streaky squares: a cold head or a weak fire line; "
+            "a line at the join: check direction_trim (alignment page, row D).")
 
     cmd_POLYDYE_OFFSET_PRINT_help = ("PLA and LIVE INK: a PLA plaque with a cross-shaped groove centred on X, Y "
                                      "(LAYERS of LAYER_HEIGHT, the groove in the top 3; heats to EXTRUDER_TEMP and "

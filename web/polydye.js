@@ -1090,8 +1090,20 @@ function queueStoring(key, script) {
   }).finally(() => storing.delete(key));
 }
 
-['align-form', 'align-read', 'offset-form', 'offset-read'].forEach((id) => {
+['test-form', 'align-form', 'align-read', 'offset-form', 'offset-read'].forEach((id) => {
   $(id).addEventListener('submit', (ev) => ev.preventDefault());
+});
+
+$('test-btn').addEventListener('click', () => {
+  const p = numParams($('test-form'), [['x', 'X'], ['y', 'Y'], ['z', 'Z']]);
+  if (p.error) {
+    log(`! test page: ${p.error}`);
+    return;
+  }
+  const ok = window.confirm('Print the test page with LIVE INK, on paper only?\n\nPaper taped over the glass where '
+    + 'the page goes, about 45 x 35 mm, so no ink lands on the glass (the console says exactly where); cartridge '
+    + 'fitted. It homes if needed, warms and primes the head over the wipe sponge and prints 13 passes.');
+  if (ok) gcode(`PD_TEST_PAGE${p.text}`);
 });
 
 $('align-btn').addEventListener('click', () => {
