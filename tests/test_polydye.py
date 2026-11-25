@@ -394,10 +394,18 @@ class TestCleanup(unittest.TestCase):
         for run in (lambda: pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=0.2, PERIOD_US=200, CONFIRM=1)),
                     lambda: pd.cmd_POLYDYE_WARM(self.gcmd(SECONDS=0.5, CONFIRM=1)),
                     lambda: pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b_late:6", PATTERN='all', **self.FIRE)),
-                    lambda: pd.cmd_POLYDYE_ENABLE(self.gcmd(LIVE=1))):
+                    lambda: pd.cmd_POLYDYE_ENABLE(self.gcmd(LIVE=1)),
+                    # 8 words would be 4.8 us at half: the board would shut down rather than take it.
+                    lambda: pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(PULSE=8)),
+                    lambda: pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(TEMPLATE='black_b'))):
             with self.assertRaisesRegex(RuntimeError, "runs the half bus clock .* FIRMWARE_RESTART sets it back"):
                 run()
         self.assertEqual(board.sent, [])
+        # At the stock clock an over-limit pulse left by older firmware can still be shortened.
+        pd._fresh_status = pd._query_status = board.status
+        board.pulse = 9
+        pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(PULSE=8))
+        self.assertEqual((board.sent, board.pulse), (['pulse'], 8))
 
     def test_removed_settings_are_refused_before_anything_is_sent(self):
         pd, board = self.make(fail_on="NOTHING")

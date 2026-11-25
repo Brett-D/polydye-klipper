@@ -945,16 +945,20 @@ class PolyDye:
 
     cmd_POLYDYE_ENABLE_help = "Turn on the PolyDye boost (LIVE=1 also allows real ink; LIVE=0 is a dry run)"
 
-    def _check_current_pulse(self, gcmd, name, st):
-        """Refuses to go on from a board whose current pulse is over the limit (older firmware doesn't always stop
-        that), so live ink never uses it and a test can't put it back afterwards; and from a board on a clock other
-        than the stock one (older firmware's console can still switch it), where the add-on's pulse, column and
-        warm-up timing, all worked out for the stock clock, would be wrong."""
+    def _check_board_clock(self, gcmd, name, st):
+        """Refuses to go on from a board on a clock other than the stock one (older firmware's console can still switch
+        it): the add-on's pulse limit, column and warm-up timing are all worked out for the stock clock, so a setting
+        or test it allows could be over the limit there and shut the board down."""
         clock = st.get('bus_clock')
         if clock not in (None, 'stock'):
             raise gcmd.error("%s: the board runs the %s bus clock (set on its console?), but only the stock clock is "
                              "left: FIRMWARE_RESTART sets it back, and updating the board firmware from the PolyDye "
                              "page (Board firmware: Update to bundled firmware) removes the others" % (name, clock))
+
+    def _check_current_pulse(self, gcmd, name, st):
+        """Refuses to go on from a board whose current pulse is over the limit (older firmware doesn't always stop
+        that), so live ink never uses it and a test can't put it back afterwards, or from one on another clock."""
+        self._check_board_clock(gcmd, name, st)
         if st.get('pulse_words') is not None and pulse_limit_error(st['pulse_words']):
             raise gcmd.error("%s: the board is set to an over-limit pulse: %s. Set a shorter one first, e.g. "
                              "POLYDYE_CARTRIDGE PULSE=%d" % (name, pulse_limit_error(st['pulse_words']), PULSE_MAX))
@@ -1053,6 +1057,7 @@ class PolyDye:
             # The board refuses a change while powered or busy by shutting down; check first for a plain error.
             self.printer.lookup_object('toolhead').wait_moves()
             st = self._fresh_status()
+            self._check_board_clock(gcmd, cmd, st)
             change = (name is not None and name != st['cartridge_template']) or (
                 pulse is not None and pulse != st['pulse_words'])
             # Also when nothing changes: the result must be within the limit, not just different.
