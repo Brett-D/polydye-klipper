@@ -256,6 +256,7 @@ offset_y: -8.7
 #warm_position: sponge # where warm-ups run: sponge (POLYDYE_WIPE's X), X, Y over printed plastic, or pass
 #warm_clearance: 10   # mm behind the pass's run-up start, for warm_position: pass
 #warm_prespit: 0      # s of stock-pattern spit at the warm spot right after a warm-up (0: none; up to 5)
+#prime_seconds: 0.3   # s of POLYDYE_PRIME's stock-pattern spit over the wipe sponge without SECONDS (up to 5)
 #cyan_columns: 0      # colour registration (POLYDYE_ALIGN sets these): cyan's and yellow's dots against magenta's,
 #cyan_positions: 0    #   in bus columns along the pass (DIR=1's order) and nozzle positions across it
 #yellow_columns: 0
@@ -343,6 +344,7 @@ If anything would print a pass wrongly, Klipper stops with a readable reason, fo
 | `POLYDYE_DISABLE` | Waits for queued moves, then turns live output and the boost off |
 | `POLYDYE_PASS LAYER= PASS= X= Y= [DIR=1] [SPEED=] [WARM=] [WARM_PULSE=] [WARM_PERIOD_US=] [PRESPIT=]` | Prints one pass (above), after an automatic head warm-up off the print if live ink is on and the head is cold; `WARM` asks for one (seconds), `WARM=0` for none, `PRESPIT` adds a stock-pattern pre-spit after it (see "Automatic head warm-up") |
 | `POLYDYE_PREWARM [SECONDS=6]` | Warms the head in the background while the moves after it run, so it's hot for the next pass (see "Prewarm bursts"): `SECONDS` (default `prewarm_seconds`, 6) of every nozzle at 1 word (0.35 µs, which doesn't eject) every `warm_period_us`, from where the moves before it end, without stopping them. Turns live ink on. A pass never waits for it: one that comes first cuts it short, and needs no warm-up of its own. At most 16.6 s at 254 µs. Needs this add-on's bundled board firmware |
+| `POLYDYE_PRIME [SECONDS=0.3]` | Primes the nozzles over the wipe sponge before an ink layer whose colours have been idle (see "Priming"): waits for the passes before it, turns live ink on, goes up by `POLYDYE_WIPE`'s `z_hop` and over the sponge, spits `SECONDS` (default `prime_seconds`, 0.3; up to 5) of the stock pattern in every colour, then comes back. Allowed during a print, no `CONFIRM`. Colour templates only; needs the `POLYDYE_WIPE` macro and this add-on's bundled board firmware |
 | `POLYDYE_CANCEL` | Drops passes that are scheduled but not started (for a cancel macro). The add-on does this itself, and turns live ink off, within 2 s of a print being cancelled or stopping with an error: the print's own `POLYDYE_ENABLE LIVE=0` never runs then (`CANCEL_PRINT` waits for the command running, such as a pass's warm-up) |
 | `POLYDYE_STATUS` | Board status: boost, live, passes printed and queued, worst column lateness, faults, stored passes, cartridge template, fire pulse, the last prewarm burst; and the offsets and direction trim in use |
 | `POLYDYE_NUDGE [X=] [Y=] [TRIM=]` | Moves where the ink lands by `X`, `Y` mm on the bed, and the ink of reverse passes by `TRIM` mm along the pass axis (each at most ±5 mm), from the next pass on. Changes `offset_x`/`offset_y` (in the opposite direction: the offset is where the cartridge is) and `direction_trim` until the next restart |
@@ -544,6 +546,32 @@ POLYDYE_PASS LAYER=5 PASS=0 X=120 Y=100 DIR=1
 **Proof test before relying on it (paper):** print lines (`POLYDYE_UPLOAD_TEST_PASS` passes) in groups with 30 s and
 60 s gaps after the previous group, each group led by a `POLYDYE_PREWARM` timed to end as it starts: every group should
 print in full, and the paper under the bursts stay clean.
+
+### Priming
+
+A burst warms the head but doesn't eject, and a hot head isn't enough: a nozzle that hasn't ejected for a while misses
+about its first 60 full-energy fires. Cyan printed in full 30, 60 and 120 s after its last ejection, but lost about
+5 mm of a pass after 4.5 min. So an ink layer starts with `POLYDYE_PRIME` when it's the print's first, or when any
+colour it uses hasn't ejected for 90 s or more:
+
+- **Over the wipe sponge only.** It rides on the X gantry, so the cartridge's gap to it stays the same; spits from over
+  about 5 mm mist, so never over the base or the bed.
+- **A short spit:** `prime_seconds` (0.3 s: 591 columns) of the stock pattern every 508 µs, all three colours. After
+  0.2 s a full-width cyan bar still started ragged.
+- **After the burst, right before the passes:** the passes before it finish first (it waits for the moves), then up by
+  `POLYDYE_WIPE`'s `z_hop`, over the sponge, spit, and back across at that height and down. It counts as firing, so the
+  passes after it need no warm-up of their own for `warm_idle_time`. If the board can't be seen idle afterwards, the
+  cartridge stays over the sponge and the command fails.
+
+```
+POLYDYE_PREWARM
+; ... the layer's last ~6 s of plastic ...
+POLYDYE_PRIME
+POLYDYE_PASS LAYER=5 PASS=0 X=120 Y=100 DIR=1
+```
+
+On paper, a 6 s burst, then a 0.2 s prime, then one layer's eight wall passes printed all four walls; without the
+prime only the colour that had just fired did.
 
 ### Calibration prints
 
