@@ -204,6 +204,20 @@ class PrintEnd(unittest.TestCase):
         pd.cmd_POLYDYE_ENABLE(gcmd)
         self.assertEqual(sent, off + [('mode', 1, 1)])
         run((('complete', False, []), ('standby', False, [])))
+        # A send that fails (the link hiccups) is tried again at the next poll.
+        state[0] = 'printing'
+        pd.cmd_POLYDYE_ENABLE(gcmd)
+        state[0], fail = 'cancelled', [True]
+
+        def mode(args):
+            if fail.pop() if fail else False:
+                raise RuntimeError("Timeout on wait for 'polydye_status' response")
+            sent.append(('mode', args[1], args[2]))
+        pd.mode_cmd = types.SimpleNamespace(send=mode)
+        with self.assertRaisesRegex(RuntimeError, "Timeout"):
+            pd._check_print_end(0.)
+        self.assertTrue(pd.print_live)
+        run((('cancelled', False, off), ('cancelled', False, [])))
         # Older board firmware: the boost goes off too.
         pd.boost_idle_s, state[0] = None, 'printing'
         pd.cmd_POLYDYE_ENABLE(gcmd)

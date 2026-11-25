@@ -1342,11 +1342,12 @@ class PolyDye:
         too unless the board keeps it on (boost_idle_s)."""
         if not self.print_live or self.cancel_cmd is None or self._printing(eventtime):
             return
-        self.print_live = False
         print_stats = self.printer.lookup_object('print_stats', None)
         state = print_stats.get_status(eventtime).get('state') if print_stats is not None else None
         self.cancel_cmd.send([self.oid])
         self.mode_cmd.send([self.oid, 0 if self.boost_idle_s is None else 1, 0])
+        # Done only once both went out: if one fails, the next poll tries again.
+        self.print_live = False
         self.last_fire = None  # the dropped passes never fired
         msg = "PolyDye: the print %s, so its queued passes were dropped and live ink is off" % (
             {'cancelled': "was cancelled", 'error': "stopped with an error",
