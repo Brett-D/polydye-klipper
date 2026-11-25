@@ -161,6 +161,9 @@ class CalibrationPrints(unittest.TestCase):
         self.assertEqual(run(self.macros, "PD_TEST_PAGE", "X=120 PRIME=0.5", homed="xy"),
                          ["G28", "POLYDYE_TEST_PAGE Z=1.0 X=120.0 PRIME=0.5"])
         self.assertEqual(run(self.macros, "PD_TEST_PAGE", "Z=1.5", homed="xyz"), ["POLYDYE_TEST_PAGE Z=1.5"])
+        self.assertEqual(run(self.macros, "PD_FIRE_GAP_TEST", "X=120 GAPS=7,10.5,15", homed="xy"),
+                         ["G28", "POLYDYE_FIRE_GAP_TEST Z=1.0 X=120.0 GAPS=7.0,10.5,15.0"])
+        self.assertEqual(run(self.macros, "PD_FIRE_GAP_TEST", homed="xyz"), ["POLYDYE_FIRE_GAP_TEST Z=1.0"])
 
     def test_the_head_clean_homes_only_when_needed_and_passes_the_values(self):
         self.assertEqual(run(self.macros, "PD_CLEAN", "WARM=4 SECONDS=2 STROKES=5", homed="x"),
@@ -169,10 +172,10 @@ class CalibrationPrints(unittest.TestCase):
         self.assertEqual(run(self.macros, "PD_CLEAN", homed="xyz", print_state="printing"), ["POLYDYE_CLEAN"])
 
     def test_refused_during_a_print_before_homing(self):
-        for name in ("PD_ALIGN_PRINT", "PD_OFFSET_PRINT", "PD_TEST_PAGE"):
+        for name in ("PD_ALIGN_PRINT", "PD_OFFSET_PRINT", "PD_TEST_PAGE", "PD_FIRE_GAP_TEST"):
             with self.assertRaisesRegex(MacroError, "not during a print"):
                 run(self.macros, name, homed="", print_state="paused")
-        for name in ("PD_ALIGN_PRINT", "PD_TEST_PAGE"):
+        for name in ("PD_ALIGN_PRINT", "PD_TEST_PAGE", "PD_FIRE_GAP_TEST"):
             with self.assertRaisesRegex(MacroError, "Z must be"):
                 run(self.macros, name, "Z=0.1")
 

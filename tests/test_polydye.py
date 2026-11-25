@@ -31,6 +31,7 @@ def bare_polydye():
     pd.prewarm_cmd = pd.query_prewarm_cmd = pd.prewarm_sent = pd.prewarm_state = pd.boost_ready = None
     pd.prewarm_seconds, pd.prewarm_gen, pd.prime_seconds = polydye.AUTO_PREWARM_S, 0, polydye.PRIME_S
     pd.clean_seconds = polydye.CLEAN_S
+    pd.set_fire_gap_cmd = pd.query_fire_gap_cmd = pd.fire_gap_max = None
     return pd
 
 
@@ -287,6 +288,17 @@ class StatusCommand(unittest.TestCase):
         self.assertIn("passes=3", replies[0])
         self.assertIn("cartridge template color_b_late, fire pulse 6 words = 2.10 us", replies[0])
         self.assertIn("bus clock stock (2.857 MHz)", replies[0])
+        self.assertNotIn("fire gap", replies[0])
+        # Board firmware with the fire gap: shown when it isn't the stock timing.
+        gap = {'words': 0}
+        pd.query_fire_gap_cmd = types.SimpleNamespace(send=lambda args: dict(gap))
+        pd.cmd_POLYDYE_STATUS(types.SimpleNamespace(respond_info=replies.append))
+        self.assertNotIn("fire gap", replies[1])
+        self.assertEqual((pd.last_status['fire_gap_words'], pd.last_status['fire_gap_us']), (0, 0.))
+        gap['words'] = 43
+        pd.cmd_POLYDYE_STATUS(types.SimpleNamespace(respond_info=replies.append))
+        self.assertIn("fire pulse 6 words = 2.10 us (", replies[2])
+        self.assertIn("fire gap 43 words = 15.05 us, bus clock stock", replies[2])
 
 
 class Stripes(unittest.TestCase):
@@ -348,18 +360,22 @@ class FakeBoard:
         self.boost = self.live = False
         self.template, self.pulse = 'color_b_late', 6
         self.measured = None
+        self.gap = None  # fire gap in words; None: board firmware without one
         self.sent = []
-        self.violations = []  # pulses the board would have refused
+        self.violations = []  # pulses the board would have refused, and fire gaps set with live ink on
 
     def check(self):
         if polydye.pulse_limit_error(self.pulse):
             self.violations.append(self.pulse)
 
     def status(self):
-        return {'boost': self.boost, 'live': self.live, 'running': False, 'queued': 0, 'faults': 0,
-                'cartridge_template': self.template, 'pulse_words': self.pulse,
-                'pulse_us': round(polydye.pulse_us(self.pulse), 2), 'bus_clock': 'stock', 'bus_hz': polydye.BUS_HZ,
-                'bus_hz_measured': self.measured}
+        st = {'boost': self.boost, 'live': self.live, 'running': False, 'queued': 0, 'faults': 0,
+              'cartridge_template': self.template, 'pulse_words': self.pulse,
+              'pulse_us': round(polydye.pulse_us(self.pulse), 2), 'bus_clock': 'stock', 'bus_hz': polydye.BUS_HZ,
+              'bus_hz_measured': self.measured}
+        if self.gap is not None:
+            st.update(fire_gap_words=self.gap, fire_gap_us=polydye.fire_gap_us(self.gap))
+        return st
 
 
 class TestCleanup(unittest.TestCase):
@@ -428,6 +444,53 @@ class TestCleanup(unittest.TestCase):
                                      error=RuntimeError)
 
     FIRE = dict(X=80., Y=60., SPACING=20., COLUMNS=600, UPLOAD=1, LAYER=0, PASS=0)
+
+    @staticmethod
+    def with_gap(pd, board, words=0):
+        """Board firmware with the fire gap, at `words`; one set with live ink on is a violation (a shutdown)."""
+        board.gap = words
+
+        def send(args):
+            if board.live:
+                board.violations.append(('gap', args[1]))
+            board.gap = args[1]
+            board.sent.append(('gap', args[1]))
+        pd.fire_gap_max, pd.dpi, pd.pass_speed = polydye.FIRE_GAP_MAX, 847., 59.5
+        pd.set_fire_gap_cmd = types.SimpleNamespace(send=send)
+        pd.query_fire_gap_cmd = types.SimpleNamespace(send=lambda args: {'words': board.gap})
+
+    def test_cartridge_sets_the_fire_gap(self):
+        pd, board = self.make(fail_on="NOTHING")
+        self.with_gap(pd, board)
+        replies = []
+        gcmd = self.gcmd(GAP=7.)
+        gcmd.respond_info = replies.append
+        pd.cmd_POLYDYE_CARTRIDGE(gcmd)
+        self.assertEqual(board.gap, 20)
+        self.assertIn("fire gap 20 words = 7.00 us", replies[-1])
+        self.assertIn("pulse_words and fire_gap_us in polydye.cfg", replies[-1])
+        sent = len(board.sent)
+        pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(GAP=7.1))  # 20 words too: nothing to send
+        self.assertEqual(len(board.sent), sent)
+        pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(GAP=0.))
+        self.assertEqual((board.gap, board.violations), (0, []))
+        # Refused, with nothing sent: over the longest gap, live ink on, an ink job loaded (its passes were capped for
+        # the gap it was loaded with), a column too long for the pass period, board firmware without the gap.
+        for setup, params, error in (
+                (None, dict(GAP=17.), r"GAP is at most 16.80 us \(48 bus words\)"),
+                (lambda pd, board: setattr(board, 'live', True), dict(GAP=7.), "turn PolyDye off .* or the fire gap"),
+                (lambda pd, board: setattr(pd, 'job', {}), dict(GAP=7.), "an ink job is loaded"),
+                (lambda pd, board: setattr(pd, 'pass_speed', 75.), dict(GAP=16.8),
+                 "makes the column 407 us on the bus, more than the 400 us pass column period"),
+                (lambda pd, board: setattr(pd, 'set_fire_gap_cmd', None), dict(GAP=7.),
+                 "GAP needs newer PolyDye board firmware")):
+            pd, board = self.make(fail_on="NOTHING")
+            self.with_gap(pd, board)
+            if setup:
+                setup(pd, board)
+            with self.assertRaisesRegex(RuntimeError, error):
+                pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(**params))
+            self.assertEqual((board.gap, board.sent), (0, []), error)
 
     def test_fire_test_error_turns_off_and_restores(self):
         pd, board = self.make(fail_on="POLYDYE_PASS")
@@ -924,6 +987,24 @@ class TestCleanup(unittest.TestCase):
         self.assertEqual(polydye.column_us(6), 172)
         self.assertEqual(polydye.column_us(8), 192)
         self.assertEqual(polydye.min_spit_period_us(6), 192)
+        # A fire gap adds its words to every packet: the longest makes the 6-word column 407 us and the 8-word one
+        # 427 us, 447 us with the margin: within the stock pass column period (504 us), not at 75 mm/s (400 us).
+        self.assertEqual((polydye.column_us(6, 48), polydye.column_us(8, 48), polydye.min_spit_period_us(8, 48)),
+                         (407, 427, 447))
+        self.assertEqual((polydye.fire_gap_words(7.), polydye.fire_gap_words(15.), polydye.fire_gap_us(48)),
+                         (20, 43, 16.8))
+        self.assertIsNone(polydye.fire_gap_fit_error(48, 8, 847., 59.5))
+        self.assertIn("more than the 400 us pass column period", polydye.fire_gap_fit_error(48, 8, 847., 75.))
+
+    def test_a_fire_gap_lengthens_the_spit_column(self):
+        pd, board = self.make(fail_on="NOTHING")
+        self.with_gap(pd, board, 48)
+        with self.assertRaisesRegex(RuntimeError, "PERIOD_US=426 is too short for a pulse of 6 words and a 16.80 us "
+                                                  "fire gap: the column takes 407 us on the bus, so the period must "
+                                                  "be at least 427 us"):
+            self.spit(pd, board, SECONDS=1., PATTERN='stock', PERIOD_US=426)
+        _, _, sent = self.spit(pd, board, SECONDS=1., PATTERN='stock', PERIOD_US=427)
+        self.assertEqual(sent[0][4], 427)
 
     def test_stock_spit_and_period_need_newer_board_firmware(self):
         pd, board = self.make(fail_on="NOTHING")
@@ -1704,13 +1785,13 @@ STOCK_ONLY = {'POLYDYE_STOCK_ONLY': 1, 'POLYDYE_SOFT_RESET': 1, 'POLYDYE_SPIT_PA
 class BuildConfig(unittest.TestCase):
     """What the board offers, and the settings sent on every connect."""
 
-    def build(self, constants, pulse_words=None, template=None, missing=()):
+    def build(self, constants, pulse_words=None, template=None, missing=(), fire_gap=None):
         """_build_config on board firmware with these constants and every command but those starting with `missing`;
         returns (pd, the polydye_set_* commands sent on connect) or (pd, the config error)."""
         class ConfigError(Exception):
             pass
         pd = bare_polydye()
-        pd.oid, pd.cartridge_template, pd.pulse_words = 0, template, pulse_words
+        pd.oid, pd.cartridge_template, pd.pulse_words, pd.fire_gap = 0, template, pulse_words, fire_gap
         pd.spit_patterns = pd.templates = ()
         pd.spit_run_cmd = pd.spit_random_cmd = None
         pd.warm_max_words, pd.warm_max_us, pd.warm_max_s = polydye.WARM_OLD_WORDS, polydye.WARM_OLD_US, polydye.WARM_OLD_S
@@ -1774,6 +1855,25 @@ class BuildConfig(unittest.TestCase):
         pd, error = self.build({}, None, 'color_b_late', missing=("polydye_query_clock",))
         self.assertIn("cartridge_template: color_b_late needs newer PolyDye board firmware", error)
         self.assertIn("Update to bundled firmware", error)
+
+    def test_the_fire_gap_follows_the_board(self):
+        gap = dict(STOCK_ONLY, POLYDYE_FIRE_GAP_MAX=48)
+        pd, sent = self.build(gap)
+        self.assertEqual((sent, pd.fire_gap_max), (["polydye_set_clock oid=0 stock=1"], 48))
+        self.assertIsNotNone(pd.query_fire_gap_cmd)
+        self.assertEqual(self.status(pd)['fire_gap_max'], 48)
+        # fire_gap_us goes on every connect, in whole bus words.
+        pd, sent = self.build(gap, fire_gap=7.)
+        self.assertEqual(sent, ["polydye_set_fire_gap oid=0 words=20", "polydye_set_clock oid=0 stock=1"])
+        pd, error = self.build(dict(STOCK_ONLY, POLYDYE_FIRE_GAP_MAX=30), fire_gap=15.)
+        self.assertIn("fire_gap_us: this PolyDye board firmware takes at most 10.50 us", error)
+        # Older board firmware has no fire gap: 0 is its timing anyway, more needs an update.
+        pd, sent = self.build(STOCK_ONLY, fire_gap=0.)
+        self.assertEqual((sent, pd.set_fire_gap_cmd, self.status(pd)['fire_gap_max']),
+                         (["polydye_set_clock oid=0 stock=1"], None, None))
+        pd, error = self.build(STOCK_ONLY, fire_gap=7.)
+        self.assertIn("fire_gap_us needs newer PolyDye board firmware. Update it from the PolyDye page (Board "
+                      "firmware: Update to bundled firmware)", error)
 
     def test_status_lists_what_the_board_offers(self):
         pd, _ = self.build(STOCK_ONLY)
@@ -1861,6 +1961,15 @@ class ConfigOptions(unittest.TestCase):
         # bus_clock: stock is still taken, as a no-op.
         pd = self.load(bus_clock='Stock', cartridge_template='black_b', pulse_words='8')
         self.assertEqual((pd.cartridge_template, pd.pulse_words), ('black_b', 8))
+
+    def test_fire_gap_option(self):
+        self.assertIsNone(self.load().fire_gap)
+        self.assertEqual(self.load(fire_gap_us='7').fire_gap, 7.)
+        self.assertEqual(self.load(fire_gap_us='17'), "[polydye] fire_gap_us: 17 us is more than the longest fire "
+                                                      "gap, 16.80 us (48 bus words)")
+        self.assertIn("[polydye] fire_gap_us: a 16.80 us fire gap with a pulse of 8 words makes the column 427 us on "
+                      "the bus, more than the 400 us pass column period (dpi 847, pass_speed 75)",
+                      self.load(fire_gap_us='16.8', pulse_words='8', pass_speed='75'))
 
     def test_auto_warm_options(self):
         pd = self.load()
@@ -2418,6 +2527,100 @@ class CalibrationPrints(unittest.TestCase):
                       "Y 89-111: the paper must cover that with 5 mm to spare", said)
         self.assertIn("PolyDye test page done.", self.said[-1])
 
+    def test_the_test_page_at_a_fire_gap_splits_nothing(self):
+        pd, board = self.make()
+        pd.spit_run_cmd, pd.warm_duty_ppm, pd.warm_max_s = object(), 5800, 30.
+        TestCleanup.with_gap(pd, board, 20)
+        pd.cmd_POLYDYE_TEST_PAGE(self.gcmd(X=120., Y=100.))
+        self.assertEqual(len([u for u in self.uploads if u[0] == polydye.DATA_PUT]), 8)
+        self.assertIn("8 passes (8 on the board)", [s for s in self.said if s.startswith("PolyDye test page, live")][0])
+        self.assertIn("(two inks, each one pass at the fire gap)", self.said[-1])
+        self.assertEqual((board.gap, board.violations), (20, []))
+
+    def fire_gap_test(self, board_gap=5, **params):
+        pd, board = self.make()
+        pd.spit_run_cmd, pd.warm_duty_ppm, pd.warm_max_s = object(), 5800, 30.
+        TestCleanup.with_gap(pd, board, board_gap)
+        uploaded = []
+        upload = pd._upload_cal
+        pd._upload_cal = lambda gcmd, cmd, passes: (uploaded.extend(passes), upload(gcmd, cmd, passes))
+        pd.cmd_POLYDYE_FIRE_GAP_TEST(self.gcmd(**params))
+        return pd, board, uploaded
+
+    def test_fire_gap_test(self):
+        pd, board, uploaded = self.fire_gap_test(X=120., Y=100.)
+        # Four rows of red, green and blue squares, none split: 4 + 4 heaters, but the control's F5 at 2.
+        self.assertEqual([(line_load(data, 0x0f), line_load(data, 0xf0)) for data, _ in uploaded],
+                         [(4, 4)] * 3 + [(4, 2)] * 3 + [(4, 4)] * 6)
+        self.assertEqual(len([u for u in self.uploads if u[0] == polydye.DATA_PUT]), 12)
+        passes = [i for i, s in enumerate(board.sent) if isinstance(s, str) and s.startswith("POLYDYE_PASS")]
+        fields = [dict(w.split("=") for w in board.sent[i].split()[1:]) for i in passes]
+        self.assertEqual([int(f['PASS']) for f in fields], list(range(12)))
+        xs = [float(f['X']) for f in fields]
+        self.assertEqual([round(v - xs[0], 3) for v in xs], [0., 8., 16.] * 4)
+        ys = [float(f['Y']) - (uploaded[n][1] - 1) * 25.4 / 847 * (f['DIR'] == "-1")
+              for n, f in enumerate(fields)]  # each pass's front edge
+        for r in range(4):  # rows a square (156 columns) and 3 mm (100) apart
+            self.assertAlmostEqual(ys[3 * r] - ys[0], r * 256 * 25.4 / 847, delta=0.002)
+        # The board's gap (5 words) goes to the stock timing for the first row, which the control shares; then 20 and
+        # 43 words (7 and 15 us), each with live ink off before and on again after; back to 5 at the end.
+        gaps = [(i, s[1]) for i, s in enumerate(board.sent) if isinstance(s, tuple) and s[0] == 'gap']
+        self.assertEqual([g for _, g in gaps], [0, 20, 43, 5])
+        self.assertTrue(gaps[0][0] < passes[0] and passes[5] < gaps[1][0] < passes[6] and
+                        passes[8] < gaps[2][0] < passes[9] and passes[11] < gaps[3][0], (gaps, passes))
+        for i, _ in gaps[:3]:
+            self.assertEqual(board.sent[i + 1], "POLYDYE_ENABLE LIVE=1")
+        self.assertEqual((board.gap, board.violations, board.boost, board.live), (5, [], False, False))
+        said = [s for s in self.said if s.startswith("PolyDye fire gap test, live ink")][0]
+        self.assertIn("4 rows of red, green and blue squares (12 passes) centred on X=120.0 Y=100.0, Z=1.00, front to "
+                      "back: stock timing; stock timing, F5 at 2 (control); gap 7.00 us; gap 15.05 us.", said)
+        self.assertIn("the left half (towards -X) is fire line F5", self.said[-1])
+        self.assertIn("fire gap 5 words = 1.75 us", self.said[-1])
+        # Its own gaps, at the stock timing already: the first rows change nothing.
+        pd, board, uploaded = self.fire_gap_test(board_gap=0, GAPS="16.8")
+        self.assertEqual(len(uploaded), 9)
+        self.assertEqual([s[1] for s in board.sent if isinstance(s, tuple) and s[0] == 'gap'], [48, 0])
+
+    def test_a_failed_fire_gap_test_puts_the_gap_back(self):
+        pd, board = self.make()
+        pd.spit_run_cmd, pd.warm_duty_ppm, pd.warm_max_s = object(), 5800, 30.
+        TestCleanup.with_gap(pd, board, 0)
+        gcode = pd.printer.lookup_object('gcode')
+        run = gcode.run_script_from_command
+
+        def failing(script):
+            run(script)
+            if script.startswith("POLYDYE_PASS LAYER=65000 PASS=7"):
+                raise RuntimeError("Move out of range")
+        gcode.run_script_from_command = failing
+        with self.assertRaisesRegex(RuntimeError, "out of range"):
+            pd.cmd_POLYDYE_FIRE_GAP_TEST(self.gcmd(X=120., Y=100.))
+        self.assertEqual((board.gap, board.violations, board.live), (0, [], False))
+        self.assertEqual([s[1] for s in board.sent if isinstance(s, tuple) and s[0] == 'gap'], [20, 0])
+
+    def test_fire_gap_test_refused_before_anything_is_sent(self):
+        for setup, params, error in (
+                (lambda pd, board: setattr(pd, 'set_fire_gap_cmd', None), {},
+                 r"needs PolyDye board firmware with the fire gap; update it from the PolyDye page"),
+                (None, dict(GAPS="7,x"), r"GAPS must be 1-4 fire gaps in us, separated by commas, each 0.35-16.80 us"),
+                (None, dict(GAPS="0.1"), "GAPS must be"),
+                (None, dict(GAPS="17"), "GAPS must be"),
+                (None, dict(GAPS="inf"), "GAPS must be"),
+                (None, dict(GAPS="1,2,3,4,5"), "GAPS must be"),
+                (lambda pd, board: setattr(pd, 'pass_speed', 75.), dict(GAPS="16.8"),
+                 "more than the 400 us pass column period"),
+                (lambda pd, board: setattr(pd, 'pass_axis', 'x'), {}, "needs pass_axis: y"),
+                (lambda pd, board: setattr(board, 'template', 'black_a'), {}, "for the colour cartridge"),
+                (None, dict(Y=222.), r"would take the toolhead to X=1\d\d.\d Y=2\d\d.\d, beyond the axis")):
+            pd, board = self.make()
+            pd.spit_run_cmd, pd.warm_duty_ppm, pd.warm_max_s = object(), 5800, 30.
+            TestCleanup.with_gap(pd, board)
+            if setup:
+                setup(pd, board)
+            with self.assertRaisesRegex(RuntimeError, error):
+                pd.cmd_POLYDYE_FIRE_GAP_TEST(self.gcmd(**params))
+            self.assertEqual((board.sent, self.uploads), ([], []), error)
+
     def test_test_page_refused_before_anything_is_sent(self):
         for homed, params, setup, error in (
                 ('xyz', {}, lambda pd, board: setattr(pd, 'pass_axis', 'x'), "needs pass_axis: y"),
@@ -2674,6 +2877,13 @@ def pulse_load(data):
     return out
 
 
+def line_load(data, mask):
+    """The most heaters on one fire pulse of one fire line (mask 0x0f: F3, 0xf0: F5) anywhere in nozzle data."""
+    size = polydye.NOZDATA_SIZE
+    return max(sum(bin(data[i * size + 14 * c + k] & mask).count('1') for c in range(3))
+               for i in range(len(data) // size) for k in range(14))
+
+
 def singles(data):
     """The fires with neither neighbour column firing the same heater: (column, byte, bit)."""
     n, size = len(data) // polydye.NOZDATA_SIZE, polydye.NOZDATA_SIZE
@@ -2765,6 +2975,35 @@ class HeaterCap(unittest.TestCase):
         colours, data = job_planes(bar(polydye.MAGENTA, 1, 40, 40), 1)
         self.assertEqual((polydye.job_pass_parts(data, colours, 1, 1), polydye.job_pass_data(data, colours, 1, 1)),
                          ([], None))
+
+    def test_at_a_fire_gap_each_line_keeps_four_and_nothing_is_split(self):
+        slot = polydye.heater_slot(20)
+        self.assertEqual((slot, polydye.heater_slot(0), polydye.heater_slot(None)), (8, 5, 5))
+        # Two inks at positions 28-82 laid over each other (4 + 4 in a packet): one board pass, every dot kept.
+        dots = bar(polydye.CYAN, 200, 28, 82) + bar(polydye.YELLOW, 200, 28, 82)
+        colours, data = job_planes(dots, 200)
+        parts = polydye.job_pass_parts(data, colours, 200, 1, (-34, 1, 27, 0), slot=slot)
+        self.assertEqual([(o, lines_used(d)) for o, d, _, _ in parts], [(0, {3, 5})])
+        self.assertEqual(sum(bin(b).count('1') for b in parts[0][1]), 2 * 200 * 55)
+        self.assertEqual((max(pulse_load(parts[0][1])), max(slot_load(parts[0][1]))), (4, 8))
+        self.assertEqual(parts[0][1:], polydye.job_pass_data(data, colours, 200, 1, (-34, 1, 27, 0), slot=slot))
+        # Three inks at 16-83: still at most 4 on each line, no fire on its own.
+        colours, data = job_planes([d for c in range(3) for d in bar(c, 120, 16, 83)], 120)
+        parts = polydye.job_pass_parts(data, colours, 120, 1, slot=slot)
+        self.assertEqual(len(parts), 1)
+        self.assertEqual((max(pulse_load(parts[0][1])), max(slot_load(parts[0][1])), singles(parts[0][1])),
+                         (4, 8, []))
+
+    def test_each_fire_line_may_have_its_own_cap(self):
+        # The fire gap test's control: two inks at 4 + 4, F5 capped to 2 and the slot to 6: one pass, F3 untouched.
+        d = polydye.PassDrawing()
+        for c in (polydye.CYAN, polydye.YELLOW):
+            d.bar(0, 99, c, 28, 82)
+        (data, n, first), = polydye.drawing_parts(d, 1, cap=(4, 2), slot=6)
+        self.assertEqual((n, first, line_load(data, 0x0f), line_load(data, 0xf0), singles(data)), (100, 0, 4, 2, []))
+        self.assertEqual(sum(bin(b & 0x0f).count('1') for b in data), 2 * 100 * 28)
+        # The same at the stock cap: split by fire line.
+        self.assertEqual(len(polydye.drawing_parts(d, 1)), 2)
 
     def test_reverse_passes_drop_the_same_dots(self):
         dots = [d for c in range(3) for d in bar(c, 61, 16, 83)]
@@ -2929,6 +3168,21 @@ class InkJobs(unittest.TestCase):
         self.assertIsNone(pd.job)
         with self.assertRaisesRegex(RuntimeError, "no PolyDye ink job is loaded"):
             pd.cmd_POLYDYE_JOB_PASS(self.gcmd(N=0))
+
+    def test_at_a_fire_gap_a_two_ink_pass_goes_as_one(self):
+        two = bar(0, 120, 28, 82) + bar(2, 120, 28, 82)
+        pd, board = self.make([(0, 0, 'A', 120., 100., 1, 120, two)])
+        TestCleanup.with_gap(pd, board, 20)
+        pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
+        self.wait_for(lambda: len(self.puts()) == 1)
+        colours, data = job_planes(two, 120)
+        built = polydye.job_pass_data(data, colours, 120, 1, (-34, 1, 27, 0), slot=8)
+        self.assertEqual(self.puts()[0][1], struct.pack("<HHBBH", 0, 0, 0, polydye.PASS_FLAG_ONCE, built[1]) +
+                         built[0])
+        # Its passes were capped for that gap: it can't change until the job ends.
+        with self.assertRaisesRegex(RuntimeError, "an ink job is loaded"):
+            pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(GAP=0.))
+        self.assertEqual(board.gap, 20)
 
     def test_an_excluded_objects_passes_are_skipped_and_deleted(self):
         pd, board = self.make()
