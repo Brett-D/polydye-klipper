@@ -557,7 +557,8 @@ colour it uses hasn't ejected for 90 s or more:
 - **Over the wipe sponge only.** It rides on the X gantry, so the cartridge's gap to it stays the same; spits from over
   about 5 mm mist, so never over the base or the bed.
 - **A short spit:** `prime_seconds` (0.3 s: 591 columns) of the stock pattern every 508 µs, all three colours. After
-  0.2 s a full-width cyan bar still started ragged.
+  0.2 s a full-width cyan bar still started ragged. The stock pattern fires nozzle positions 14–85 of each colour, the
+  ones the stock firmware prints with; the add-on's calibration prints stay within them too.
 - **After the burst, right before the passes:** the passes before it finish first (it waits for the moves), then up by
   `POLYDYE_WIPE`'s `z_hop`, over the sponge, spit, and back across at that height and down. It counts as firing, so the
   passes after it need no warm-up of their own for `warm_idle_time`. If the board can't be seen idle afterwards, the

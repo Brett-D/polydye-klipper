@@ -1740,8 +1740,9 @@ class PolyDye:
         self.last_fire = self.mcu.estimated_print_time(reactor.monotonic())
 
     cmd_POLYDYE_PRIME_help = ("Prime the nozzles over the wipe sponge, for a layer's ink after its colours have been "
-                              "idle: SECONDS (prime_seconds, 0.3) of the stock pattern, every colour, then back; turns "
-                              "live ink on. Allowed during a print, no CONFIRM; waits for the passes before it")
+                              "idle: SECONDS (prime_seconds, 0.3) of the stock pattern (positions 14-85 of every "
+                              "colour), then back; turns live ink on. Allowed during a print, no CONFIRM; waits for the "
+                              "passes before it")
 
     def cmd_POLYDYE_PRIME(self, gcmd):
         cmd = "POLYDYE_PRIME"
