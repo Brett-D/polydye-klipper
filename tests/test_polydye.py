@@ -2632,6 +2632,7 @@ class InkJobs(unittest.TestCase):
 
     def test_ink_blocks_move_gently_and_put_the_limits_back(self):
         pd, board = self.make()
+        board.print_state = 'printing'
         st = self.objects['toolhead'].get_status(0.)
         st['square_corner_velocity'] = 5.
         pd.cmd_POLYDYE_INK_MOTION(self.gcmd())
@@ -2657,6 +2658,12 @@ class InkJobs(unittest.TestCase):
         callbacks[0](0.)
         self.assertEqual((scripts, pd.ink_motion), (["SET_VELOCITY_LIMIT ACCEL=800.000 SQUARE_CORNER_VELOCITY=5.000"],
                                                     None))
+        # Lowered from the console, with no print running (the last one cancelled): they stay lowered until
+        # RESTORE=1.
+        pd.printer.lookup_object = lookup
+        pd.cmd_POLYDYE_INK_MOTION(self.gcmd())
+        pd._check_job_end(0.)
+        self.assertEqual((len(callbacks), pd.ink_motion[:2]), (1, (800., 5.)))
 
     def test_a_new_job_stops_the_old_ones_uploads_before_it_clears_the_board(self):
         # The first job's thread is still making its first pass's data when a second job is loaded and clears the
@@ -2792,6 +2799,13 @@ class InkJobs(unittest.TestCase):
         pd, board = self.make([(0, 0, '-', 120., 224.7, 1, 2, bar(1, 2, 30, 33))], ink_accel=500.)
         self.objects['toolhead'].get_status(0.)['minimum_cruise_ratio'] = 0.6
         pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
+        # A long pass ending there too: one fire line's half of it, if it's split, can be as short as that one.
+        pd, board = self.make([(0, 0, '-', 120., 226.2 - 298 * 25.4 / 847., 1, 300, bar(1, 300, 30, 33))],
+                              ink_accel=500.)
+        self.objects['toolhead'].get_status(0.)['minimum_cruise_ratio'] = 0.6
+        with self.assertRaisesRegex(RuntimeError, r"layer 0's ink at X=120.0 Y=216.2 would take the toolhead to "
+                                                  r"X=120.0 Y=235.9, beyond the axis limits"):
+            pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
 
     def test_a_pass_speed_over_max_velocity_is_refused_at_the_start(self):
         pd, board = self.make()

@@ -302,6 +302,9 @@ class Ink(unittest.TestCase):
             # The band: 9.6 mm lines 0.4 mm apart filling 4 mm, plus the lines' half widths all round.
             area = (9.6 + 0.42) * (4. + 0.02) / (SX * PITCH)
             self.assertAlmostEqual(len(dots) / area, share, delta=0.03)
+        # So light the dither fires nothing: nothing to ink, the G-code unchanged.
+        src = block_gcode(layers=1, band=4., top=True)
+        self.assertIsNone(run(src, "--ink-limit", "0.5")[0])
 
     def test_top_surfaces_get_their_coats(self):
         out, _ = run(block_gcode(layers=2, top=True), "--edge-margin", "0")

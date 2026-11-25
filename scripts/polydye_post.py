@@ -538,6 +538,8 @@ def layer_passes(layer, grid, support, tools, objects, opts, pitch):
                 cols = (np.arange(g0, g0 + shape[1]) + dg) % 8
                 fires[ch] = level[ch] > bayer[np.ix_(rows, cols)]
             occupied = np.nonzero(fires.any(axis=(0, 1)))[0]
+            if not len(occupied):  # a tone so light the dither fires nothing (--ink-limit 0.5, say)
+                continue
             # Sweeps over the whole footprint along Y, every colour in each, the grid shifted per layer (and coat).
             # Neighbours overlap by --feather positions; there each cell (two rows, so four bus columns: pairs stay
             # together; one position) goes to one of them, the right one where its fixed hash is under a ramp that

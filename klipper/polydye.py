@@ -1548,7 +1548,8 @@ class PolyDye:
         # Data port requests one at a time: the ink job's uploads run in their own thread (JobStreamer).
         self.data_lock = threading.Lock()
         self.job = None  # the ink job loaded (POLYDYE_JOB): {'streamer', 'header', 'records', ...}
-        self.ink_motion = None  # (max_accel, square_corner_velocity) POLYDYE_INK_MOTION put back afterwards
+        # (max_accel, square_corner_velocity, lowered in a print) POLYDYE_INK_MOTION puts back afterwards
+        self.ink_motion = None
         # Pass direction and the cartridge nozzle-row centre relative to the hotend nozzle, in bed coordinates.
         # Required: they depend on the mount, and a wrong guess would put ink in the wrong place.
         self.pass_axis = config.getchoice('pass_axis', {'x': 'x', 'y': 'y'})
@@ -3051,9 +3052,10 @@ class PolyDye:
             columns = rec['columns'] + after - before
             rec['size'] = 2 * columns * NOZDATA_SIZE  # at most two board passes (job_pass_parts())
             first = rec['y'] + (before if rec['dir'] > 0 else rec['columns'] - 1 + after) * pitch
-            # The pass sent lies within those columns but can be shorter (by up to the spread), and with
-            # minimum_cruise_ratio a shorter pass has a longer run-up: the longest it can have, over the widest extent.
-            run_up = self._run_up(self.pass_speed, slow, max(1, rec['columns'] - (after - before)))
+            # Each board pass sent lies within those columns but can be much shorter (one fire line's half of a split
+            # pass is trimmed to its own ink), and with minimum_cruise_ratio a shorter pass has a longer run-up: the
+            # longest any can have (a one-column pass's), over the widest extent.
+            run_up = self._run_up(self.pass_speed, slow, 1)
             start, _, end = pass_geometry('y', rec['x'], first, rec['dir'], columns, pitch, run_up,
                                           (self.offset_x, self.offset_y), base, self.direction_trim)
             for px, py in (start, end):
@@ -3153,7 +3155,7 @@ class PolyDye:
         (POLYDYE_INK_MOTION) go back then too, if the print ended inside one."""
         if self.job is not None and self.job['from_print'] and not self._printing(eventtime):
             self._stop_job("its print ended")
-        if self.ink_motion is not None and not self._printing(eventtime):
+        if self.ink_motion is not None and self.ink_motion[2] and not self._printing(eventtime):
             # G-code can't run from the status timer itself: from a callback, in turn with other commands.
             self.printer.get_reactor().register_callback(lambda e: self._restore_ink_motion("the print ended"))
 
@@ -3168,7 +3170,9 @@ class PolyDye:
         scv = gcmd.get_float('SCV', INK_SCV, minval=0.)
         st = self.printer.lookup_object('toolhead').get_status(self.printer.get_reactor().monotonic())
         if self.ink_motion is None:
-            self.ink_motion = (st['max_accel'], st['square_corner_velocity'])
+            # Put back by RESTORE=1, or when the print it was lowered in ends (one from the console: RESTORE=1 only).
+            self.ink_motion = (st['max_accel'], st['square_corner_velocity'],
+                               self._printing(self.printer.get_reactor().monotonic()))
         self.printer.lookup_object('gcode').run_script_from_command(
             "SET_VELOCITY_LIMIT ACCEL=%.3f SQUARE_CORNER_VELOCITY=%.3f"
             % (min(accel, st['max_accel']), min(scv, st['square_corner_velocity'])))
@@ -3178,7 +3182,7 @@ class PolyDye:
         saved, self.ink_motion = self.ink_motion, None
         if saved is None:
             return
-        script = "SET_VELOCITY_LIMIT ACCEL=%.3f SQUARE_CORNER_VELOCITY=%.3f" % saved
+        script = "SET_VELOCITY_LIMIT ACCEL=%.3f SQUARE_CORNER_VELOCITY=%.3f" % saved[:2]
         try:
             if why:
                 self.printer.lookup_object('gcode').run_script(script)
