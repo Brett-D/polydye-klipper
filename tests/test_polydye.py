@@ -2668,6 +2668,20 @@ class InkJobs(unittest.TestCase):
         pd._check_job_end(0.)
         self.assertIsNotNone(pd.job)
 
+    def test_a_short_pass_has_the_longest_run_up(self):
+        # minimum_cruise_ratio 0.6 at 500 mm/s^2: a 2-column magenta pass at Y=226.2 needs 8.84 mm of run-out, to
+        # Y=235.07 on a 235 mm axis. The registration's spread (61 columns) made it look 63 columns long, with a shorter
+        # run-out; it's refused now.
+        pd, board = self.make([(0, 0, '-', 120., 226.2, 1, 2, bar(1, 2, 30, 33))], ink_accel=500.)
+        self.objects['toolhead'].get_status(0.)['minimum_cruise_ratio'] = 0.6
+        with self.assertRaisesRegex(RuntimeError, r"layer 0's ink at X=120.0 Y=225.2 would take the toolhead to "
+                                                  r"X=120.0 Y=235.9, beyond the axis limits"):
+            pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
+        # 1.5 mm further in, it fits.
+        pd, board = self.make([(0, 0, '-', 120., 224.7, 1, 2, bar(1, 2, 30, 33))], ink_accel=500.)
+        self.objects['toolhead'].get_status(0.)['minimum_cruise_ratio'] = 0.6
+        pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
+
     def test_object_names_and_burst_lengths(self):
         # A non-ASCII object name (Orca keeps the model's) still matches the excluded object's.
         pd, board = self.make([(0, 0, 'pièce_id_0_copy_0', 120., 100., 1, 40, bar(1, 40, 30, 33))])

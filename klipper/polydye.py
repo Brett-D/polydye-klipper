@@ -2958,7 +2958,9 @@ class PolyDye:
             columns = rec['columns'] + after - before
             rec['size'] = columns * NOZDATA_SIZE
             first = rec['y'] + (before if rec['dir'] > 0 else rec['columns'] - 1 + after) * pitch
-            run_up = self._run_up(self.pass_speed, slow, columns)
+            # The pass sent lies within those columns but can be shorter (by up to the spread), and with
+            # minimum_cruise_ratio a shorter pass has a longer run-up: the longest it can have, over the widest extent.
+            run_up = self._run_up(self.pass_speed, slow, max(1, rec['columns'] - (after - before)))
             start, _, end = pass_geometry('y', rec['x'], first, rec['dir'], columns, pitch, run_up,
                                           (self.offset_x, self.offset_y), base, self.direction_trim)
             for px, py in (start, end):
