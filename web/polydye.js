@@ -1252,6 +1252,13 @@ document.querySelectorAll('button[data-gcode]').forEach((b) => {
   b.addEventListener('click', () => gcode(b.dataset.gcode));
 });
 
+$('clean-btn').addEventListener('click', () => {
+  const ok = window.confirm('Clean the head with LIVE INK?\n\nIt homes if needed, moves the cartridge over the wipe '
+    + 'sponge, warms the head, spits about 1.5 s of every colour into the sponge and wipes it there, then comes back. '
+    + 'The sponge should be damp.');
+  if (ok) gcode('PD_CLEAN');
+});
+
 $('live-btn').addEventListener('click', () => {
   const ok = window.confirm('Enable LIVE ink?\n\nOnly with a cartridge fitted in a calibrated mount. '
     + 'Passes will fire real ink until you press Off or Klipper stops.');
