@@ -647,8 +647,9 @@ class PolyDye:
         # Bus columns per inch along the pass and the pass speed: by default the stock firmware's cadence, 3,333 bus
         # columns per 100 mm (each 423 dpi image column twice) at 59.5 mm/s, a column every 504 us (stock: ~508 us).
         # Automatic head warm-up before a live pass when the head is cold (head_cold()); warm_seconds: 0 turns it off.
-        # warm_position: the bed X, Y the cartridge warms over (a waste spot); unset, it warms where the pass is
-        # called, which leaves no mark (every nozzle at once heats the head rather than spits).
+        # warm_position: where warm-ups (and the fire test's WARM) run. A head already hot from firing spits during
+        # one (big C/M/Y blobs on 48483ab, 2026-11-25), so never over the print: by default over the wipe sponge
+        # (POLYDYE_WIPE's X), else over a bed spot (X, Y of the cartridge, like POLYDYE_PASS), or `here` for in place.
         self.warm_seconds = config.getfloat('warm_seconds', AUTO_WARM_S, minval=0., maxval=WARM_MAX_S)
         self.warm_pulse = config.getint('warm_pulse', AUTO_WARM_WORDS, minval=1, maxval=PULSE_MAX)
         self.warm_period_us = config.getint('warm_period_us', AUTO_WARM_PERIOD_US, minval=1, maxval=65535)
@@ -656,16 +657,17 @@ class PolyDye:
         error = auto_warm_error(self.warm_seconds, self.warm_pulse, self.warm_period_us)
         if error:
             raise config.error("[polydye] %s" % (error,))
-        position = config.get('warm_position', None)
-        self.warm_position = None
-        if position is not None:
+        position = config.get('warm_position', 'sponge').strip().lower()
+        if position in ('sponge', 'here'):
+            self.warm_position = position
+        else:
             try:
                 self.warm_position = tuple(float(v) for v in position.split(','))
             except ValueError:
                 self.warm_position = ()
             if len(self.warm_position) != 2:
-                raise config.error("[polydye] warm_position must be X, Y (bed coordinates of the cartridge), not %r"
-                                   % (position,))
+                raise config.error("[polydye] warm_position must be sponge (the default), here, or X, Y (bed "
+                                   "coordinates of the cartridge), not %r" % (position,))
         self.last_fire = None  # print time the head last fired (a live pass, spit test or warm-up); None: not yet
         self.auto_warm_off = False  # a fire test with an explicit WARM: it warms (or not) as asked
         self.dpi = config.getfloat('dpi', 847., above=0.)
@@ -1002,25 +1004,27 @@ class PolyDye:
                      first[0], first[1])
 
     def _auto_warm(self, gcmd, cmd):
-        """Before a pass: warms the head (_warm_head()) if live ink is on and the head is cold (head_cold()). Returns
-        whether live ink is on, if the add-on asked (auto warm-up on), else None: a dry-run pass fires nothing, so it
-        neither needs a warm-up nor keeps the head warm."""
-        if not self.warm_seconds or self.auto_warm_off or self.spit_run_cmd is None or self.warm_duty_ppm is None:
-            return None
+        """Before a pass: warms the head (_warm_head()) if live ink is on, the automatic warm-up is on and the head will
+        be cold when the pass starts (head_cold() at the end of the moves already queued, the earliest the pass can
+        fire). Returns whether live ink is on, whatever the warm-up: a live pass keeps the head warm, a dry-run pass
+        fires nothing."""
         st = self._fresh_status()
         if not st['live']:
             return False
-        now = self.mcu.estimated_print_time(self.printer.get_reactor().monotonic())
-        if head_cold(self.last_fire, now, self.warm_idle_time):
+        if not self.warm_seconds or self.auto_warm_off or self.spit_run_cmd is None or self.warm_duty_ppm is None:
+            return True
+        start = max(self.printer.lookup_object('toolhead').get_last_move_time(),
+                    self.mcu.estimated_print_time(self.printer.get_reactor().monotonic()))
+        if head_cold(self.last_fire, start, self.warm_idle_time):
             why = ("the head hasn't fired since Klipper started" if self.last_fire is None else
-                   "the head hasn't fired for %.0f s" % (now - self.last_fire,))
+                   "the head won't have fired for %.0f s when the pass starts" % (start - self.last_fire,))
             self._warm_head(gcmd, cmd, why)
         return True
 
     def _warm_head(self, gcmd, cmd, why):
         """The automatic warm-up: once the moves and passes before it are done, warm_seconds of every nozzle at
-        warm_pulse every warm_period_us, standing still over warm_position if set, in one board run with live ink
-        left on."""
+        warm_pulse every warm_period_us, standing still at the warm spot (_go_to_warm_spot()), in one board run with
+        live ink left on; then back where it was."""
         toolhead = self.printer.lookup_object('toolhead')
         reactor = self.printer.get_reactor()
         toolhead.wait_moves()
@@ -1034,18 +1038,8 @@ class PolyDye:
             reactor.pause(reactor.monotonic() + 0.05)
         self._check_current_pulse(gcmd, cmd, st)
         words, period, columns = self._warm_plan(gcmd, cmd, self.warm_seconds, self.warm_pulse, self.warm_period_us)
-        if self.warm_position is not None:
-            gcode_move = self.printer.lookup_object('gcode_move')
-            pos = list(gcode_move.last_position)
-            base = gcode_move.base_position
-            pos[0] = self.warm_position[0] - self.offset_x + base[0]
-            pos[1] = self.warm_position[1] - self.offset_y + base[1]
-            gcode_move.move_with_transform(pos, self.travel_speed)
-            gcode_move.reset_last_position()
-            toolhead.wait_moves()
-        gcmd.respond_info("PolyDye: %s, so a head %s comes first%s" % (
-            why, warm_text(columns, words, period),
-            " over X=%.1f Y=%.1f" % self.warm_position if self.warm_position is not None else ""))
+        back, where = self._go_to_warm_spot(gcmd, cmd)
+        gcmd.respond_info("PolyDye: %s, so a head %s comes first, %s" % (why, warm_text(columns, words, period), where))
         self.testing = True
         try:
             self.spit_run_cmd.send([self.oid, 0, SPIT_PATTERNS['all'], 0, SPIT_PERIOD_US, columns, words, period])
@@ -1060,7 +1054,41 @@ class PolyDye:
                     raise gcmd.error("%s: the board didn't finish the warm-up" % (cmd,))
         finally:
             self.testing = False
+            self._back_from_warm_spot(back)
         self.last_fire = self.mcu.estimated_print_time(reactor.monotonic())
+
+    def _go_to_warm_spot(self, gcmd, cmd):
+        """Moves the cartridge to where warm-ups run (warm_position): up by POLYDYE_WIPE's z_hop, then over the wipe
+        sponge (POLYDYE_WIPE's X) or the bed spot, and waits there. Returns (where it came from, for
+        _back_from_warm_spot(), or None for `here`; a description for messages)."""
+        if self.warm_position == 'here':
+            return None, "where the toolhead stands"
+        macro = self.printer.lookup_object('gcode_macro POLYDYE_WIPE', None)
+        variables = getattr(macro, 'variables', {}) if macro is not None else {}
+        hop = float(variables.get('z_hop', 1.))
+        if self.warm_position == 'sponge':
+            if 'x' not in variables:
+                raise gcmd.error("%s: warm_position is the wipe sponge, but there's no POLYDYE_WIPE macro to say where "
+                                 "it is: include polydye_macros.cfg, or set warm_position in polydye.cfg" % (cmd,))
+            x, y, where = float(variables['x']), None, "over the wipe sponge (X=%.1f)" % (float(variables['x']),)
+        else:
+            x, y = self.warm_position[0] - self.offset_x, self.warm_position[1] - self.offset_y
+            where = "over X=%.1f Y=%.1f" % self.warm_position
+        reactor = self.printer.get_reactor()
+        pos = self.printer.lookup_object('gcode_move').get_status(reactor.monotonic())['gcode_position']
+        self.printer.lookup_object('gcode').run_script_from_command(
+            "SAVE_GCODE_STATE NAME=polydye_warm\nG90\nG1 Z%.3f F900\nG1 X%.3f%s F%d"
+            % (pos.z + hop, x, "" if y is None else " Y%.3f" % (y,), self.travel_speed * 60))
+        self.printer.lookup_object('toolhead').wait_moves()
+        return (pos.x, pos.y, pos.z), where
+
+    def _back_from_warm_spot(self, back):
+        """Back to where _go_to_warm_spot() came from: across at the hopped height, then down."""
+        if back is None or self.printer.is_shutdown():
+            return
+        self.printer.lookup_object('gcode').run_script_from_command(
+            "G1 X%.3f Y%.3f F%d\nG1 Z%.3f F900\nRESTORE_GCODE_STATE NAME=polydye_warm"
+            % (back[0], back[1], self.travel_speed * 60, back[2]))
 
     cmd_POLYDYE_ENABLE_help = "Turn on the PolyDye boost (LIVE=1 also allows real ink; LIVE=0 is a dry run)"
 
@@ -1428,7 +1456,12 @@ class PolyDye:
                     run(upload_cmd)
                     uploaded = cart
                 if warm_cmd:
-                    run(warm_cmd)
+                    # Off the paper like the automatic warm-up: a head the previous stripe heated spits during it.
+                    back, _ = self._go_to_warm_spot(gcmd, cmd)
+                    try:
+                        run(warm_cmd)
+                    finally:
+                        self._back_from_warm_spot(back)
                 run("POLYDYE_ENABLE LIVE=1")
                 run("POLYDYE_PASS LAYER=%d PASS=%d X=%.3f Y=%.3f DIR=1" % (layer, pass_num, px, py))
                 gcmd.respond_info("PolyDye fire test: stripe %d/%d queued at X=%.1f Y=%.1f (%s, pulse %d)"
@@ -1713,7 +1746,8 @@ class PolyDye:
                     board_soft_reset=self.board_soft_reset,
                     auto_warm={'seconds': self.warm_seconds, 'pulse_words': self.warm_pulse,
                                'period_us': self.warm_period_us, 'idle_time': self.warm_idle_time,
-                               'position': list(self.warm_position) if self.warm_position else None},
+                               'position': self.warm_position if isinstance(self.warm_position, str)
+                               else list(self.warm_position)},
                     head_idle_s=None if self.last_fire is None else
                     round(max(0., self.mcu.estimated_print_time(eventtime) - self.last_fire), 1))
 

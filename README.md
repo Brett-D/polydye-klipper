@@ -249,7 +249,7 @@ offset_y: -8.7
 #warm_pulse: 8        # its pulse in bus words (8 = 2.80 us)
 #warm_period_us: 508  # one all-nozzle warm-up column every this many us (at most 0.58 % heater duty)
 #warm_idle_time: 60   # s without firing after which the head counts as cold again
-#warm_position:       # X, Y: bed spot the cartridge warms over; default: where the pass is called
+#warm_position: sponge # where warm-ups run: sponge (POLYDYE_WIPE's X), X, Y (bed spot of the cartridge), or here
 #mcu: polydye
 #data_port:           # the board's data port; default: the [mcu polydye] serial path with -if02 instead of -if00
 ```
@@ -337,7 +337,7 @@ If anything would print a pass wrongly, Klipper stops with a readable reason, fo
 | `POLYDYE_OFFSET [X=] [Y=] [TRIM=]` | Sets `offset_x`, `offset_y` and `direction_trim` until the next restart; without arguments, shows them |
 | `POLYDYE_CARTRIDGE [TEMPLATE=color_b_late\|black_a\|black_b] [PULSE=6..8]` | Switches the board's waveform template and fire pulse until the next restart (to compare them at the nozzle check); without arguments, shows them and the bus clock. Only with live ink off and no passes queued (with older board firmware, the boost off too) |
 | `POLYDYE_UPLOAD_TEST_PASS [LAYER=0] [PASS=0] [COLUMNS=600] [PATTERN=alternate\|all\|none\|stock] [REPEAT=1] [DENSITY=] [COLORS=] [FIRST=] [LAST=] [PER_PULSE=]` | Uploads a test pass over the board's data port. `alternate` (the dry run's) fires every nozzle in every other column, `all` in every column and `none` in none; `stock` is the stock firmware's random pattern with its knobs (below; `REPEAT` defaults to 2 there, at most 16; colour cartridges only); `REPEAT` sends each column that many times in a row, so the pass has `COLUMNS` × `REPEAT` columns (at most 65535). Not during a print: it briefly blocks Klipper while it sends |
-| `POLYDYE_FIRE_TEST [X=70] [Y=60] [Z=] [SPACING=18] [STRIPES=…] [PATTERN=stock\|all] [DENSITY=] [REPEAT=] [COLORS=] [FIRST=] [LAST=] [PER_PULSE=] [WARM=0] [WARM_PULSE=] [WARM_PERIOD_US=] [COLUMNS=600] [UPLOAD=1] [LAYER=0] [PASS=0]` | **Live ink.** Prints one stripe per `TEMPLATE:PULSE` in `STRIPES` (e.g. `color_b_late:6,color_b_late:8`): a pass of `COLUMNS` columns along the pass axis, the stripes `SPACING` mm apart across it, the first at `X`, `Y`. The default is one stripe with the stock firmware's settings, `color_b_late:6`. `PATTERN=stock` (the default) prints the stock firmware's random pattern, the one that ejects ink on a cold head, with the spit test's knobs (below), on any board firmware: the add-on makes the columns. Without `WARM` each stripe's pass warms a cold head by itself (see "Automatic head warm-up"); `WARM` instead warms the head for that many seconds right before each stripe, and `WARM=0` not at all (`POLYDYE_WARM` with the stripe's template, after its upload, so only the travel and run-up come in between; board firmware with the warm-up). `UPLOAD=0` prints the pass already stored as `LAYER`, `PASS` instead. Moves to `Z` first if given. Refused during a print, also a paused one, and with a black stripe for `PATTERN=stock` (a colour pattern) before anything moves. Afterwards, also after an error, turns live ink off (and the boost too with older board firmware; with this add-on's bundled firmware the boost stays on, as stock keeps it, until `POLYDYE_DISABLE`, a shutdown or 30 min unused; see "Stock baseline") and puts the template, pulse and G-code state back. Doesn't home (`PD_FIRE_TEST` does) |
+| `POLYDYE_FIRE_TEST [X=70] [Y=60] [Z=] [SPACING=18] [STRIPES=…] [PATTERN=stock\|all] [DENSITY=] [REPEAT=] [COLORS=] [FIRST=] [LAST=] [PER_PULSE=] [WARM=0] [WARM_PULSE=] [WARM_PERIOD_US=] [COLUMNS=600] [UPLOAD=1] [LAYER=0] [PASS=0]` | **Live ink.** Prints one stripe per `TEMPLATE:PULSE` in `STRIPES` (e.g. `color_b_late:6,color_b_late:8`): a pass of `COLUMNS` columns along the pass axis, the stripes `SPACING` mm apart across it, the first at `X`, `Y`. The default is one stripe with the stock firmware's settings, `color_b_late:6`. `PATTERN=stock` (the default) prints the stock firmware's random pattern, the one that ejects ink on a cold head, with the spit test's knobs (below), on any board firmware: the add-on makes the columns. Without `WARM` each stripe's pass warms a cold head by itself (see "Automatic head warm-up"); `WARM` instead warms the head for that many seconds right before each stripe (`POLYDYE_WARM` with the stripe's template, after its upload, over `warm_position`, so only the travel and run-up come in between; board firmware with the warm-up), and `WARM=0` not at all. `UPLOAD=0` prints the pass already stored as `LAYER`, `PASS` instead. Moves to `Z` first if given. Refused during a print, also a paused one, and with a black stripe for `PATTERN=stock` (a colour pattern) before anything moves. Afterwards, also after an error, turns live ink off (and the boost too with older board firmware; with this add-on's bundled firmware the boost stays on, as stock keeps it, until `POLYDYE_DISABLE`, a shutdown or 30 min unused; see "Stock baseline") and puts the template, pulse and G-code state back. Doesn't home (`PD_FIRE_TEST` does) |
 | `POLYDYE_SPIT [SECONDS=2] [TEMPLATE=] [PULSE=] [PATTERN=stock\|all] [DENSITY=] [REPEAT=] [COLORS=] [FIRST=] [LAST=] [PER_PULSE=] [PERIOD_US=1000] [WARM=0] [WARM_PULSE=] [WARM_PERIOD_US=] CONFIRM=1` | **Live ink, no motion.** Fires like the stock firmware (`PATTERN=stock`, the default, with its knobs, see below) a column every 508 µs, or every nozzle (`all`) at 1 kHz, or a column every `PERIOD_US`, for `SECONDS` (at most 10, and at most 10000 columns) into a paper towel held under the cartridge, through the same waveform and safety checks as a pass, starting at least 0.1 s after the boost came on. Refused without `CONFIRM=1`, during a print (also a paused one) or with passes queued. Turns live ink off afterwards (and the boost too with older board firmware; see "Stock baseline") and puts the template and pulse back. `WARM` warms the head first, in the same board run (see below) |
 | `POLYDYE_WARM [SECONDS=2] [WARM_PULSE=] [WARM_PERIOD_US=] [TEMPLATE=] CONFIRM=1` | **Experimental, heaters on, no motion.** The head warm-up of `POLYDYE_SPIT WARM=` on its own (see below), at most 30 s |
 | `POLYDYE_LEVEL LINE=D1\|D2\|D3\|CSYNC\|S1..S5\|DCLK [STATE=high\|low\|off]` | Signal check, **cartridge out**: holds one cartridge line at its rail voltage (`high`) or 0 V for a multimeter; `STATE=off` puts every line LOW. Needs `POLYDYE_ENABLE LIVE=0` first and nothing queued. The fire lines are never held. A line goes back to LOW after 5 minutes, or when a pass is scheduled or PolyDye turns off |
@@ -452,16 +452,24 @@ same stripe or spit right after 10 s of every nozzle at 2.80 µs every 508 µs p
 again within minutes (4–13). So a live `POLYDYE_PASS` (a print's, the fire test's, an alignment print's) warms the
 head first when it hasn't fired since Klipper started or not for `warm_idle_time` seconds (60): it waits for the moves
 and passes before it, then the board runs `warm_seconds` (10) of every nozzle at `warm_pulse` words (8, 2.80 µs) every
-`warm_period_us` (508), standing still, and the pass follows with live ink still on. A dry-run pass (`POLYDYE_ENABLE
+`warm_period_us` (508), standing still over a waste spot (below), and the pass follows with live ink still on. The
+decision is made for when the pass can start, after the moves already queued. A dry-run pass (`POLYDYE_ENABLE
 LIVE=0`) fires nothing, so it neither warms nor keeps the head warm; spit tests and warm-ups count as firing.
 
-- Every nozzle at once heats the head rather than spits at the PolyDye's 12.6 V, so the warm-up leaves no mark where it
-  stands. To keep it off the print anyway, set `warm_position: X, Y` (bed coordinates of the cartridge, like
-  `POLYDYE_PASS`'s X and Y): the toolhead travels there at `travel_speed` first, at the current Z.
+- **Never over the print.** On a cold head every nozzle at once only heats it, but a head still hot from firing spits
+  during the warm-up: on 48483ab, back-to-back fire tests with `WARM=10` left a big C/M/Y blob a few mm past each
+  previous stripe, where the next warm-up ran. So warm-ups (and the fire test's `WARM`) run over `warm_position`:
+  - `sponge` (the default): the wipe sponge, at `POLYDYE_WIPE`'s X (G-code coordinates; `variable_x`, 245);
+  - `X, Y`: a bed spot for the cartridge (bed coordinates, like `POLYDYE_PASS`'s X and Y), e.g. a strip of paper towel;
+  - `here`: where the toolhead stands (bench use only).
+
+  The toolhead rises by `POLYDYE_WIPE`'s `z_hop` (1 mm), travels there at `travel_speed`, warms, travels back at that
+  height and comes down, so the pass (or stripe) starts from where it was.
 - During a print it costs `warm_seconds` each time the head has been idle that long (between layers, typically), with
   the hotend standing still.
 - `POLYDYE_FIRE_TEST` without `WARM` warms through its passes like this; `WARM=` gives each stripe its own warm-up
-  instead, and `WARM=0` none (for a cold-head comparison). `POLYDYE_SPIT` and `POLYDYE_WARM` warm only when asked.
+  instead (over `warm_position` too), and `WARM=0` none (for a cold-head comparison). `POLYDYE_SPIT` and
+  `POLYDYE_WARM` warm only when asked, in place (they don't move).
 - `warm_seconds: 0` turns it off. It needs board firmware with the warm-up duty limit (this add-on's bundled firmware);
   with older firmware passes go ahead unwarmed.
 - `printer.polydye.auto_warm` has the settings and `head_idle_s` the seconds since the head last fired (none yet:
