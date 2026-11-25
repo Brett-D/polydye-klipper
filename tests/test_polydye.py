@@ -1464,6 +1464,21 @@ class Prime(unittest.TestCase):
             pd.cmd_POLYDYE_PRIME(self.gcmd())
         self.assertEqual((runs, moves, board.live, pd.last_fire), ([], [], False, None))
 
+    def test_a_print_that_ends_while_it_waits_gets_no_prime(self):
+        pd, board, runs, moves = self.prime()
+        board.print_state = 'printing'
+
+        def wait_moves():  # the print is cancelled meanwhile
+            board.print_state = 'cancelled'
+        self.objects['toolhead'].wait_moves = wait_moves
+        with self.assertRaisesRegex(RuntimeError, "the print ended while it waited for the passes before it"):
+            pd.cmd_POLYDYE_PRIME(self.gcmd())
+        self.assertEqual((runs, moves, board.live), ([], [], False))
+        # Outside a print it primes as usual.
+        board.print_state = 'standby'
+        pd.cmd_POLYDYE_PRIME(self.gcmd())
+        self.assertEqual(len(runs), 1)
+
     def test_a_prime_the_board_cant_be_seen_to_finish_stays_over_the_sponge(self):
         pd, board, runs, moves = self.prime()
         board.running = False

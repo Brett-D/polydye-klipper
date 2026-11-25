@@ -1754,7 +1754,14 @@ class PolyDye:
         if 'x' not in getattr(macro, 'variables', {}):
             raise gcmd.error("%s: primes over the wipe sponge, but there's no POLYDYE_WIPE macro to say where it is: "
                              "include polydye_macros.cfg" % (cmd,))
+        reactor = self.printer.get_reactor()
+        printing = self._printing(reactor.monotonic())
         st = self._board_idle(gcmd, cmd, "the nozzles can't be primed")
+        # A print that ended while this waited has had live ink turned off (_check_print_end()): turning it on again
+        # here would leave it on, no longer the print's.
+        if printing and not self._printing(reactor.monotonic()):
+            raise gcmd.error("%s: the print ended while it waited for the passes before it, so it doesn't prime"
+                             % (cmd,))
         if (st.get('cartridge_template') or '').startswith('black'):
             raise gcmd.error("%s: primes with the stock pattern, for a colour cartridge template, not %s"
                              % (cmd, st['cartridge_template']))
