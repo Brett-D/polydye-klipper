@@ -2105,13 +2105,19 @@ class PolyDye:
 
     def _retry_restore(self):
         """Puts back the cartridge settings a test's cleanup couldn't (restore_pending), once the board is seen idle
-        with live ink off (the last status), and says so."""
+        with live ink off (the last status), then reads them back: done once the board reports them, which also
+        brings the status POLYDYE_PASS checks against up to date. Says so."""
         st = self.last_status
         # Nothing left: the status poll may have finished it while a command waited for its query.
         if (self.restore_pending is None or not st or self.live_off_pending or st.get('live') or st.get('running')
                 or st.get('queued') or (st.get('boost') and self.boost_idle_s is None)):
             return
-        self._send_cartridge(st, *self.restore_pending)
+        want = self.restore_pending
+        self._send_cartridge(st, *want)
+        st = self._fresh_status()  # after the settings: the same command queue
+        if any(v is not None and st.get(key) != v
+               for key, v in zip(('cartridge_template', 'pulse_words', 'fire_gap_words'), want)):
+            return  # not taken (yet): tried again
         self.restore_pending = None
         msg = "PolyDye: the cartridge settings are back as before the last test"
         logging.info("polydye: %s", msg)
@@ -2119,8 +2125,8 @@ class PolyDye:
 
     def _finish_restore(self, gcmd, cmd):
         """Before a command that takes the board's settings as they are (a test that puts them back afterwards, an ink
-        job, a settings change): puts back what a failed test cleanup left (restore_pending) now, live ink off first,
-        or refuses while the board isn't idle."""
+        job, a settings change, live ink on): puts back what a failed test cleanup left (restore_pending) now, live ink
+        off first, or refuses while the board isn't idle."""
         if self.restore_pending is None:
             return
         self._check_print_end(self.printer.get_reactor().monotonic())
@@ -2232,6 +2238,11 @@ class PolyDye:
         direction = gcmd.get_int('DIR', 1)
         if direction not in (1, -1):
             raise gcmd.error("POLYDYE_PASS: DIR must be 1 or -1")
+        # The board still has a failed test's settings (live ink may be on): nothing prints with them.
+        if self.restore_pending is not None:
+            raise gcmd.error("POLYDYE_PASS: the last test couldn't put the cartridge settings back yet; PolyDye puts "
+                             "them back once the board is idle with live ink off (POLYDYE_ENABLE does it at once), so "
+                             "try again in a moment")
         info = self.query_pass_cmd.send([self.oid, layer, pass_num])
         if not info['present']:
             raise gcmd.error("POLYDYE_PASS: layer %d pass %d has not been uploaded to the PolyDye board"
@@ -2258,10 +2269,14 @@ class PolyDye:
 
         speed = gcmd.get_float('SPEED', self.pass_speed, above=0.)
         # With a fire gap the column is longer: a faster pass than pass_speed may not fit it (the board would shut
-        # down). The status as last seen: the gap only changes through this add-on, which reads it back.
-        gap = self.last_status.get('fire_gap_words')
+        # down). Every gap the add-on sets fits pass_speed, so only another SPEED needs the board's own gap and pulse,
+        # read now; the status as last seen otherwise.
+        st = self.last_status
+        if speed != self.pass_speed and self.query_fire_gap_cmd is not None:
+            st = self._fresh_status()
+        gap = st.get('fire_gap_words')
         if gap:
-            error = fire_gap_fit_error(gap, self.last_status.get('pulse_words') or PULSE_MAX, self.dpi, speed)
+            error = fire_gap_fit_error(gap, st.get('pulse_words') or PULSE_MAX, self.dpi, speed)
             if error:
                 raise gcmd.error("POLYDYE_PASS: SPEED %g: %s" % (speed, error))
 
@@ -2741,6 +2756,8 @@ class PolyDye:
         if not live:
             self.prewarm_gen += 1  # live ink off drops the board's bursts, and one not sent yet
         if live:
+            # Not with a failed test's settings still on the board: put back first, or refused.
+            self._finish_restore(gcmd, cmd)
             st = self._fresh_status()
             self._check_current_pulse(gcmd, cmd, st)
             boost_was_on = st['boost']

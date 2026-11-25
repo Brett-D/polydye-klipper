@@ -483,6 +483,24 @@ class TestCleanup(unittest.TestCase):
         self.assertEqual((board.gap, board.live, pd.restore_pending, board.violations), (0, False, None, []))
         self.assertEqual(said[-1], "PolyDye: the cartridge settings are back as before the last test")
 
+    def test_no_live_ink_or_pass_with_a_failed_tests_settings(self):
+        pd, board = self.make(fail_on="NOTHING")
+        self.with_gap(pd, board, 43)
+        pd._fresh_status = pd._query_status = lambda: setattr(pd, 'last_status', board.status()) or pd.last_status
+        pd.printer.lookup_object('gcode').respond_info = lambda msg: None
+        pd.query_pass_cmd = types.SimpleNamespace(send=lambda args: {'present': 1, 'columns': 600, 'cart': 0})
+        # A failed cleanup left live ink on with the fire gap test's 43 words.
+        pd.restore_pending, board.live, board.boost = ('color_b_late', 6, 0), True, True
+        for run in (lambda: pd.cmd_POLYDYE_ENABLE(self.gcmd(LIVE=1)),
+                    lambda: pd.cmd_POLYDYE_PASS(self.gcmd(LAYER=0, PASS=0, X=100., Y=40.))):
+            with self.assertRaisesRegex(RuntimeError, "the last test couldn't put the cartridge settings back yet"):
+                run()
+        self.assertEqual((board.gap, board.sent), (43, []))
+        # Idle with live ink off: POLYDYE_ENABLE puts them back, then turns live ink on.
+        pd.boost_idle_s, board.live = 1800, False
+        pd.cmd_POLYDYE_ENABLE(self.gcmd(LIVE=1))
+        self.assertEqual((board.gap, board.live, pd.restore_pending, board.violations), (0, True, None, []))
+
     def test_a_second_failed_cleanup_keeps_the_first_ones_settings(self):
         pd, board = self.make(fail_on="NOTHING")
         pd.mode_cmd = types.SimpleNamespace(send=lambda args: (_ for _ in ()).throw(RuntimeError("timeout")))
@@ -1377,6 +1395,34 @@ class AutoWarm(unittest.TestCase):
                                                   "column period"):
             pd.cmd_POLYDYE_PASS(TestCleanup.gcmd(self, LAYER=0, PASS=0, X=100., Y=40., SPEED=75.))
         self.assertEqual((runs, moves, self.travel), ([], [], []))
+
+    def test_a_deferred_restore_reads_the_board_back_before_passes_are_checked(self):
+        # A failed fire gap test left the board at 20 words; the gap from before it, 48, goes back later. A SPEED that
+        # fits 20 but not 48 is then refused here, not left to the board (a shutdown).
+        pd, board, runs, moves = self.make()
+        TestCleanup.with_gap(pd, board, 20)
+        pd.query_pass_cmd = types.SimpleNamespace(send=lambda args: {'present': 1, 'columns': 600, 'cart': 0})
+        pd._query_status = pd._fresh_status = lambda: setattr(pd, 'last_status', board.status()) or pd.last_status
+        pd._query_status()
+        pd.restore_pending = ('color_b_late', 6, 48)
+        said = []
+        pd.printer.lookup_object('gcode').respond_info = said.append
+        pd._retry_restore()
+        self.assertEqual((board.gap, pd.restore_pending, pd.last_status['fire_gap_words']), (48, None, 48))
+        self.assertEqual(said, ["PolyDye: the cartridge settings are back as before the last test"])
+        error = "POLYDYE_PASS: SPEED 75: a 16.80 us fire gap with a pulse of 6 words makes the column 407 us"
+        with self.assertRaisesRegex(RuntimeError, error):
+            pd.cmd_POLYDYE_PASS(TestCleanup.gcmd(self, LAYER=0, PASS=0, X=100., Y=40., SPEED=75.))
+        # Another SPEED reads the board's gap, whatever the status last said.
+        pd.last_status = dict(pd.last_status, fire_gap_words=20)
+        with self.assertRaisesRegex(RuntimeError, error):
+            pd.cmd_POLYDYE_PASS(TestCleanup.gcmd(self, LAYER=0, PASS=0, X=100., Y=40., SPEED=75.))
+        self.assertEqual((runs, board.sent, self.travel), ([], [('gap', 48)], []))  # the restore only, no move
+        # A board that didn't take a setting: still to put back, tried again, nothing said.
+        pd.restore_pending = ('color_b_late', 6, 0)
+        pd.set_fire_gap_cmd = types.SimpleNamespace(send=lambda args: None)
+        pd._retry_restore()
+        self.assertEqual((board.gap, pd.restore_pending, len(said)), (48, ('color_b_late', 6, 0), 1))
 
     def test_an_optional_pre_spit_after_the_warm_up(self):
         pd, board, runs, moves = self.make()
