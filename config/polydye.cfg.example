@@ -52,6 +52,9 @@ offset_y: -8.7
 # Seconds of stock-pattern spit at the warm spot right after a warm-up (0: none), for testing. Real ink: at the sponge
 # or over printed plastic only.
 #warm_prespit: 0
+# Seconds of POLYDYE_PRIME's stock-pattern spit over the wipe sponge without SECONDS (up to 5): an ink layer whose
+# colours haven't ejected for 90 s or more starts with one (0.2 s left a full-width cyan bar's start ragged).
+#prime_seconds: 0.3
 
 # Where POLYDYE_WIPE meets the sponge (X, G-code coordinates; must be below the X axis maximum). Uncomment to
 # change the default of 245:

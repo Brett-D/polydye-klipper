@@ -22,7 +22,7 @@ def bare_polydye():
     """A PolyDye without its __init__ (no Klipper), with the state every command needs."""
     pd = object.__new__(polydye.PolyDye)
     pd.prewarm_cmd = pd.query_prewarm_cmd = pd.prewarm_sent = pd.prewarm_state = pd.boost_ready = None
-    pd.prewarm_seconds, pd.prewarm_gen = polydye.AUTO_PREWARM_S, 0
+    pd.prewarm_seconds, pd.prewarm_gen, pd.prime_seconds = polydye.AUTO_PREWARM_S, 0, polydye.PRIME_S
     return pd
 
 
@@ -1403,6 +1403,94 @@ class Prewarm(unittest.TestCase):
         self.assertEqual(pd._warm_plan(self.gcmd(), "POLYDYE_WARM", 30., 1, 1016), (1, 1016, 29527))
 
 
+class Prime(unittest.TestCase):
+    """POLYDYE_PRIME: a short stock-pattern spit over the wipe sponge, for an ink layer whose colours have been idle."""
+
+    make = AutoWarm.make
+
+    def gcmd(self, **params):
+        def get(name, default=None, **kw):
+            return params.get(name, default)
+        return types.SimpleNamespace(get=get, get_float=get, respond_info=self.said.append, error=RuntimeError)
+
+    def prime(self, **params):
+        pd, board, runs, moves = self.make()
+        pd.spit_run_cmd = types.SimpleNamespace(send=lambda args: (runs.append(args), board.sent.append('run')))
+        self.dwells, board.queued_until = [], 100.  # the moves queued end now
+        self.objects['toolhead'].dwell = lambda t: (self.dwells.append(round(t, 6)), board.sent.append('dwell'))
+        return pd, board, runs, moves
+
+    def test_a_prime_spits_over_the_sponge_and_comes_back(self):
+        pd, board, runs, moves = self.prime()
+        # The warm-up spot is the pass's (warm_position pass), but a prime is always over the sponge: its gap is fixed,
+        # and spits from higher up mist.
+        pd.cmd_POLYDYE_PRIME(self.gcmd())
+        # 0.3 s (prime_seconds) of the stock pattern every 508 us, no warm-up, in one board run.
+        self.assertEqual(runs, [[0, 591, polydye.SPIT_PATTERNS['stock'], 0, 508, 0, 0, 0]])
+        # The boost was off: live ink on, then the moves to the sponge wait for it to settle; up by POLYDYE_WIPE's
+        # z_hop, over the sponge, spit, then back across and down.
+        self.assertEqual(moves, [('mode', 1, 1), 'dwell', "SAVE_GCODE_STATE NAME=polydye_warm",
+                                 "G90\nG1 Z1.300 F900\nG1 X245.000 F9000", 'run',
+                                 "G1 X10.000 Y20.000 F9000\nG1 Z0.300 F900", "RESTORE_GCODE_STATE NAME=polydye_warm"])
+        self.assertEqual((self.travel, board.live, self.dwells), ([], True, [0.15]))
+        self.assertIn("priming, 0.3 s of the stock pattern (591 columns every 508 us) over the wipe sponge (X=245.0)",
+                      self.said[0])
+        # It fired: a pass right after it needs no warm-up of its own.
+        self.assertEqual(pd.last_fire, 100.)
+        board.print_time, pd.warm_idle_time = 102., 5.
+        self.assertIs(AutoWarm.warm(self, pd), True)
+        self.assertEqual(len(runs), 1)
+        # SECONDS sets its length; with live ink already on, nothing waits for the boost.
+        pd.cmd_POLYDYE_PRIME(self.gcmd(SECONDS=0.1))
+        self.assertEqual((runs[-1][1], self.dwells), (197, [0.15]))
+
+    def test_refused_before_anything_moves_or_fires(self):
+        pd, board, runs, moves = self.prime()
+        pd.spit_patterns = ('all',)  # board firmware without the stock pattern
+        with self.assertRaisesRegex(RuntimeError, "POLYDYE_PRIME: needs newer PolyDye board firmware"):
+            pd.cmd_POLYDYE_PRIME(self.gcmd())
+        pd.spit_patterns = tuple(polydye.SPIT_PATTERNS)
+        board.template = 'black_b'
+        with self.assertRaisesRegex(RuntimeError, "stock pattern, for a colour cartridge template, not black_b"):
+            pd.cmd_POLYDYE_PRIME(self.gcmd())
+        board.template = 'color_b_late'
+        del self.objects['gcode_macro POLYDYE_WIPE']
+        with self.assertRaisesRegex(RuntimeError, "no POLYDYE_WIPE macro to say where it is"):
+            pd.cmd_POLYDYE_PRIME(self.gcmd())
+        self.objects['gcode_macro POLYDYE_WIPE'] = types.SimpleNamespace(variables={'x': 245, 'z_hop': 1})
+        # Passes still running 5 s after the moves before it are done.
+        pd._fresh_status = pd._query_status = lambda: dict(board.status(), running=True)
+        with self.assertRaisesRegex(RuntimeError, "still busy with passes, so the nozzles can't be primed"):
+            pd.cmd_POLYDYE_PRIME(self.gcmd())
+        self.assertEqual((runs, moves, board.live, pd.last_fire), ([], [], False, None))
+
+    def test_a_print_that_ends_while_it_waits_gets_no_prime(self):
+        pd, board, runs, moves = self.prime()
+        board.print_state = 'printing'
+
+        def wait_moves():  # the print is cancelled meanwhile
+            board.print_state = 'cancelled'
+        self.objects['toolhead'].wait_moves = wait_moves
+        with self.assertRaisesRegex(RuntimeError, "the print ended while it waited for the passes before it"):
+            pd.cmd_POLYDYE_PRIME(self.gcmd())
+        self.assertEqual((runs, moves, board.live), ([], [], False))
+        # Outside a print it primes as usual.
+        board.print_state = 'standby'
+        pd.cmd_POLYDYE_PRIME(self.gcmd())
+        self.assertEqual(len(runs), 1)
+
+    def test_a_prime_the_board_cant_be_seen_to_finish_stays_over_the_sponge(self):
+        pd, board, runs, moves = self.prime()
+        board.running = False
+        pd._fresh_status = pd._query_status = lambda: dict(board.status(), running=board.running)
+        pd.spit_run_cmd = types.SimpleNamespace(send=lambda args: (runs.append(args), setattr(board, 'running', True)))
+        with self.assertRaisesRegex(RuntimeError, "didn't finish the prime"):
+            pd.cmd_POLYDYE_PRIME(self.gcmd())
+        self.assertIn("stays over the warm-up spot", self.said[-1])
+        self.assertFalse(any(m.startswith("G1 X10.000") for m in moves if isinstance(m, str)))
+        self.assertEqual((moves[-1], pd.last_fire), ("RESTORE_GCODE_STATE NAME=polydye_warm", None))
+
+
 class RandomPattern(unittest.TestCase):
     """The random pattern's columns are the board's (printcart_pattern_random), so a fire test prints what a spit test
     fires."""
@@ -1641,6 +1729,7 @@ class ConfigOptions(unittest.TestCase):
         self.assertIn("prewarm_seconds 17 is too long: a burst is at most 65535 columns, 16.6 s at warm_period_us 254",
                       self.load(prewarm_seconds='17'))
         self.assertEqual(self.load(prewarm_seconds='16.5').prewarm_seconds, 16.5)
+        self.assertEqual((pd.prime_seconds, self.load(prime_seconds='0.5').prime_seconds), (0.3, 0.5))
 
 
 
