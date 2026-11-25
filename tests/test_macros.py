@@ -145,5 +145,27 @@ class FireTest(unittest.TestCase):
             run(self.macros, "PD_FIRE_TEST", "Z=0")
 
 
+
+@unittest.skipUnless(jinja2, "needs jinja2 (part of klippy's environment)")
+class CalibrationPrints(unittest.TestCase):
+    def setUp(self):
+        self.macros = load_macros()
+
+    def test_home_only_when_needed_and_pass_the_values(self):
+        self.assertEqual(run(self.macros, "PD_ALIGN_PRINT", "X=60 SPACING=9", homed="xy"),
+                         ["G28", "POLYDYE_ALIGN_PRINT Z=1.0 X=60.0 SPACING=9.0"])
+        self.assertEqual(run(self.macros, "PD_ALIGN_PRINT", homed="xyz"), ["POLYDYE_ALIGN_PRINT Z=1.0"])
+        self.assertEqual(run(self.macros, "PD_OFFSET_PRINT", "LAYERS=3 EXTRUDER_TEMP=215 BED_TEMP=60", homed=""),
+                         ["G28", "POLYDYE_OFFSET_PRINT LAYERS=3 EXTRUDER_TEMP=215.0 BED_TEMP=60.0"])
+        self.assertEqual(run(self.macros, "PD_OFFSET_PRINT", homed="xyz"), ["POLYDYE_OFFSET_PRINT"])
+
+    def test_refused_during_a_print_before_homing(self):
+        for name in ("PD_ALIGN_PRINT", "PD_OFFSET_PRINT"):
+            with self.assertRaisesRegex(MacroError, "not during a print"):
+                run(self.macros, name, homed="", print_state="paused")
+        with self.assertRaisesRegex(MacroError, "Z must be"):
+            run(self.macros, "PD_ALIGN_PRINT", "Z=0.1")
+
+
 if __name__ == "__main__":
     unittest.main()

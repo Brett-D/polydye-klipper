@@ -10,6 +10,15 @@ offset_y: -8.7
 # Moves the ink of reverse passes along the pass axis to line them up with forward passes (mm). The PolyDye page's
 # Ink position nudges set this and the offsets live; Store writes them here.
 #direction_trim: 0
+# Colour registration: where cyan's and yellow's dots go against magenta's, in bus columns along the pass (DIR=1's
+# order) and nozzle positions across it. POLYDYE_ALIGN sets them from the alignment page (POLYDYE_ALIGN_PRINT) and
+# stores them here. They apply to the passes the add-on draws itself (calibration prints).
+#cyan_columns: 0
+#cyan_positions: 0
+#yellow_columns: 0
+#yellow_positions: 0
+# Nozzles per inch across the pass; sizes the offset print's X scale (POLYDYE_OFFSET_PRINT). About 300.
+#nozzle_dpi: 300
 # Leave the cartridge settings unset for the stock PolyDye firmware's: the board starts with them (older board firmware
 # started with color_b: update it), and these defaults copy the stock cadence. The bus runs only at the stock clock
 # (2.857 MHz); Klipper sets it on every connect.

@@ -9,7 +9,11 @@ import json
 import logging
 import math
 import os
+import re
+import stat
 import struct
+import threading
+import time
 import zlib
 
 import mcu as mcu_mod
@@ -128,20 +132,31 @@ STATUS_INTERVAL = 2.  # s between background status queries
 MAX_NUDGE = 5.  # mm per POLYDYE_NUDGE value; more is almost certainly a typo
 NOZDATA_SIZE = 42
 DATA_HELLO, DATA_PUT, DATA_ERR = 0x01, 0x10, 0xFF
+DATA_CHUNK = 16384
 
 
 class DataPortError(Exception):
     pass
 
 
-def data_port_request(path, seq, ftype, payload=b"", timeout=3.):
-    """One request on the board's data port (protocol in README.md, "Data port"). Returns the JSON reply."""
+def data_port_request(path, seq, ftype, payload=b"", timeout=3., rate=None):
+    """One request on the board's data port (protocol in README.md, "Data port"). Returns the JSON reply. `rate`
+    (bytes/s) paces a big request's writing, in DATA_CHUNK pieces."""
     import serial  # pyserial is part of klippy's environment
     ser = serial.Serial(path, 115200, timeout=timeout)
     try:
         head = struct.pack("<BBI", ftype, seq, len(payload))
         crc = zlib.crc32(payload, zlib.crc32(head)) & 0xffffffff
-        ser.write(b"PD" + head + payload + struct.pack("<I", crc))
+        frame = b"PD" + head + payload + struct.pack("<I", crc)
+        if rate:
+            due = time.time()
+            for off in range(0, len(frame), DATA_CHUNK):
+                if due > time.time():
+                    time.sleep(due - time.time())
+                ser.write(frame[off:off + DATA_CHUNK])
+                due = max(due, time.time()) + DATA_CHUNK / float(rate)
+        else:
+            ser.write(frame)
         ser.flush()
         prev = b""
         while True:
@@ -620,6 +635,404 @@ def nudge_offsets(offset_x, offset_y, trim, dx, dy, dtrim):
     return round(offset_x - dx, 4), round(offset_y - dy, 4), round(trim + dtrim, 4)
 
 
+
+# ---- calibration prints ---------------------------------------------------------------------------------------------
+# POLYDYE_ALIGN_PRINT and POLYDYE_OFFSET_PRINT draw their passes here on the Pi, store them on the board as layer
+# CAL_LAYER, passes 0, 1, ... (replacing what was there), and print them with POLYDYE_PASS. A pass's dots are drawn in
+# bed order (draw_pass()): column index i counts bus columns along +pass_axis from the drawing's origin, p is Sprite_tm's
+# colour nozzle position 0-111. With pass_axis y as PolyDye mounts the cartridge, positions go towards -X, and text drawn
+# with image rows going down in position and image columns along +Y reads correctly from above (vernier page 1).
+CAL_LAYER = 65000
+# The big strips go up at CAL_UPLOAD_RATE: a whole firmware image at full USB speed once upset a Raspberry Pi 3's USB.
+CAL_UPLOAD_RATE = 128 * 1024
+# Colour registration ([polydye] cyan_columns, cyan_positions, yellow_columns, yellow_positions; POLYDYE_ALIGN): where
+# cyan's and yellow's dots go against magenta's. The colour rows sit side by side along the pass, so their offset is
+# fixed on the bed (vernier page 2, 2026-11-25: the corrected word printed without colour fringes in both directions): a
+# colour's dot drawn at bed column i fires at bed column i + <colour>_columns (counted along +pass_axis, DIR=1's order;
+# DIR=-1 passes print the same bed columns backwards) and at nozzle position p + <colour>_positions. Applied to every
+# pass the add-on draws.
+REG_KEYS = ('cyan_columns', 'cyan_positions', 'yellow_columns', 'yellow_positions')
+REG_MAX_COLUMNS, REG_MAX_POSITIONS = 300, 30
+CYAN, MAGENTA, YELLOW = 0, 1, 2
+# Every calibration strip starts with a priming block, printed first, then PRIME_GAP empty columns: nozzles that hadn't
+# fired for a while missed their first marks even right after a gentle warm-up, but words led in by 300 columns of the
+# stock pattern (a random quarter of the positions of every colour) printed every colour from their first column
+# (vernier page 2). PRIME is the stock pattern over positions 14-85.
+PRIME_COLUMNS, PRIME_GAP = 300, 100
+PRIME = STOCK_RANDOM
+# POLYDYE_ALIGN_PRINT, the vernier page (ported from the alignment page printed on 2026-11-24): blocks k = -16..16,
+# ALIGN_BLOCK columns apart, and an empty block at each end. In each row the mark that lines up with its magenta
+# reference names k, which POLYDYE_ALIGN turns into the correction:
+# - C, Y (along the pass): a magenta bar on positions 20-49 at the block centre, the colour's bar on 50-79 3k columns
+#   further: CYAN=k / YELLOW=k move that colour's dots by 3k columns (<colour>_columns += 3k).
+# - D (direction): magenta bars on 20-49 printed forwards, and on 50-79 by a DIR=-1 pass 2k columns further on:
+#   DIRECTION=k moves reverse passes by 2k columns (direction_trim += 2k x 25.4 / dpi mm).
+# - CX, YX (across the pass): 2-position magenta lines at 49-50 and the colour's at 49+k to 50+k: CYAN_X=k /
+#   YELLOW_X=k move that colour's dots by k positions.
+# The rows are side by side across the pass, ALIGN_SPACING mm apart, between two rows of block numbers.
+ALIGN_BLOCK, ALIGN_K = 96, 16
+ALIGN_COLUMNS = ALIGN_BLOCK * (2 * ALIGN_K + 3)
+ALIGN_SPACING = 8.
+# The paper the page needs: ALIGN_PAPER (across, along the pass, mm) with ALIGN_PAPER_MARGIN all round its ink (the
+# rows, the nozzle row's width at 10 % more than nozzle_dpi, the priming blocks at both ends). Settings that need more
+# are refused, so the size the page asks for is always enough.
+ALIGN_PAPER, ALIGN_PAPER_MARGIN = (70., 140.), 5.
+ALIGN_ROWS = ('labels', 'C', 'Y', 'D', 'CX', 'YX', 'labels')
+# No ink on the glass bed, ever (Brett, 2026-11-25): calibration ink and its priming blocks go on paper (the alignment
+# page) or printed plastic (the offset print), and the warm-up before them (which fires every nozzle) over the wipe
+# sponge at the X gantry's right end (POLYDYE_WIPE's X; Brett confirmed it is fitted), whatever warm_position says.
+# Their passes don't warm again.
+# POLYDYE_OFFSET_PRINT (pass_axis y): a PLA plaque, then two ink scales across a cross-shaped groove, OFFSET_SLOT mm wide,
+# in its top OFFSET_GROOVE_LAYERS layers, centred on the X, Y asked for. The X scale: lines along Y every OFFSET_X_TICK
+# nozzle positions (about 0.25 mm at nozzle_dpi 300), across the groove that runs along Y; the Y scale: lines along X
+# about every OFFSET_Y_TICK_MM (whole columns: 8 at dpi 847; offset_y_tick()), across the groove that runs along X. Tick 0 is where the groove's
+# centre should be; the tick in the middle of the groove, k, is the reading: POLYDYE_OFFSET X_TICK=k / Y_TICK=k moves
+# the ink by k ticks. Every 4th tick is long and every 8th numbered. OFFSET_REF_POSITION is the nozzle position
+# POLYDYE_PASS's X, Y name across the pass.
+OFFSET_REF_POSITION = 50
+OFFSET_X_TICK, OFFSET_X_TICKS = 3, 11
+OFFSET_Y_TICK_MM, OFFSET_Y_TICKS = 0.24, 12
+# Its numbers' rows are OFFSET_TEXT_ROW_MM along the pass, so the layout keeps its size at another dpi.
+OFFSET_TEXT_ROW_MM = 0.12
+OFFSET_SLOT = 1.
+OFFSET_LAYERS, OFFSET_GROOVE_LAYERS, OFFSET_LAYER_HEIGHT, OFFSET_GAP = 5, 3, 0.2, 1.
+# The plaque around the groove's centre (-X, +X, -Y, +Y mm): the ink (priming included) spans -3.3..+9.9 mm in X (at
+# nozzle pitches up to 1/270") and -14.1..+10.5 mm in Y, and the plaque reaches OFFSET_MARGIN mm beyond, so ink that lands
+# that far off still lands on plastic. Where the grooves end: the one along X OFFSET_SLOT_END[0] mm to +X, before the Y
+# scale's numbers; the one along Y OFFSET_SLOT_END[1] mm up, below the X scale's. The Y scale's pass is
+# OFFSET_Y_SCALE_X mm to +X. The plaque's retraction and travel are the coordinator's ink-on-PLA plaque's
+# (2026-11-24).
+OFFSET_MARGIN = 6.5
+OFFSET_PLAQUE = (3.3 + OFFSET_MARGIN, 9.9 + OFFSET_MARGIN, 14.1 + OFFSET_MARGIN, 10.5 + OFFSET_MARGIN)
+OFFSET_SLOT_END = (7.35, 9.3)
+OFFSET_Y_SCALE_X = 6.5
+PLAQUE_RETRACT, PLAQUE_TRAVEL_F = 0.8, 9000
+# Digits and row names in a 5 x 7 font.
+FONT = {
+    '0': ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
+    '1': ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+    '2': ("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
+    '3': ("11111", "00010", "00100", "00010", "00001", "10001", "01110"),
+    '4': ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
+    '5': ("11111", "10000", "11110", "00001", "00001", "10001", "01110"),
+    '6': ("00110", "01000", "10000", "11110", "10001", "10001", "01110"),
+    '7': ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
+    '8': ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
+    '9': ("01110", "10001", "10001", "01111", "00001", "00010", "01100"),
+    '-': ("00000", "00000", "00000", "11111", "00000", "00000", "00000"),
+    'C': ("01110", "10001", "10000", "10000", "10000", "10001", "01110"),
+    'D': ("11100", "10010", "10001", "10001", "10001", "10010", "11100"),
+    'X': ("10001", "10001", "01010", "00100", "01010", "10001", "10001"),
+    'Y': ("10001", "10001", "01010", "00100", "00100", "00100", "00100"),
+}
+
+
+def text_size(text):
+    """(width, height) of `text` in font pixels: 5 x 7 characters one pixel apart."""
+    return 6 * len(text) - 1, 7
+
+
+class PassDrawing:
+    """The dots of a pass the add-on draws, in bed order (see CAL_LAYER), before colour registration (pass_data())."""
+
+    def __init__(self, lo=0, hi=-1):
+        self.dots = set()  # (column, colour, position)
+        self.raw = {}  # column -> nozzle data put in as it is (the priming block)
+        self.lo, self.hi = lo, hi  # columns the pass covers even where they're empty
+
+    def dot(self, i, c, p):
+        self.dots.add((i, c, p))
+
+    def bar(self, i0, i1, c, p0, p1):
+        """Every dot from column i0 to i1 and position p0 to p1, both inclusive."""
+        for i in range(i0, i1 + 1):
+            for p in range(p0, p1 + 1):
+                self.dots.add((i, c, p))
+
+    def text(self, text, c, i, p, col_px, pos_px, rotated=False):
+        """`text` in FONT, each font pixel col_px columns by pos_px positions. Normally it reads along +pass from
+        column i (its left edge), its top row at position p and rows going down in position. `rotated`: it reads down
+        in position from p (its left edge), its top row at column i and rows going back along the pass (pass_axis y:
+        along +X, the top towards +Y)."""
+        for n, ch in enumerate(text):
+            for r, row in enumerate(FONT[ch]):
+                for x, bit in enumerate(row):
+                    if bit != '1':
+                        continue
+                    across = (6 * n + x) if rotated else r
+                    along = r if rotated else (6 * n + x)
+                    if rotated:
+                        i0, p0 = i - along * col_px - (col_px - 1), p - across * pos_px - (pos_px - 1)
+                    else:
+                        i0, p0 = i + along * col_px, p - across * pos_px - (pos_px - 1)
+                    self.bar(i0, i0 + col_px - 1, c, p0, p0 + pos_px - 1)
+
+    def prime(self, i0):
+        """The priming block (PRIME, PRIME_COLUMNS) from column i0 on."""
+        plan = random_plan(PRIME)
+        for k in range(PRIME_COLUMNS):
+            self.raw[i0 + k] = random_column(k, PRIME, plan)
+
+
+def pass_data(drawing, direction, registration=(0, 0, 0, 0)):
+    """Nozzle data to print `drawing` in `direction` with colour registration (cyan_columns, cyan_positions,
+    yellow_columns, yellow_positions; dots moved beyond the nozzle row are left out). Returns (data, columns, first):
+    first is the drawing column of the pass's first column, the one POLYDYE_PASS's X, Y name."""
+    along = (registration[0], 0, registration[2])
+    across = (registration[1], 0, registration[3])
+    cols = {}
+    for i, c, p in drawing.dots:
+        p += across[c]
+        if 0 <= p < COLOR_POSITIONS:
+            col = cols.setdefault(i + along[c], bytearray(NOZDATA_SIZE))
+            col[COLOR_BYTE_ORDER[c][p % 14] + 14 * c] |= 1 << (p // 14)
+    for i, raw in drawing.raw.items():
+        col = cols.setdefault(i, bytearray(NOZDATA_SIZE))
+        for n, b in enumerate(raw):
+            col[n] |= b
+    lo = min([drawing.lo] + list(cols))
+    hi = max([drawing.hi] + list(cols))
+    order = range(lo, hi + 1) if direction > 0 else range(hi, lo - 1, -1)
+    empty = bytes(NOZDATA_SIZE)
+    return b"".join(bytes(cols[i]) if i in cols else empty for i in order), hi - lo + 1, lo if direction > 0 else hi
+
+
+def align_centre(k):
+    """Drawing column of block k's centre on the vernier page."""
+    return ALIGN_BLOCK // 2 + (k + ALIGN_K + 1) * ALIGN_BLOCK
+
+
+def align_drawings():
+    """The vernier page's passes as (row, drawing, direction), in ALIGN_ROWS order with the D row's reverse pass after
+    its forward one; the label row is printed again as the last row. The drawing's column 0 is the page's start."""
+    ks = range(-ALIGN_K, ALIGN_K + 1)
+
+    def new(row, direction):
+        d = PassDrawing(0, ALIGN_COLUMNS - 1)
+        # Printed first: before the page going forwards, after it going backwards.
+        d.prime(-PRIME_GAP - PRIME_COLUMNS if direction > 0 else ALIGN_COLUMNS + PRIME_GAP)
+        if row not in ('labels', 'D-'):
+            w = text_size(row)[0] * 7
+            d.text(row, MAGENTA, (ALIGN_BLOCK - w) // 2, 64, 7, 5)
+        return d
+
+    out = []
+    d = new('labels', 1)
+    for k in ks:
+        d.bar(align_centre(k) - 2, align_centre(k) + 1, MAGENTA, 14, 28 if k == 0 else 21)
+        if k % 2 == 0:
+            s = "%d" % (k,)
+            d.text(s, MAGENTA, align_centre(k) - text_size(s)[0] * 9 // 2, 64, 9, 5)
+    out.append(('labels', d, 1))
+    for row, colour in (('C', CYAN), ('Y', YELLOW)):
+        d = new(row, 1)
+        for k in ks:
+            d.bar(align_centre(k) - 2, align_centre(k) + 1, MAGENTA, 20, 49)
+            d.bar(align_centre(k) + 3 * k - 2, align_centre(k) + 3 * k + 1, colour, 50, 79)
+        out.append((row, d, 1))
+    d = new('D', 1)
+    for k in ks:
+        d.bar(align_centre(k) - 2, align_centre(k) + 1, MAGENTA, 20, 49)
+    out.append(('D', d, 1))
+    d = new('D-', -1)
+    for k in ks:
+        d.bar(align_centre(k) + 2 * k - 2, align_centre(k) + 2 * k + 1, MAGENTA, 50, 79)
+    out.append(('D-', d, -1))
+    for row, colour in (('CX', CYAN), ('YX', YELLOW)):
+        d = new(row, 1)
+        for k in ks:
+            d.bar(align_centre(k) - 20, align_centre(k) + 19, MAGENTA, 49, 50)
+            d.bar(align_centre(k) - 20, align_centre(k) + 19, colour, 49 + k, 50 + k)
+        out.append((row, d, 1))
+    return out
+
+
+def offset_y_tick(columns_per_mm):
+    """Columns between the offset print's Y ticks: OFFSET_Y_TICK_MM in whole columns."""
+    return max(1, int(round(OFFSET_Y_TICK_MM * columns_per_mm)))
+
+
+def offset_drawings(columns_per_mm):
+    """POLYDYE_OFFSET_PRINT's two passes (pass_axis y, DIR=1), the X scale then the Y scale, as drawings whose column 0
+    is the groove's centre line along Y; `columns_per_mm` is dpi / 25.4. Each starts with a priming block on the plaque
+    below the groove's centre."""
+    mm = lambda v: int(round(v * columns_per_mm))
+    row = max(1, int(round(OFFSET_TEXT_ROW_MM * columns_per_mm)))
+    x = PassDrawing()
+    x.prime(mm(-11.))
+    t0 = mm(3.)
+    for k in range(-OFFSET_X_TICKS, OFFSET_X_TICKS + 1):
+        p = OFFSET_REF_POSITION - OFFSET_X_TICK * k
+        x.bar(t0, t0 + mm(6. if k == 0 else 5. if k % 4 == 0 else 3.5), MAGENTA, p, p)
+        if k % 8 == 0:
+            # Above the ticks, past the groove's end, reading along +X like the Y scale's.
+            s = "%d" % (k,)
+            x.text(s, MAGENTA, mm(OFFSET_SLOT_END[1] + 0.3) + 7 * row - 1, p + text_size(s)[0], row, 2, rotated=True)
+    y = PassDrawing()
+    y.prime(mm(-14.))
+    for k in range(-OFFSET_Y_TICKS, OFFSET_Y_TICKS + 1):
+        i = offset_y_tick(columns_per_mm) * k
+        w = 2 if k == 0 else 1
+        y.bar(i - w, i + w, MAGENTA, 52 if k % 4 else 44, 85)
+        if k % 8 == 0:
+            s = "%d" % (k,)
+            y.text(s, MAGENTA, i + 7 * row // 2, 35, row, 2, rotated=True)
+    return x, y
+
+
+def drawing_extent(drawing):
+    """(first column, last column, lowest position, highest position) of a drawing's dots, its priming included."""
+    cols = [i for i, c, p in drawing.dots] + list(drawing.raw)
+    positions = [p for i, c, p in drawing.dots] + ([PRIME['first'], PRIME['last']] if drawing.raw else [])
+    return min(cols), max(cols), min(positions), max(positions)
+
+
+def offset_ink_extent(dpi, nozzle_dpi):
+    """Where POLYDYE_OFFSET_PRINT's ink can land around the groove's centre, (x0, y0, x1, y1) mm, from its drawings at
+    `dpi`, with nozzle positions up to 10 % further apart than `nozzle_dpi` says (its photo estimate's spread)."""
+    pitch, widest = 25.4 / dpi, 25.4 / nozzle_dpi * 1.1
+    xs, ys = [], []
+    for d, across in zip(offset_drawings(dpi / 25.4), (0., OFFSET_Y_SCALE_X)):
+        c0, c1, p0, p1 = drawing_extent(d)
+        xs += [across - (p1 - OFFSET_REF_POSITION) * widest, across + (OFFSET_REF_POSITION - p0) * widest]
+        ys += [c0 * pitch, c1 * pitch]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def plaque_rects(x, y, slot=OFFSET_SLOT, size=OFFSET_PLAQUE, end=OFFSET_SLOT_END):
+    """A plaque layer's rectangles (x0, y0, x1, y1) around a cross-shaped groove centred on x, y, `slot` mm wide,
+    extending `size` mm (-X, +X, -Y, +Y). The grooves end `end` mm from the centre (+X, +Y): the plaque beyond holds the
+    numbers."""
+    h = slot / 2.
+    xs = ((x - size[0], x - h), (x + h, x + end[0]))
+    ys = ((y - size[2], y - h), (y + h, y + end[1]))
+    return ([(xa, ya, xb, yb) for ya, yb in ys for xa, xb in xs] +
+            [(x + end[0], y - size[2], x + size[1], y + end[1]), (x - size[0], y + end[1], x + size[1], y + size[3])])
+
+
+def plaque_gcode(layers, height, width, filament_area, first_width=None):
+    """G-code (absolute XYZ, relative E) for a PLA plaque: `layers` lists each layer's rectangles ((x0, y0, x1, y1) in
+    G-code coordinates), layers `height` mm. In each layer and rectangle a perimeter, then a zigzag fill, along Y in
+    even layers and along X in odd ones, slightly overlapping the perimeter. The first layer is `first_width` wide
+    (default `width`) and slower; the part fan comes on from the second layer. Starts with a prime line 3 mm left of
+    the plaque at the first layer's height; ends retracted with the fan off."""
+    first_width = first_width or width
+    out = []
+    pos = [None, None]
+
+    def travel(x, y, z):
+        out.extend(["G1 E-%.2f F2700" % (PLAQUE_RETRACT,), "G1 Z%.3f F600" % (z + 0.4,),
+                    "G1 X%.3f Y%.3f F%d" % (x, y, PLAQUE_TRAVEL_F), "G1 Z%.3f F600" % (z,),
+                    "G1 E%.2f F2700" % (PLAQUE_RETRACT,)])
+        pos[:] = [x, y]
+
+    def line(x, y, w, h, f):
+        d = math.hypot(x - pos[0], y - pos[1])
+        out.append("G1 X%.3f Y%.3f E%.5f F%d" % (x, y, d * w * h / filament_area, f))
+        pos[:] = [x, y]
+
+    every = [r for rects in layers for r in rects]
+    x_lo = min(r[0] for r in every)
+    y_lo, y_hi = min(r[1] for r in every), max(r[3] for r in every)
+    out.extend(["G1 Z%.3f F600" % (height + 0.4,), "G1 X%.3f Y%.3f F%d" % (x_lo - 3., y_lo, PLAQUE_TRAVEL_F),
+                "G1 Z%.3f F600" % (height,), "G1 E3 F300"])
+    pos[:] = [x_lo - 3., y_lo]
+    line(x_lo - 3., y_hi, 0.6, height, 1200)
+    for n, rects in enumerate(layers):
+        z = height * (n + 1)
+        w = first_width if n == 0 else width
+        f_per, f_fill = (1200, 1500) if n == 0 else (2400, 3000)
+        if n == 1:
+            out.append("M106 S255")
+        for x0, y0, x1, y1 in rects:
+            i = w / 2.
+            travel(x0 + i, y0 + i, z)
+            for x, y in ((x1 - i, y0 + i), (x1 - i, y1 - i), (x0 + i, y1 - i), (x0 + i, y0 + i)):
+                line(x, y, w, height, f_per)
+            i = 1.5 * w - 0.1
+            step = 0.95 * w
+            if n % 2 == 0:
+                if x1 - x0 < 2 * i:
+                    continue
+                xs = [x0 + i + m * step for m in range(int((x1 - x0 - 2 * i) / step) + 1)]
+                travel(xs[0], y0 + i, z)
+                for m, x in enumerate(xs):
+                    ya, yb = (y0 + i, y1 - i) if m % 2 == 0 else (y1 - i, y0 + i)
+                    if m:
+                        line(x, ya, w, height, f_fill)
+                    line(x, yb, w, height, f_fill)
+            else:
+                if y1 - y0 < 2 * i:
+                    continue
+                ys = [y0 + i + m * step for m in range(int((y1 - y0 - 2 * i) / step) + 1)]
+                travel(x0 + i, ys[0], z)
+                for m, y in enumerate(ys):
+                    xa, xb = (x0 + i, x1 - i) if m % 2 == 0 else (x1 - i, x0 + i)
+                    if m:
+                        line(xa, y, w, height, f_fill)
+                    line(xb, y, w, height, f_fill)
+    out.extend(["G1 E-2 F2700", "M106 S0"])
+    return out
+
+
+def cfg_number(v):
+    """A value as polydye.cfg gets it: at most 4 decimals, no trailing zeros (like the page's)."""
+    s = ("%.4f" % (v,)).rstrip('0').rstrip('.')
+    return '0' if s in ('-0', '') else s
+
+
+def cfg_section(lines):
+    """(first, end) line numbers of the [polydye] section's settings in polydye.cfg's `lines`, or None."""
+    start = next((n for n, l in enumerate(lines) if re.match(r'^\s*\[polydye\]\s*$', l)), None)
+    if start is None:
+        return None
+    return start + 1, next((n for n in range(start + 1, len(lines)) if re.match(r'^\s*\[', lines[n])), len(lines))
+
+
+def cfg_key_re(key):
+    """A setting's line, active or commented out: (indent, comment mark, value, trailing comment)."""
+    return re.compile(r'^(\s*)(#\s*)?%s\s*[:=]\s*([^#]*?)\s*(#.*)?$' % (re.escape(key),))
+
+
+def cfg_value(text, key):
+    """The value of an active setting in polydye.cfg's [polydye] section, or None."""
+    lines = text.split('\n')
+    section = cfg_section(lines)
+    for n in range(*(section or (0, 0))):
+        m = cfg_key_re(key).match(lines[n])
+        if m and not m.group(2):
+            return m.group(3)
+    return None
+
+
+def cfg_with(text, values):
+    """polydye.cfg `text` with these [polydye] settings (key -> string), like the page's Settings: an active setting is
+    replaced, else a commented-out example reused, else the setting added at the top of [polydye]; further active
+    copies are commented out (Klipper refuses an option set twice). Raises ValueError without a [polydye] section."""
+    lines = text.split('\n')
+    section = cfg_section(lines)
+    if section is None:
+        raise ValueError("polydye.cfg has no [polydye] section")
+    start, end = section
+    added = start  # new settings go at the top of the section, in order
+    for key, value in values.items():
+        rx = cfg_key_re(key)
+        hits = [(n, rx.match(lines[n])) for n in range(start, end)]
+        hits = [(n, m) for n, m in hits if m]
+        active = [(n, m) for n, m in hits if not m.group(2)]
+        target = (active or hits or [None])[0]
+        if target is None:
+            lines.insert(added, "%s: %s" % (key, value))
+            added += 1
+            end += 1
+            continue
+        n, m = target
+        lines[n] = "%s%s: %s%s" % (m.group(1), key, value, "  " + m.group(4) if m.group(4) else "")
+        for n, m in active[1:]:
+            lines[n] = "%s#%s: %s%s" % (m.group(1), key, m.group(3), "  " + m.group(4) if m.group(4) else "")
+    return '\n'.join(lines)
+
+
 class PolyDye:
     def __init__(self, config):
         self.printer = printer = config.get_printer()
@@ -643,6 +1056,15 @@ class PolyDye:
         self.offset_y = config.getfloat('offset_y')
         # Moves the ink of reverse (DIR=-1) passes along the pass axis, to line them up with forward passes.
         self.direction_trim = config.getfloat('direction_trim', 0.)
+        # Colour registration (REG_KEYS), from the alignment page (POLYDYE_ALIGN_PRINT, POLYDYE_ALIGN): applied to the
+        # passes the add-on draws.
+        self.registration = tuple(
+            config.getint(key, 0, minval=-limit, maxval=limit) for key, limit in
+            zip(REG_KEYS, (REG_MAX_COLUMNS, REG_MAX_POSITIONS, REG_MAX_COLUMNS, REG_MAX_POSITIONS)))
+        # Nozzles per inch across the pass: sizes POLYDYE_OFFSET_PRINT's X scale. Photos of the alignment page put the
+        # colour cartridge's at 300-330.
+        self.nozzle_dpi = config.getfloat('nozzle_dpi', 300., above=0.)
+        self.cfg_saves = 0  # times polydye.cfg was written (POLYDYE_SAVE, the reading commands), so the page re-reads it
         # Waveform template for the board to use; unset leaves the board's own (color_b_late, the stock firmware's).
         # Needs board firmware with polydye_set_template, and for color_b_late with polydye_set_clock.
         self.cartridge_template = config.get('cartridge_template', None)
@@ -697,6 +1119,7 @@ class PolyDye:
                                    % (position,))
         self.last_fire = None  # print time the head last fired (a live pass, spit test or warm-up); None: not yet
         self.print_live = False  # a print turned live ink on and hasn't been seen to end yet (_check_print_end())
+        self.live_off_pending = False  # a test's cleanup failed: live ink may be on (_check_print_end() retries)
         self.dpi = config.getfloat('dpi', 847., above=0.)
         self.pass_speed = config.getfloat('pass_speed', 59.5, above=0.)
         self.travel_speed = config.getfloat('travel_speed', 150., above=0.)
@@ -748,6 +1171,12 @@ class PolyDye:
         gcode.register_command('POLYDYE_WARM', self.cmd_POLYDYE_WARM, desc=self.cmd_POLYDYE_WARM_help)
         gcode.register_command('POLYDYE_CLOCK_TEST', self.cmd_POLYDYE_CLOCK_TEST,
                                desc=self.cmd_POLYDYE_CLOCK_TEST_help)
+        gcode.register_command('POLYDYE_ALIGN_PRINT', self.cmd_POLYDYE_ALIGN_PRINT,
+                               desc=self.cmd_POLYDYE_ALIGN_PRINT_help)
+        gcode.register_command('POLYDYE_ALIGN', self.cmd_POLYDYE_ALIGN, desc=self.cmd_POLYDYE_ALIGN_help)
+        gcode.register_command('POLYDYE_OFFSET_PRINT', self.cmd_POLYDYE_OFFSET_PRINT,
+                               desc=self.cmd_POLYDYE_OFFSET_PRINT_help)
+        gcode.register_command('POLYDYE_SAVE', self.cmd_POLYDYE_SAVE, desc=self.cmd_POLYDYE_SAVE_help)
 
     def _build_config(self):
         self.mcu.add_config_cmd("config_polydye oid=%d" % (self.oid,))
@@ -915,18 +1344,22 @@ class PolyDye:
         never runs its own POLYDYE_ENABLE LIVE=0, and live ink stayed on (2026-11-25). So once a print that turned live
         ink on (print_live, set by POLYDYE_ENABLE) is no longer running or paused, however it ended and however soon,
         the board drops its queued passes and stops any run (a warm-up's, a pass's), and live ink goes off; the boost
-        too unless the board keeps it on (boost_idle_s)."""
-        if not self.print_live or self.cancel_cmd is None or self._printing(eventtime):
+        too unless the board keeps it on (boost_idle_s). The same after a test whose cleanup failed (live_off_pending,
+        _restore_after_test()). Run by the status poll and before POLYDYE_ENABLE; until it works, it's tried again."""
+        ended = self.print_live and not self._printing(eventtime)
+        if not (ended or self.live_off_pending) or self.cancel_cmd is None:
             return
-        self.print_live = False
         print_stats = self.printer.lookup_object('print_stats', None)
         state = print_stats.get_status(eventtime).get('state') if print_stats is not None else None
         self.cancel_cmd.send([self.oid])
         self.mode_cmd.send([self.oid, 0 if self.boost_idle_s is None else 1, 0])
+        # Done only once both went out: if one fails, the next poll tries again.
+        self.print_live = self.live_off_pending = False
         self.last_fire = None  # the dropped passes never fired
         msg = "PolyDye: the print %s, so its queued passes were dropped and live ink is off" % (
             {'cancelled': "was cancelled", 'error': "stopped with an error",
-             'complete': "finished with live ink still on"}.get(state, "ended"),)
+             'complete': "finished with live ink still on"}.get(state, "ended"),) if ended else (
+            "PolyDye: live ink is off now (turning it off after the last test failed)")
         logging.info("polydye: %s", msg)
         self.printer.lookup_object('gcode').respond_info(msg)
 
@@ -1028,13 +1461,7 @@ class PolyDye:
             raise gcmd.error("POLYDYE_PASS: SPEED %.1f exceeds max_velocity %.1f"
                              % (speed, th_status['max_velocity']))
         pitch = 25.4 / self.dpi
-        length = (columns - 1) * pitch
-        run_up = speed * speed / (2. * accel) + speed * self._settle() + self.extra_run_up
-        # Klipper's minimum_cruise_ratio caps the peak speed of moves that don't cruise for that fraction of
-        # their length; make the pass long enough that it always reaches full speed.
-        mcr = th_status.get('minimum_cruise_ratio', 0.)
-        min_distance = speed * speed / (accel * (1. - mcr))
-        run_up = max(run_up, (min_distance - length) / 2. + 0.001)
+        run_up = self._run_up(speed, th_status, columns)
 
         # Bed coordinates of the ink -> toolhead coordinates of the hotend.
         start, first, end = pass_geometry(self.pass_axis, bed_x, bed_y, direction, columns, pitch, run_up,
@@ -1078,6 +1505,17 @@ class PolyDye:
                      "period %.4f ticks, t0 %.6f, run-up %.4f mm, toolhead first column %.3f,%.3f", layer, pass_num,
                      columns, self.pass_axis, t_first, clock_first, period_ticks + frac / 65536., t0, run_up,
                      first[0], first[1])
+
+    def _run_up(self, speed, th_status, columns):
+        """Run-up in mm before a pass of `columns` at `speed` (toolhead status `th_status`): accelerating, settling and
+        extra_run_up. Klipper's minimum_cruise_ratio caps the peak speed of moves that don't cruise for that fraction
+        of their length, so the pass is also made long enough to always reach full speed."""
+        accel = th_status['max_accel']
+        length = (columns - 1) * 25.4 / self.dpi
+        run_up = speed * speed / (2. * accel) + speed * self._settle() + self.extra_run_up
+        mcr = th_status.get('minimum_cruise_ratio', 0.)
+        min_distance = speed * speed / (accel * (1. - mcr))
+        return max(run_up, (min_distance - length) / 2. + 0.001)
 
     def _auto_warm(self, gcmd, cmd, start, direction, warm=None, words=None, period=None, prespit=None):
         """Before a pass whose run-up starts at toolhead `start` (going `direction` along pass_axis): warms the head
@@ -1269,10 +1707,9 @@ class PolyDye:
     def cmd_POLYDYE_ENABLE(self, gcmd):
         live = gcmd.get_int('LIVE', 1, minval=0, maxval=1)
         printing = self._printing(self.printer.get_reactor().monotonic())
-        if not printing:
-            # A print that turned live ink on has ended but the status poll hasn't cleaned up after it yet: do it now,
-            # so it can't come later and turn off what's enabled here (a fire test, say).
-            self._check_print_end(self.printer.get_reactor().monotonic())
+        # A print that turned live ink on has ended, or a test's cleanup failed, but the status poll hasn't turned live
+        # ink off yet: do it now, so it can't come later and turn off what's enabled here (a fire test, say).
+        self._check_print_end(self.printer.get_reactor().monotonic())
         boost_was_on = True
         if live:
             st = self._fresh_status()
@@ -1316,28 +1753,448 @@ class PolyDye:
         level = st.get('level')
         gcmd.respond_info(
             "PolyDye: boost=%d live=%d running=%d queued=%d passes=%d late_max=%.1fus faults=%d"
-            " stored_passes=%d store_free=%dkB\n%s\npass_axis=%s offset_x=%.3f offset_y=%.3f"
-            " direction_trim=%.3f dpi=%.0f pass_speed=%.1f%s"
+            " stored_passes=%d store_free=%dkB\n%s\npass_axis=%s %s dpi=%.0f pass_speed=%.1f%s"
             % (st['boost'], st['live'], st['running'], st['queued'], st['passes'], st['late_max_us'],
                st['faults'], st['store_count'], st['store_free'] // 1024, cartridge_text(st), self.pass_axis,
-               self.offset_x, self.offset_y, self.direction_trim, self.dpi, self.pass_speed,
+               self._offsets_text(), self.dpi, self.pass_speed,
                "\nsignal check: %s held %s, %d s left" % (level['line'], level['state'], level['remaining'])
                if level else ""))
 
-    def _respond_offsets(self, gcmd):
-        gcmd.respond_info("PolyDye: offset_x=%.3f offset_y=%.3f direction_trim=%.3f (until the next restart: Store "
-                          "on the PolyDye page or edit polydye.cfg to keep them)"
-                          % (self.offset_x, self.offset_y, self.direction_trim))
+    def _offsets_text(self):
+        return "offset_x=%.3f offset_y=%.3f direction_trim=%.3f %s" % (
+            self.offset_x, self.offset_y, self.direction_trim,
+            " ".join("%s=%d" % kv for kv in zip(REG_KEYS, self.registration)))
 
-    cmd_POLYDYE_OFFSET_help = "Set the cartridge offset (X, Y) and direction trim (TRIM) in mm from the next pass on"
+    def _respond_offsets(self, gcmd):
+        gcmd.respond_info("PolyDye: %s (until the next restart: POLYDYE_SAVE, Store on the PolyDye page, or edit "
+                          "polydye.cfg to keep them)" % (self._offsets_text(),))
+
+    def _x_tick_mm(self):
+        return OFFSET_X_TICK * 25.4 / self.nozzle_dpi
+
+    def _y_tick_mm(self):
+        return offset_y_tick(self.dpi / 25.4) * 25.4 / self.dpi
+
+    cmd_POLYDYE_OFFSET_help = ("Set the cartridge offset (X, Y) and direction trim (TRIM) in mm and the colour "
+                               "registration (CYAN_COLUMNS, CYAN_POSITIONS, YELLOW_COLUMNS, YELLOW_POSITIONS) from the "
+                               "next pass on, or move the ink by the offset print's readings (X_TICK, Y_TICK; stored in "
+                               "polydye.cfg unless SAVE=0)")
 
     def cmd_POLYDYE_OFFSET(self, gcmd):
+        cmd = "POLYDYE_OFFSET"
         # Parse everything before changing anything, so a bad value leaves the offsets alone.
+        x_tick = gcmd.get_float('X_TICK', None, minval=-OFFSET_X_TICKS - 1., maxval=OFFSET_X_TICKS + 1.)
+        y_tick = gcmd.get_float('Y_TICK', None, minval=-OFFSET_Y_TICKS - 1., maxval=OFFSET_Y_TICKS + 1.)
+        ticks = x_tick is not None or y_tick is not None
+        if ticks and self.pass_axis != 'y':
+            raise gcmd.error("%s: X_TICK and Y_TICK are POLYDYE_OFFSET_PRINT's readings, for pass_axis: y" % (cmd,))
+        for name, tick in (('X', x_tick), ('Y', y_tick)):
+            if tick is not None and gcmd.get(name, None) is not None:
+                raise gcmd.error("%s: give %s or %s_TICK, not both" % (cmd, name, name))
         x = gcmd.get_float('X', self.offset_x)
         y = gcmd.get_float('Y', self.offset_y)
         trim = gcmd.get_float('TRIM', self.direction_trim)
-        self.offset_x, self.offset_y, self.direction_trim = x, y, trim
-        self._respond_offsets(gcmd)
+        registration = tuple(
+            gcmd.get_int(key.upper(), now, minval=-limit, maxval=limit) for key, now, limit in
+            zip(REG_KEYS, self.registration, (REG_MAX_COLUMNS, REG_MAX_POSITIONS, REG_MAX_COLUMNS, REG_MAX_POSITIONS)))
+        save = gcmd.get_int('SAVE', 1 if ticks else 0, minval=0, maxval=1)
+        # The tick in the groove is where the ink landed against where it should be: move it back by that many ticks.
+        dx, dy = (x_tick or 0.) * self._x_tick_mm(), (y_tick or 0.) * self._y_tick_mm()
+        x, y, trim = nudge_offsets(x, y, trim, dx, dy, 0.)
+        # Stored first: if polydye.cfg can't be written nothing changes, so the readings can simply be entered again.
+        if save:
+            self._save(gcmd, cmd, (x, y, trim, registration))
+        self.offset_x, self.offset_y, self.direction_trim, self.registration = x, y, trim, registration
+        if ticks:
+            gcmd.respond_info("PolyDye: ink moved %+.3f mm in X (%+g ticks) and %+.3f mm in Y (%+g ticks)"
+                              % (dx, x_tick or 0., dy, y_tick or 0.))
+        if not save:
+            self._respond_offsets(gcmd)
+
+    cmd_POLYDYE_ALIGN_help = ("Enter the alignment page's readings (the block number where each row lines up: CYAN, "
+                              "YELLOW, DIRECTION, CYAN_X, YELLOW_X) to correct the colour registration and the "
+                              "direction trim; stored in polydye.cfg unless SAVE=0")
+
+    def cmd_POLYDYE_ALIGN(self, gcmd):
+        cmd = "POLYDYE_ALIGN"
+        limit = ALIGN_K + 0.5
+        read = dict((name, gcmd.get_float(name, None, minval=-limit, maxval=limit))
+                    for name in ('CYAN', 'YELLOW', 'DIRECTION', 'CYAN_X', 'YELLOW_X'))
+        if all(v is None for v in read.values()):
+            raise gcmd.error("%s: give the alignment page's readings, the block number where each row's marks line "
+                             "up: CYAN= YELLOW= (rows C, Y), DIRECTION= (row D), CYAN_X= YELLOW_X= (rows CX, YX)"
+                             % (cmd,))
+        save = gcmd.get_int('SAVE', 1, minval=0, maxval=1)
+        registration = list(self.registration)
+        for n, name, step in ((0, 'CYAN', 3), (1, 'CYAN_X', 1), (2, 'YELLOW', 3), (3, 'YELLOW_X', 1)):
+            if read[name] is not None:
+                registration[n] += int(round(step * read[name]))
+        for key, v, most in zip(REG_KEYS, registration,
+                                (REG_MAX_COLUMNS, REG_MAX_POSITIONS, REG_MAX_COLUMNS, REG_MAX_POSITIONS)):
+            if abs(v) > most:
+                raise gcmd.error("%s: %s would be %d, beyond +-%d; check the reading" % (cmd, key, v, most))
+        trim = self.direction_trim
+        if read['DIRECTION'] is not None:
+            trim = round(trim + 2. * read['DIRECTION'] * 25.4 / self.dpi, 4)
+        # Stored first: if polydye.cfg can't be written nothing changes, so the readings can simply be entered again.
+        if save:
+            self._save(gcmd, cmd, (self.offset_x, self.offset_y, trim, tuple(registration)))
+        self.registration, self.direction_trim = tuple(registration), trim
+        if not save:
+            self._respond_offsets(gcmd)
+
+    cmd_POLYDYE_SAVE_help = ("Store the live cartridge offsets, direction trim and colour registration in polydye.cfg "
+                             "(next to printer.cfg)")
+
+    def cmd_POLYDYE_SAVE(self, gcmd):
+        self._save(gcmd, "POLYDYE_SAVE", (self.offset_x, self.offset_y, self.direction_trim, self.registration))
+
+    def _save(self, gcmd, cmd, values):
+        """Writes `values` (offset_x, offset_y, direction_trim, colour registration) to the [polydye] section of
+        polydye.cfg (cfg_with()), safely: a new file, synced, then renamed over the old one. The registration goes in
+        once it isn't zero or polydye.cfg already has it. Raises if it can't."""
+        offset_x, offset_y, trim, registration = values
+        config_file = self.printer.get_start_args().get('config_file')
+        if not config_file:
+            raise gcmd.error("%s: Klipper didn't say where its configuration is" % (cmd,))
+        path = os.path.realpath(os.path.join(os.path.dirname(config_file), 'polydye.cfg'))
+        values = {'offset_x': cfg_number(offset_x), 'offset_y': cfg_number(offset_y),
+                  'direction_trim': cfg_number(trim)}
+        tmp = path + '.polydye-tmp'
+        try:
+            with open(path) as f:
+                text = f.read()
+            for key, v in zip(REG_KEYS, registration):
+                if v or cfg_value(text, key) is not None:
+                    values[key] = "%d" % (v,)
+            updated = cfg_with(text, values)
+            with open(tmp, 'w') as f:
+                f.write(updated)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+            os.replace(tmp, path)
+        except (OSError, ValueError) as e:
+            raise gcmd.error("%s: couldn't store the values in %s: %s" % (cmd, path, e))
+        os.sync()  # a Raspberry Pi 3 has lost files written just before it froze
+        self.cfg_saves += 1
+        gcmd.respond_info("PolyDye: stored in %s: %s" % (path, ", ".join("%s %s" % kv for kv in values.items())))
+
+    # ---- calibration prints ------------------------------------------------------------------------------------------
+
+    def _data_request(self, ftype, payload=b"", rate=None):
+        """A data port request (data_port_request()) in a thread while Klipper's reactor keeps running: a big pass
+        takes seconds to go up, longer than heaters and MCUs can wait."""
+        self.data_seq = (self.data_seq + 1) & 0xff
+        seq, result = self.data_seq, {}
+
+        def work():
+            try:
+                result['reply'] = data_port_request(self.data_port, seq, ftype, payload, rate=rate)
+            except Exception as e:
+                result['error'] = e
+        worker = threading.Thread(target=work, name="polydye-data")
+        worker.daemon = True
+        worker.start()
+        reactor = self.printer.get_reactor()
+        while worker.is_alive():
+            reactor.pause(reactor.monotonic() + 0.05)
+        if 'error' in result:
+            raise result['error']
+        return result['reply']
+
+    def _upload_cal(self, gcmd, cmd, passes):
+        """Stores each (data, columns) of `passes` on the board as layer CAL_LAYER, passes 0, 1, ..., for the colour
+        cartridge."""
+        gcmd.respond_info("PolyDye: sending %d passes to the board (%d kB)..."
+                          % (len(passes), sum(len(data) for data, _ in passes) // 1024))
+        try:
+            hello = self._data_request(DATA_HELLO)
+            if hello.get('cart') == 'black':
+                raise ValueError("the board is set for a black cartridge; the calibration prints are for the colour "
+                                 "cartridge")
+            for n, (data, columns) in enumerate(passes):
+                self._data_request(DATA_PUT, struct.pack("<HHBBH", CAL_LAYER, n, 0, 0, columns) + data,
+                                   CAL_UPLOAD_RATE)
+        except (DataPortError, OSError, ValueError) as e:
+            raise gcmd.error("%s: %s" % (cmd, e))
+
+    def _cal_start(self, gcmd, cmd, axes):
+        """Checks before a calibration print, before anything moves: board firmware and data port, not during a print,
+        `axes` homed, and the board idle at a pulse within the limit with a colour template. Returns its status."""
+        if self.query_cartridge_cmd is None:
+            raise gcmd.error("%s: the PolyDye board firmware is too old; update it from the PolyDye page (Board "
+                             "firmware)" % (cmd,))
+        if not self.data_port:
+            raise gcmd.error("%s: set data_port in [polydye]" % (cmd,))
+        self._check_not_printing(gcmd, cmd)
+        toolhead = self.printer.lookup_object('toolhead')
+        homed = toolhead.get_status(self.printer.get_reactor().monotonic())['homed_axes']
+        missing = [a for a in axes if a not in homed]
+        if missing:
+            raise gcmd.error("%s: home %s first (G28)" % (cmd, "".join(missing).upper()))
+        toolhead.wait_moves()
+        st = self._fresh_status()
+        if st['running'] or st['queued']:
+            raise gcmd.error("%s: wait for queued passes to finish" % (cmd,))
+        self._check_current_pulse(gcmd, cmd, st)
+        if (st.get('cartridge_template') or '').startswith('black'):
+            raise gcmd.error("%s: is for the colour cartridge, but the board is set to %s (POLYDYE_CARTRIDGE "
+                             "TEMPLATE=color_b_late)" % (cmd, st['cartridge_template']))
+        return st
+
+    def _ink_centre(self, axis):
+        """The middle of where the cartridge can put ink along `axis` (0: X, 1: Y) within that axis's own range (the
+        bed), in bed coordinates: where a calibration print goes by default."""
+        th = self.printer.lookup_object('toolhead').get_status(self.printer.get_reactor().monotonic())
+        lo = (th['axis_minimum'].x, th['axis_minimum'].y)[axis]
+        hi = (th['axis_maximum'].x, th['axis_maximum'].y)[axis]
+        off = (self.offset_x, self.offset_y)[axis]
+        return (max(lo, lo + off) + min(hi, hi + off)) / 2.
+
+    def _cal_sponge(self, gcmd, cmd):
+        """Where a calibration print warms the head: (X, Z hop) of the wipe sponge from POLYDYE_WIPE, or None when it
+        doesn't warm (the automatic warm-up off, or board firmware without it). Refuses, before anything moves, without
+        the macro or with its X beyond the X axis."""
+        if not (self.warm_seconds and self.spit_run_cmd is not None and self.warm_duty_ppm is not None):
+            return None
+        macro = self.printer.lookup_object('gcode_macro POLYDYE_WIPE', None)
+        variables = getattr(macro, 'variables', {}) if macro is not None else {}
+        if 'x' not in variables:
+            raise gcmd.error("%s: the head warms over the wipe sponge, but there's no POLYDYE_WIPE macro to say where "
+                             "it is: include polydye_macros.cfg" % (cmd,))
+        x = float(variables['x'])
+        th = self.printer.lookup_object('toolhead').get_status(self.printer.get_reactor().monotonic())
+        base = self.printer.lookup_object('gcode_move').base_position
+        # Below the axis maximum, like POLYDYE_WIPE: that is the hard stop.
+        if not th['axis_minimum'].x <= x + base[0] < th['axis_maximum'].x:
+            raise gcmd.error("%s: the wipe sponge's X (POLYDYE_WIPE, %.1f) must be within the X axis, below its "
+                             "maximum" % (cmd, x))
+        return x, float(variables.get('z_hop', 1.))
+
+    def _check_reach(self, gcmd, cmd, prints, columns):
+        """Refuses, before anything moves, passes of `prints` ((pass, X, Y, direction)) that would take the toolhead
+        beyond the axis limits; columns[pass] is each pass's length."""
+        th = self.printer.lookup_object('toolhead').get_status(self.printer.get_reactor().monotonic())
+        base = self.printer.lookup_object('gcode_move').base_position
+        lo, hi = th['axis_minimum'], th['axis_maximum']
+        pitch = 25.4 / self.dpi
+        for n, x, y, direction in prints:
+            run_up = self._run_up(self.pass_speed, th, columns[n])
+            start, _, end = pass_geometry(self.pass_axis, x, y, direction, columns[n], pitch, run_up,
+                                          (self.offset_x, self.offset_y), base, self.direction_trim)
+            for px, py in (start, end):
+                if not (lo.x <= px <= hi.x and lo.y <= py <= hi.y):
+                    raise gcmd.error("%s: the pass at X=%.1f Y=%.1f would take the toolhead to X=%.1f Y=%.1f, beyond "
+                                     "the axis limits; choose another X, Y" % (cmd, x, y, px, py))
+
+    def _run_cal(self, gcmd, cmd, st, prints, sponge, setup=None, z=None):
+        """Prints `prints` ((pass, X, Y, direction) of layer CAL_LAYER) with live ink, after the G-code `setup` (the
+        plaque), a move to `z` and, with `sponge` (_cal_sponge()), a head warm-up with the automatic warm-up's settings
+        over the wipe sponge: up by its Z hop (within the Z axis), across, warm, back over the first pass at that
+        height and down. The passes don't warm again. Afterwards, also after an error, live ink goes off
+        (_restore_after_test()) and the G-code state back, and after a plaque the hotend and the part fan are off."""
+        toolhead = self.printer.lookup_object('toolhead')
+        run = self.printer.lookup_object('gcode').run_script_from_command
+        before = (st['cartridge_template'], st['pulse_words'])
+        run("SAVE_GCODE_STATE NAME=polydye_cal")
+        try:
+            if setup:
+                run(setup)
+            if z is not None:
+                run("G90\nG1 Z%.3f F900" % (z,))
+            if sponge is not None:
+                eventtime = self.printer.get_reactor().monotonic()
+                gm = self.printer.lookup_object('gcode_move').get_status(eventtime)
+                here = gm['gcode_position'].z
+                top = toolhead.get_status(eventtime)['axis_maximum'].z - (gm['position'].z - here)
+                up = max(here, min(here + sponge[1], top))
+                run("G90\nG1 Z%.3f F900\nG1 X%.3f F%d" % (up, sponge[0], self.travel_speed * 60))
+                run("POLYDYE_WARM SECONDS=%g WARM_PULSE=%d WARM_PERIOD_US=%d CONFIRM=1"
+                    % (min(self.warm_seconds, self.warm_max_s), self.warm_pulse, self.warm_period_us))
+                n, x, y, direction = prints[0]
+                run("G1 X%.3f Y%.3f F%d\nG1 Z%.3f F900" % (x - self.offset_x, y - self.offset_y,
+                                                           self.travel_speed * 60, here))
+            run("POLYDYE_ENABLE LIVE=1")
+            for i, (n, x, y, direction) in enumerate(prints):
+                if i and i % 4 == 0:
+                    toolhead.wait_moves()  # the board queues at most 8 passes
+                run("POLYDYE_PASS LAYER=%d PASS=%d X=%.3f Y=%.3f DIR=%d WARM=0" % (CAL_LAYER, n, x, y, direction))
+        finally:
+            if setup and not self.printer.is_shutdown():
+                try:
+                    run("M104 S0\nM106 S0")
+                except Exception:
+                    logging.exception("polydye: %s couldn't turn the hotend and the part fan off", cmd)
+            self._restore_after_test(before)
+            if not self.printer.is_shutdown():
+                try:
+                    run("RESTORE_GCODE_STATE NAME=polydye_cal")
+                except Exception:
+                    logging.exception("polydye: %s couldn't restore the G-code state", cmd)
+
+    cmd_POLYDYE_ALIGN_PRINT_help = ("LIVE INK, on paper only (taped over the glass, the page and a margin): the "
+                                    "alignment page, vernier rows for the colour registration along (C, Y) and across "
+                                    "(CX, YX) the pass and the direction trim (D), SPACING mm apart from X, Y, at Z if "
+                                    "given; enter the block number where each row lines up with POLYDYE_ALIGN")
+
+    def cmd_POLYDYE_ALIGN_PRINT(self, gcmd):
+        cmd = "POLYDYE_ALIGN_PRINT"
+        spacing = gcmd.get_float('SPACING', ALIGN_SPACING, minval=5.)
+        z = gcmd.get_float('Z', None, minval=0.2)
+        pitch = 25.4 / self.dpi
+        a = 0 if self.pass_axis == 'x' else 1  # the pass axis
+        along = self._ink_centre(a) - ALIGN_COLUMNS * pitch / 2.
+        across = self._ink_centre(1 - a) - (len(ALIGN_ROWS) - 1) * spacing / 2.
+        x = gcmd.get_float('X', along if a == 0 else across)
+        y = gcmd.get_float('Y', across if a == 0 else along)
+        st = self._cal_start(gcmd, cmd, 'xyz' if z is not None else 'xy')
+        drawings = align_drawings()
+        built = [pass_data(d, direction, self.registration) for _, d, direction in drawings]
+        index = dict((row, n) for n, (row, _, _) in reversed(list(enumerate(drawings))))
+        start, side = (y, x) if a == 1 else (x, y)
+        prints = []
+        for r, row in enumerate(ALIGN_ROWS):
+            for name in (('D', 'D-') if row == 'D' else (row,)):
+                n = index[name]
+                first = start + built[n][2] * pitch
+                cross = side + r * spacing
+                prints.append((n, cross, first, drawings[n][2]) if a == 1 else (n, first, cross, drawings[n][2]))
+        paper = self._align_paper(gcmd, cmd, drawings, built, start, side, spacing)
+        sponge = self._cal_sponge(gcmd, cmd)
+        self._check_reach(gcmd, cmd, prints, [b[1] for b in built])
+        self._upload_cal(gcmd, cmd, [(b[0], b[1]) for b in built])
+        gcmd.respond_info("PolyDye alignment page, live ink on paper: %d rows %.0f mm apart from X=%.1f Y=%.1f. Its "
+                          "ink spans %s: the paper must cover that with %g mm to spare, at least %.0f x %.0f mm"
+                          % (len(ALIGN_ROWS), spacing, x, y, paper, ALIGN_PAPER_MARGIN, ALIGN_PAPER[0],
+                             ALIGN_PAPER[1]))
+        self._run_cal(gcmd, cmd, st, prints, sponge, z=z)
+        gcmd.respond_info(
+            "PolyDye alignment page done. In each row find the block where its marks line up best (C, Y: the colour "
+            "bar on the magenta one; D: the two magenta bars; CX, YX: the two lines make one) and read its number "
+            "off the label rows; halfway between two blocks reads as e.g. -11.5. Then\n"
+            "  POLYDYE_ALIGN CYAN=<C> YELLOW=<Y> DIRECTION=<D> CYAN_X=<CX> YELLOW_X=<YX>\n"
+            "corrects and stores them; print the page again to check that every row reads 0.")
+
+    def _align_paper(self, gcmd, cmd, drawings, built, start, side, spacing):
+        """The bed area the alignment page's ink can cover (all rows, the nozzle row at 10 % more than nozzle_dpi, the
+        priming blocks, the reverse pass moved by direction_trim), as text, where it is on the bed (with the G-code
+        offset, as pass_geometry() puts it); refuses, before anything moves, settings that need more paper than
+        ALIGN_PAPER with ALIGN_PAPER_MARGIN all round."""
+        pitch, wide = 25.4 / self.dpi, 25.4 / self.nozzle_dpi * 1.1
+        ends = [(b[2] * pitch, (b[2] + b[1] - 1) * pitch) if d[2] > 0 else
+                ((b[2] - b[1] + 1) * pitch + self.direction_trim, b[2] * pitch + self.direction_trim)
+                for b, d in zip(built, drawings)]
+        along = (start + min(e[0] for e in ends), start + max(e[1] for e in ends))
+        extents = [drawing_extent(d) for _, d, _ in drawings]
+        half = max(max(e[3] for e in extents) - OFFSET_REF_POSITION,
+                   OFFSET_REF_POSITION - min(e[2] for e in extents)) * wide
+        across = (side - half, side + (len(ALIGN_ROWS) - 1) * spacing + half)
+        need = (across[1] - across[0] + 2 * ALIGN_PAPER_MARGIN, along[1] - along[0] + 2 * ALIGN_PAPER_MARGIN)
+        if need[0] > ALIGN_PAPER[0] or need[1] > ALIGN_PAPER[1]:
+            raise gcmd.error("%s: at SPACING %g and dpi %g the page would need %.0f x %.0f mm of paper (with %g mm "
+                             "margins), more than the %.0f x %.0f mm it asks for: use a smaller SPACING, or the "
+                             "default dpi" % (cmd, spacing, self.dpi, need[0], need[1], ALIGN_PAPER_MARGIN,
+                                              ALIGN_PAPER[0], ALIGN_PAPER[1]))
+        base = self.printer.lookup_object('gcode_move').base_position
+        x, y = (across, along) if self.pass_axis == 'y' else (along, across)
+        return "X %.0f-%.0f, Y %.0f-%.0f" % (x[0] + base[0], x[1] + base[0], y[0] + base[1], y[1] + base[1])
+
+    cmd_POLYDYE_OFFSET_PRINT_help = ("PLA and LIVE INK: a PLA plaque with a cross-shaped groove centred on X, Y "
+                                     "(LAYERS of LAYER_HEIGHT, the groove in the top 3; heats to EXTRUDER_TEMP and "
+                                     "BED_TEMP if given, else needs the hotend's target set; the hotend is off "
+                                     "afterwards), then ink scales across the groove from GAP mm above the plaque; "
+                                     "enter the tick in the groove on each scale with POLYDYE_OFFSET X_TICK= Y_TICK=. "
+                                     "PLAQUE=0: only the ink, onto a plaque printed before (at its top plus GAP, or Z)")
+
+    def cmd_POLYDYE_OFFSET_PRINT(self, gcmd):
+        cmd = "POLYDYE_OFFSET_PRINT"
+        if self.pass_axis != 'y':
+            raise gcmd.error("%s: needs pass_axis: y (its X scale is drawn along the nozzle row, across X)" % (cmd,))
+        plaque = gcmd.get_int('PLAQUE', 1, minval=0, maxval=1)
+        layers = gcmd.get_int('LAYERS', OFFSET_LAYERS, minval=OFFSET_GROOVE_LAYERS + 1, maxval=12)
+        height = gcmd.get_float('LAYER_HEIGHT', OFFSET_LAYER_HEIGHT, minval=0.05, maxval=0.6)
+        gap = gcmd.get_float('GAP', OFFSET_GAP, minval=0.2, maxval=5.)
+        # With the plaque the ink goes GAP above its top: a lower Z would drive the hotend into it.
+        if plaque and gcmd.get('Z', None) is not None:
+            raise gcmd.error("%s: Z goes with PLAQUE=0; with the plaque, GAP sets the height above it" % (cmd,))
+        # PLAQUE=0 inks a plaque printed before (or paper, with Z): by default its top plus GAP, like with the plaque.
+        z = gcmd.get_float('Z', layers * height + gap, minval=0.2)
+        # Every drop on the plaque, OFFSET_MARGIN mm inside its edges, at this dpi and nozzle_dpi.
+        ink = offset_ink_extent(self.dpi, self.nozzle_dpi)
+        size = OFFSET_PLAQUE
+        if not (-size[0] + OFFSET_MARGIN <= ink[0] and ink[2] <= size[1] - OFFSET_MARGIN and
+                -size[2] + OFFSET_MARGIN <= ink[1] and ink[3] <= size[3] - OFFSET_MARGIN):
+            raise gcmd.error("%s: at dpi %g and nozzle_dpi %g the scales would reach X %.1f to %.1f, Y %.1f to %.1f mm "
+                             "around the groove, beyond the plaque less its %g mm margin (X %.1f to %.1f, Y %.1f to "
+                             "%.1f): the print is laid out for dpi 847 and nozzle_dpi about 300"
+                             % (cmd, self.dpi, self.nozzle_dpi, ink[0], ink[2], ink[1], ink[3], OFFSET_MARGIN,
+                                -size[0] + OFFSET_MARGIN, size[1] - OFFSET_MARGIN, -size[2] + OFFSET_MARGIN,
+                                size[3] - OFFSET_MARGIN))
+        e_temp = gcmd.get_float('EXTRUDER_TEMP', None, minval=0.)
+        b_temp = gcmd.get_float('BED_TEMP', None, minval=0.)
+        # The plaque spans the groove's centre -OFFSET_PLAQUE[0]..+OFFSET_PLAQUE[1] in X, and so on: centred by default.
+        x = gcmd.get_float('X', self._ink_centre(0) - (OFFSET_PLAQUE[1] - OFFSET_PLAQUE[0]) / 2.)
+        y = gcmd.get_float('Y', self._ink_centre(1) + (OFFSET_PLAQUE[2] - OFFSET_PLAQUE[3]) / 2.)
+        setup = None
+        if plaque:
+            setup = self._plaque_setup(gcmd, cmd, x, y, layers, height, e_temp, b_temp, z)
+        st = self._cal_start(gcmd, cmd, 'xyz')
+        pitch = 25.4 / self.dpi
+        built = [pass_data(d, 1, self.registration) for d in offset_drawings(self.dpi / 25.4)]
+        prints = [(0, x, y + built[0][2] * pitch, 1), (1, x + OFFSET_Y_SCALE_X, y + built[1][2] * pitch, 1)]
+        sponge = self._cal_sponge(gcmd, cmd)
+        self._check_reach(gcmd, cmd, prints, [b[1] for b in built])
+        self._upload_cal(gcmd, cmd, [(b[0], b[1]) for b in built])
+        gcmd.respond_info("PolyDye offset print: %sink scales across the groove at X=%.1f Y=%.1f, Z=%.2f"
+                          % ("a %d-layer PLA plaque, then " % (layers,) if plaque else "", x, y, z))
+        self._run_cal(gcmd, cmd, st, prints, sponge, setup=setup, z=z)
+        gcmd.respond_info(
+            "PolyDye offset print done. On each scale find the tick in the middle of the groove: the X scale's lines "
+            "run along Y, %.3f mm apart; the Y scale's run along X, %.3f mm apart. Tick 0 is the longest, every 4th "
+            "is long and every 8th numbered; count from the nearest number (between two ticks reads as e.g. 2.5). "
+            "Then\n  POLYDYE_OFFSET X_TICK=<X scale> Y_TICK=<Y scale>\nmoves the ink there and stores offset_x and "
+            "offset_y; print again to check that both read 0." % (self._x_tick_mm(), self._y_tick_mm()))
+
+    def _plaque_setup(self, gcmd, cmd, x, y, layers, height, e_temp, b_temp, z):
+        """The G-code for POLYDYE_OFFSET_PRINT's plaque around the groove centred on x, y: heating (to e_temp and
+        b_temp if given, else to the hotend's current target, which must be enough to extrude), the plaque
+        (plaque_gcode(): solid layers, then OFFSET_GROOVE_LAYERS with the groove) and then up to `z` with the hotend
+        off, so it doesn't ooze onto the plaque while the ink goes on."""
+        eventtime = self.printer.get_reactor().monotonic()
+        extruder = self.printer.lookup_object('extruder', None)
+        settings = self.printer.lookup_object('configfile').get_status(eventtime)['settings'].get('extruder')
+        if extruder is None or settings is None:
+            raise gcmd.error("%s: there's no [extruder] for the plaque (PLAQUE=0 prints only the ink)" % (cmd,))
+        temp = e_temp if e_temp is not None else extruder.get_status(eventtime)['target']
+        if temp < float(settings.get('min_extrude_temp', 170.)):
+            raise gcmd.error("%s: heat the hotend for PLA first (e.g. M104 S210) or give EXTRUDER_TEMP" % (cmd,))
+        filament_area = math.pi * (float(settings.get('filament_diameter', 1.75)) / 2.) ** 2
+        nozzle = float(settings.get('nozzle_diameter', 0.4))
+        size = OFFSET_PLAQUE
+        solid = [(x - size[0], y - size[2], x + size[1], y + size[3])]
+        plaque = [solid] * (layers - OFFSET_GROOVE_LAYERS) + [plaque_rects(x, y)] * OFFSET_GROOVE_LAYERS
+        th = self.printer.lookup_object('toolhead').get_status(eventtime)
+        base = self.printer.lookup_object('gcode_move').base_position
+        lo, hi = th['axis_minimum'], th['axis_maximum']
+        x_lo, x_hi = solid[0][0] - 3. + base[0], solid[0][2] + base[0]
+        y_lo, y_hi = solid[0][1] + base[1], solid[0][3] + base[1]
+        if x_lo < lo.x or x_hi > hi.x or y_lo < lo.y or y_hi > hi.y:
+            raise gcmd.error("%s: the plaque (X %.1f-%.1f, Y %.1f-%.1f with its prime line) doesn't fit within the "
+                             "axis limits; choose another X, Y" % (cmd, x_lo, x_hi, y_lo, y_hi))
+        lines = []
+        if b_temp is not None:
+            lines.append("M140 S%.0f" % (b_temp,))
+        if e_temp is not None:
+            lines.append("M104 S%.0f" % (e_temp,))
+        if b_temp is not None:
+            lines.append("M190 S%.0f" % (b_temp,))
+        # The plaque's extrusion and speeds assume 100 %: an earlier M221/M220 would thin it out or leave no plaque
+        # under the ink. RESTORE_GCODE_STATE puts the factors back afterwards.
+        lines += ["M109 S%.0f" % (temp,), "G90", "M83", "M220 S100", "M221 S100"]
+        lines += plaque_gcode(plaque, height, nozzle * 1.125, filament_area, nozzle * 1.25)
+        lines += ["G1 Z%.3f F600" % (z,), "M104 S0"]
+        return "\n".join(lines)
 
     cmd_POLYDYE_NUDGE_help = ("Move where the ink lands by X, Y mm on the bed, and reverse passes by TRIM mm along the"
                               " pass axis, from the next pass on")
@@ -1908,10 +2765,12 @@ class PolyDye:
             self._send_cartridge(self._live_off(), before[0], before[1])
             self._query_status()
         except Exception:
-            logging.exception("polydye: fire test cleanup failed")
+            # Live ink may still be on: the status poll keeps trying to turn it off (_check_print_end()).
+            self.live_off_pending = True
+            logging.exception("polydye: test cleanup failed; live ink goes off at the next status poll")
 
     def get_status(self, eventtime):
-        return dict(self.last_status, last_pass=self.last_pass, pass_axis=self.pass_axis, offset_x=self.offset_x,
+        status = dict(self.last_status, last_pass=self.last_pass, pass_axis=self.pass_axis, offset_x=self.offset_x,
                     offset_y=self.offset_y, direction_trim=self.direction_trim, spit_patterns=list(self.spit_patterns),
                     spit_random=self.spit_random_cmd is not None, warm_max_us=self.warm_max_us,
                     warm_max_s=self.warm_max_s, warm_duty_ppm=self.warm_duty_ppm, templates=list(self.templates),
@@ -1923,7 +2782,10 @@ class PolyDye:
                                else list(self.warm_position), 'clearance': self.warm_clearance,
                                'prespit': self.warm_prespit},
                     head_idle_s=None if self.last_fire is None else
-                    round(max(0., self.mcu.estimated_print_time(eventtime) - self.last_fire), 1))
+                    round(max(0., self.mcu.estimated_print_time(eventtime) - self.last_fire), 1),
+                    nozzle_dpi=self.nozzle_dpi, cfg_saves=self.cfg_saves)
+        status.update(zip(REG_KEYS, self.registration))
+        return status
 
 
 def load_config(config):

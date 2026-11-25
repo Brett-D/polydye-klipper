@@ -29,12 +29,15 @@ function rpc(method, params = {}) {
   });
 }
 
+// Runs a script, logging it and any error; returns whether it went through.
 async function gcode(script) {
   log(`> ${script}`);
   try {
     await rpc('printer.gcode.script', { script });
+    return true;
   } catch (e) {
     log(`! ${e.message}`);
+    return false;
   }
 }
 
@@ -336,6 +339,9 @@ $('fw-file').addEventListener('change', async (ev) => {
 const FIELDS = ['pass_axis', 'offset_x', 'offset_y', 'direction_trim', 'cartridge_template', 'pulse_words', 'dpi',
   'pass_speed'];
 const NUDGED = ['offset_x', 'offset_y', 'direction_trim'];
+// The colour registration (POLYDYE_ALIGN), whole columns and positions; POLYDYE_SAVE stores it with the offsets.
+const REG_KEYS = ['cyan_columns', 'cyan_positions', 'yellow_columns', 'yellow_positions'];
+let cfgSaves;  // printer.polydye.cfg_saves last seen: Klipper wrote polydye.cfg when it changes
 let cfgText = '';
 
 function sectionRange(lines) {
@@ -522,6 +528,42 @@ function renderNudges(pd) {
     const unsaved = cfgText !== '' && (stored === null || Math.abs(live - stored) > 1e-6);
     text(id, `${live.toFixed(3)} mm${unsaved ? ' (not stored)' : ''}`, unsaved ? 'on' : '');
   }
+  for (const [id, keys] of [['n-cyan', REG_KEYS.slice(0, 2)], ['n-yellow', REG_KEYS.slice(2)]]) {
+    const live = keys.map((k) => (state.board ? pd[k] : undefined));
+    if (live.some((v) => typeof v !== 'number')) {
+      text(id, '–');
+      continue;
+    }
+    const unsaved = cfgText !== '' && keys.some((k, i) => storedReg(k) !== live[i]);
+    const signed = (v) => (v > 0 ? `+${v}` : `${v}`);
+    text(id, `${signed(live[0])} columns, ${signed(live[1])} positions${unsaved ? ' (not stored)' : ''}`,
+      unsaved ? 'on' : '');
+  }
+  // POLYDYE_SAVE, POLYDYE_ALIGN or POLYDYE_OFFSET X_TICK= wrote polydye.cfg: show what it holds now.
+  if (pd.cfg_saves !== undefined && pd.cfg_saves !== cfgSaves) {
+    const first = cfgSaves === undefined;
+    cfgSaves = pd.cfg_saves;
+    if (!first) queueCfg(refreshStored).catch((e) => log(`! could not read polydye.cfg: ${e.message}`));
+  }
+}
+
+// A colour registration value as polydye.cfg has it (unset: 0), or null if it isn't a whole number.
+function storedReg(key, textIn = cfgText) {
+  const raw = cfgValue(textIn, key);
+  if (raw === null) return 0;
+  return /^-?\d+$/.test(raw.trim()) ? parseInt(raw, 10) : null;
+}
+
+// Re-reads polydye.cfg after Klipper stored values in it, and shows them in the Settings fields they belong to (only
+// those: other fields may hold edits not saved yet).
+async function refreshStored() {
+  await fetchCfg();
+  const form = $('settings');
+  for (const key of NUDGED) {
+    const v = cfgValue(cfgText, key);
+    if (v !== null) form.elements[key].value = v;
+  }
+  render();
 }
 
 document.querySelectorAll('#nudge-steps button').forEach((b) => {
@@ -542,22 +584,11 @@ $('nudge-store').addEventListener('click', async () => {
   const nudgesBefore = nudgeChain;
   try {
     await queueCfg(async () => {
-      // Ask Klipper after those nudges have run: the status subscription may not have caught up yet.
+      // After those nudges have run; Klipper writes what it uses (offsets, trim, colour registration).
       await nudgesBefore;
-      const r = await rpc('printer.objects.query', { objects: { polydye: NUDGED } });
-      const pd = (r && r.status && r.status.polydye) || {};
-      if (NUDGED.some((k) => typeof pd[k] !== 'number')) throw new Error('Klipper did not report the offsets');
-      // Re-read first: the file may have been edited elsewhere since the page loaded.
-      const current = await fetchCfg();
-      const values = {};
-      for (const key of NUDGED) values[key] = fmtMm(pd[key]);
-      await uploadCfg(applySettings(current, values));
-      log(`stored offset_x ${values.offset_x}, offset_y ${values.offset_y}, direction_trim ${values.direction_trim}`
-        + ' in polydye.cfg');
-      // Only the stored fields: other Settings may hold edits that haven't been saved yet.
-      const form = $('settings');
-      for (const key of NUDGED) form.elements[key].value = values[key];
-      render();
+      log('> POLYDYE_SAVE');
+      await rpc('printer.gcode.script', { script: 'POLYDYE_SAVE' });
+      await refreshStored();
     });
   } catch (e) {
     log(`! store failed: ${e.message}`);
@@ -580,11 +611,13 @@ $('nudge-undo').addEventListener('click', () => {
     const x = storedNudged('offset_x', textIn);
     const y = storedNudged('offset_y', textIn);
     const trim = storedNudged('direction_trim', textIn);
-    if (x === null || y === null || trim === null) {
-      log('! polydye.cfg has no valid offset_x, offset_y or direction_trim');
+    const reg = REG_KEYS.map((k) => storedReg(k, textIn));
+    if (x === null || y === null || trim === null || reg.includes(null)) {
+      log('! polydye.cfg has no valid offset_x, offset_y or direction_trim, or an invalid colour registration');
       return;
     }
-    await gcode(`POLYDYE_OFFSET X=${fmtMm(x)} Y=${fmtMm(y)} TRIM=${fmtMm(trim)}`);
+    await gcode(`POLYDYE_OFFSET X=${fmtMm(x)} Y=${fmtMm(y)} TRIM=${fmtMm(trim)} `
+      + `${REG_KEYS.map((k, i) => `${k.toUpperCase()}=${reg[i]}`).join(' ')}`);
   });
 });
 
@@ -1002,6 +1035,105 @@ $('spit-btn').addEventListener('click', () => {
   gcode(`POLYDYE_SPIT SECONDS=${seconds}${f.template.value ? ` TEMPLATE=${f.template.value}` : ''}`
     + `${pulse >= 1 ? ` PULSE=${pulse}` : ''} PATTERN=${f.pattern.value}${knobs.text}`
     + `${period > 0 ? ` PERIOD_US=${period}` : ''}${warmParamText} CONFIRM=1`);
+});
+
+// ---- calibration prints: the alignment page and the offset print (README, "Calibration prints") ------------------
+
+// ` NAME=value` for each filled-in number field of `form` ([field, NAME] pairs), or an error.
+function numParams(form, fields) {
+  const out = [];
+  for (const [name, param] of fields) {
+    const el = form.elements[name];
+    const raw = el.value.trim();
+    if ((el.validity && el.validity.badInput) || (raw && !Number.isFinite(Number(raw)))) {
+      return { error: `${el.parentElement.firstChild.textContent.trim()} must be a number` };
+    }
+    if (raw) out.push(`${param}=${Number(raw)}`);
+  }
+  return { text: out.map((p) => ` ${p}`).join(''), count: out.length };
+}
+
+// A command that changes the live values by readings and writes polydye.cfg itself (POLYDYE_ALIGN, POLYDYE_OFFSET
+// X_TICK=): after the nudges and the Save/Store clicked before it (the readings correct what was printed), and before
+// nudges clicked after it; it waits only on earlier clicks. The readings add to the values, so they must go through
+// once: the button `key` takes no more clicks until it's done. Returns true when Klipper applied them (clear the
+// readings), false when it refused them, and also true when the connection dropped while it ran: they may have been
+// applied, and entering them again could apply them twice.
+const storing = new Set();
+function queueStoring(key, script) {
+  if (storing.has(key)) return Promise.resolve(false);
+  storing.add(key);
+  const nudgesBefore = nudgeChain;
+  const run = queueCfg(async () => {
+    await nudgesBefore;
+    log(`> ${script}`);
+    try {
+      await rpc('printer.gcode.script', { script });
+    } catch (e) {
+      log(`! ${e.message}`);
+      if (e.message !== 'connection closed') return false;
+      log('! the connection dropped while it ran, so it may have been applied: check the values under Ink position '
+        + 'before entering these readings again');
+      return true;
+    }
+    // Klipper has applied and stored it: a failed re-read mustn't look like a failed command.
+    await refreshStored().catch((e) => log(`! could not read polydye.cfg: ${e.message}`));
+    return true;
+  });
+  nudgeChain = nudgeChain.then(() => run).catch(() => {});  // logged below
+  return run.catch((e) => {
+    log(`! ${e.message}`);
+    return false;
+  }).finally(() => storing.delete(key));
+}
+
+['align-form', 'align-read', 'offset-form', 'offset-read'].forEach((id) => {
+  $(id).addEventListener('submit', (ev) => ev.preventDefault());
+});
+
+$('align-btn').addEventListener('click', () => {
+  const p = numParams($('align-form'), [['x', 'X'], ['y', 'Y'], ['z', 'Z'], ['spacing', 'SPACING']]);
+  if (p.error) {
+    log(`! alignment page: ${p.error}`);
+    return;
+  }
+  const ok = window.confirm('Print the alignment page with LIVE INK, on paper only?\n\nPaper taped over the glass '
+    + 'where the page goes, at least 70 x 140 mm, so no ink lands on the glass (the console says exactly where); '
+    + 'cartridge fitted. It homes if needed, warms the head over the wipe sponge and prints 8 strips along the pass '
+    + 'axis.');
+  if (ok) gcode(`PD_ALIGN_PRINT${p.text}`);
+});
+
+$('align-apply').addEventListener('click', async () => {
+  const p = numParams($('align-read'), [['cyan', 'CYAN'], ['yellow', 'YELLOW'], ['direction', 'DIRECTION'],
+    ['cyan_x', 'CYAN_X'], ['yellow_x', 'YELLOW_X']]);
+  if (p.error || !p.count) {
+    log(`! alignment: ${p.error || 'enter the numbers read off the page'}`);
+    return;
+  }
+  if (await queueStoring('align', `POLYDYE_ALIGN${p.text}`)) $('align-read').reset();
+});
+
+$('offset-btn').addEventListener('click', () => {
+  const p = numParams($('offset-form'), [['x', 'X'], ['y', 'Y'], ['layers', 'LAYERS'], ['gap', 'GAP'],
+    ['extruder_temp', 'EXTRUDER_TEMP'], ['bed_temp', 'BED_TEMP']]);
+  if (p.error) {
+    log(`! offset print: ${p.error}`);
+    return;
+  }
+  const ok = window.confirm('Print the offset check: a PLA plaque, then LIVE INK on it?\n\nCartridge fitted, PLA '
+    + 'loaded, bed clean. It homes if needed, heats, prints a 26 x 38 mm plaque, turns the hotend off, warms the head '
+    + 'over the wipe sponge and inks two scales across the groove. All the ink lands on the plaque.');
+  if (ok) gcode(`PD_OFFSET_PRINT${p.text}`);
+});
+
+$('offset-apply').addEventListener('click', async () => {
+  const p = numParams($('offset-read'), [['x_tick', 'X_TICK'], ['y_tick', 'Y_TICK']]);
+  if (p.error || !p.count) {
+    log(`! offset: ${p.error || 'enter the ticks read off the scales'}`);
+    return;
+  }
+  if (await queueStoring('offset', `POLYDYE_OFFSET${p.text}`)) $('offset-read').reset();
 });
 
 function renderDiagnostics(pd, printing) {

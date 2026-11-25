@@ -133,6 +133,8 @@
         <div><span class="k">Offset X</span><span class="v" id="n-x">&ndash;</span></div>
         <div><span class="k">Offset Y</span><span class="v" id="n-y">&ndash;</span></div>
         <div><span class="k">Direction trim</span><span class="v" id="n-trim">&ndash;</span></div>
+        <div><span class="k">Cyan registration</span><span class="v" id="n-cyan">&ndash;</span></div>
+        <div><span class="k">Yellow registration</span><span class="v" id="n-yellow">&ndash;</span></div>
       </div>
       <div class="buttons">
         <button type="button" id="nudge-store" class="primary needs-board">Store in polydye.cfg</button>
@@ -266,12 +268,64 @@
       <p class="hint hidden" id="spit-fw-old"></p>
       <p class="hint hidden" id="diag-old">The spit test, the signal check and the stock timing options need newer
         board firmware: update it under Board firmware.</p>
+      <h3>Alignment page <span class="sub">live ink, on paper only</span></h3>
+      <p class="hint">Vernier rows for the colour registration along the pass (C, Y) and across it (CX, YX) and for
+        the direction trim (D), 113 mm long, between two rows of block numbers (-16 to 16). In each row find the block
+        where its marks line up best (C, Y: the colour bar on the magenta one; D: the two magenta bars; CX, YX: the two
+        lines make one) and enter its number; halfway between two blocks is e.g. -11.5. Apply and store corrects the
+        settings and writes them into polydye.cfg; print again to check that every row reads 0. Tape paper over the
+        glass first, at least 70 &times; 140 mm where the page goes (the console says exactly where): no ink may land on
+        the glass. It homes if
+        needed and warms the head over the wipe sponge.</p>
+      <form id="align-form" class="compact">
+        <label>First row X (mm)<input name="x" type="number" step="any" placeholder="centred"></label>
+        <label>Y (mm)<input name="y" type="number" step="any" placeholder="centred"></label>
+        <label>Z (mm)<input name="z" type="number" step="any" min="0.2" value="1"></label>
+        <label>Row spacing (mm)<input name="spacing" type="number" step="any" min="5" value="8"></label>
+      </form>
+      <div class="buttons">
+        <button type="button" id="align-btn" class="danger needs-board needs-idle">Print alignment page&hellip;</button>
+      </div>
+      <form id="align-read" class="compact">
+        <label>C<input name="cyan" type="number" step="0.5" min="-16" max="16"></label>
+        <label>Y<input name="yellow" type="number" step="0.5" min="-16" max="16"></label>
+        <label>D<input name="direction" type="number" step="0.5" min="-16" max="16"></label>
+        <label>CX<input name="cyan_x" type="number" step="0.5" min="-16" max="16"></label>
+        <label>YX<input name="yellow_x" type="number" step="0.5" min="-16" max="16"></label>
+      </form>
+      <div class="buttons">
+        <button type="button" id="align-apply" class="primary needs-board">Apply and store</button>
+      </div>
+      <h3>Offset print <span class="sub">PLA and live ink</span></h3>
+      <p class="hint">Where the ink lands against the plastic: a 26 &times; 38 mm PLA plaque with a cross-shaped
+        groove in its top layers, then two ink scales across the groove (passes along Y only). All the ink and its priming
+        land on the plaque, with 6.5 mm to spare all round; the head warms over the wipe sponge. On each scale find the tick in the
+        middle of the groove, halfway between the last whole ticks either side of it, counting from the nearest number
+        (tick 0 is the longest, every 8th is numbered), and enter it. Apply and store moves the ink there and writes the
+        offsets into polydye.cfg; print again to check that both read 0. It homes if needed, heats to the temperatures
+        given (else the hotend's current target must be set for PLA) and turns the hotend off before the ink.</p>
+      <form id="offset-form" class="compact">
+        <label>Groove X (mm)<input name="x" type="number" step="any" placeholder="centred"></label>
+        <label>Y (mm)<input name="y" type="number" step="any" placeholder="centred"></label>
+        <label>Layers<input name="layers" type="number" step="1" min="4" max="12" value="5"></label>
+        <label>Gap above it (mm)<input name="gap" type="number" step="any" min="0.2" value="1"></label>
+        <label>Hotend (°C)<input name="extruder_temp" type="number" step="1" min="0" placeholder="current target"></label>
+        <label>Bed (°C)<input name="bed_temp" type="number" step="1" min="0" placeholder="as it is"></label>
+      </form>
+      <div class="buttons">
+        <button type="button" id="offset-btn" class="danger needs-board needs-idle">Print offset check&hellip;</button>
+      </div>
+      <form id="offset-read" class="compact">
+        <label>X scale (ticks)<input name="x_tick" type="number" step="0.5" min="-12" max="12"></label>
+        <label>Y scale (ticks)<input name="y_tick" type="number" step="0.5" min="-13" max="13"></label>
+      </form>
+      <div class="buttons">
+        <button type="button" id="offset-apply" class="primary needs-board">Apply and store</button>
+      </div>
       <h3>Next steps</h3>
       <ol class="steps">
         <li><b>Nozzle check</b>: print every nozzle once to find blocked ones (a black cartridge with both black_a and
           black_b).</li>
-        <li><b>Cartridge offset</b>: print ink marks next to a plastic reference and nudge X and Y until they line up.</li>
-        <li><b>Direction alignment</b>: print in both directions and nudge Reverse passes until the passes line up.</li>
       </ol>
     </section>
 

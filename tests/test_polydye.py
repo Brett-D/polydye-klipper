@@ -5,6 +5,7 @@ This file is part of polydye-klipper (GPLv3).
 """
 import math
 import os
+import struct
 import sys
 import types
 import unittest
@@ -114,7 +115,7 @@ class StatusPoll(unittest.TestCase):
         state = {'shutdown': False}
         pd.printer = types.SimpleNamespace(is_shutdown=lambda: state['shutdown'], get_reactor=lambda: reactor,
                                            lookup_object=lambda name, default=None: default)
-        pd.querying = pd.query_failing = pd.print_live = False
+        pd.querying = pd.query_failing = pd.print_live = pd.live_off_pending = False
         pd._query_status = lambda: query(state)
         return pd, state, reactor
 
@@ -153,7 +154,7 @@ class StatusPoll(unittest.TestCase):
 class PrintEnd(unittest.TestCase):
     def test_a_cancelled_or_failed_print_turns_live_ink_off(self):
         pd = object.__new__(polydye.PolyDye)
-        pd.oid, pd.boost_idle_s, pd.print_live, pd.last_fire = 0, 1800, False, 50.
+        pd.oid, pd.boost_idle_s, pd.print_live, pd.last_fire, pd.live_off_pending = 0, 1800, False, 50., False
         sent, said = [], []
         pd.cancel_cmd = types.SimpleNamespace(send=lambda args: sent.append('cancel'))
         pd.mode_cmd = types.SimpleNamespace(send=lambda args: sent.append(('mode', args[1], args[2])))
@@ -203,10 +204,46 @@ class PrintEnd(unittest.TestCase):
         pd.cmd_POLYDYE_ENABLE(gcmd)
         self.assertEqual(sent, off + [('mode', 1, 1)])
         run((('complete', False, []), ('standby', False, [])))
+        # A send that fails (the link hiccups) is tried again at the next poll.
+        state[0] = 'printing'
+        pd.cmd_POLYDYE_ENABLE(gcmd)
+        state[0], fail = 'cancelled', [True]
+
+        def mode(args):
+            if fail.pop() if fail else False:
+                raise RuntimeError("Timeout on wait for 'polydye_status' response")
+            sent.append(('mode', args[1], args[2]))
+        pd.mode_cmd = types.SimpleNamespace(send=mode)
+        with self.assertRaisesRegex(RuntimeError, "Timeout"):
+            pd._check_print_end(0.)
+        self.assertTrue(pd.print_live)
+        run((('cancelled', False, off), ('cancelled', False, [])))
+        # A test whose cleanup failed: live ink goes off at the next poll (tried again until it works), or before
+        # live ink is enabled again, also by a print.
+        pd.mode_cmd = types.SimpleNamespace(send=lambda args: sent.append(('mode', args[1], args[2])))
+        del said[:]
+        pd.live_off_pending = True
+        run((('standby', False, off), ('standby', False, [])))
+        self.assertEqual(said, ["PolyDye: live ink is off now (turning it off after the last test failed)"])
+        pd.live_off_pending, state[0], sent[:] = True, 'printing', []
+        pd.cmd_POLYDYE_ENABLE(gcmd)
+        self.assertEqual(sent, off + [('mode', 1, 1)])
+        self.assertEqual((pd.live_off_pending, pd.print_live), (False, True))
+        run((('complete', False, off),))
         # Older board firmware: the boost goes off too.
         pd.boost_idle_s, state[0] = None, 'printing'
         pd.cmd_POLYDYE_ENABLE(gcmd)
         run((('cancelled', False, ['cancel', ('mode', 0, 0)]),))
+
+    def test_a_failed_test_cleanup_leaves_live_ink_off_pending(self):
+        pd, board = TestCleanup.make(TestCleanup(), fail_on="NOTHING")
+
+        def lost(args):
+            raise RuntimeError("Lost communication with MCU 'polydye'")
+        pd.mode_cmd = types.SimpleNamespace(send=lost)
+        with self.assertLogs(level='ERROR'):
+            pd._restore_after_test(('color_b_late', 6))
+        self.assertTrue(pd.live_off_pending)
 
 
 class StatusCommand(unittest.TestCase):
@@ -227,6 +264,7 @@ class StatusCommand(unittest.TestCase):
         pd.query_clock_cmd = types.SimpleNamespace(send=lambda args: {'stock': 1, 'nominal_hz': 2857142,
                                                                       'measured_hz': 0})
         pd.pass_axis, pd.offset_x, pd.offset_y, pd.direction_trim, pd.dpi, pd.pass_speed = 'y', 1., 2., 0., 600., 50.
+        pd.registration = (0, 0, 0, 0)
         replies = []
         pd.cmd_POLYDYE_STATUS(types.SimpleNamespace(respond_info=replies.append))
         self.assertIn("boost=1", replies[0])
@@ -327,7 +365,7 @@ class TestCleanup(unittest.TestCase):
         pd.boost_idle_s = None  # board firmware that turns PolyDye off after a test
         pd.warm_seconds, pd.warm_pulse, pd.warm_period_us, pd.warm_idle_time = 10., 1, 254, 60.
         pd.warm_position, pd.warm_clearance, pd.warm_prespit = 'pass', 10., 0.
-        pd.last_fire, pd.auto_warm_off, pd.print_live = None, False, False
+        pd.last_fire, pd.auto_warm_off, pd.print_live, pd.live_off_pending = None, False, False, False
         pd.mcu = types.SimpleNamespace(estimated_print_time=lambda eventtime: board.print_time)
         board.print_time = 100.
 
@@ -1326,6 +1364,7 @@ class BuildConfig(unittest.TestCase):
 
     def status(self, pd):
         pd.last_status, pd.last_pass, pd.pass_axis, pd.offset_x, pd.offset_y, pd.direction_trim = {}, None, 'y', 0, 0, 0
+        pd.registration, pd.nozzle_dpi, pd.cfg_saves = (0, 0, 0, 0), 300., 0
         return pd.get_status(0.)
 
     def test_connect_sets_the_stock_clock(self):
@@ -1459,6 +1498,502 @@ class ConfigOptions(unittest.TestCase):
         self.assertIn("warm_position must be sponge (the default), X, Y", self.load(warm_position='here'))
         self.assertIn("heater duty", self.load(warm_pulse='8', warm_period_us='400'))
         self.assertIn("warm_position must be sponge (the default), X, Y", self.load(warm_position='5'))
+
+
+
+def decode(data, columns):
+    """The (column, colour, position) dots of pass data."""
+    out = []
+    for j in range(columns):
+        col = data[j * polydye.NOZDATA_SIZE:(j + 1) * polydye.NOZDATA_SIZE]
+        for c in range(3):
+            for q in range(14):
+                b = col[polydye.COLOR_BYTE_ORDER[c][q] + 14 * c]
+                out.extend((j, c, q + 14 * bit) for bit in range(8) if b >> bit & 1)
+    return out
+
+
+def land(built, direction, along=(0, 0, 0), across=(0, 0, 0), reverse=0.):
+    """Where a pass's dots land in drawing columns and positions (built: pass_data()'s result), on a cartridge whose
+    colours land `along` bed columns (+pass) and `across` positions off magenta's, and whose reverse passes land
+    `reverse` columns further along +pass."""
+    data, columns, first = built
+    return [(first + j * direction + along[c] + (reverse if direction < 0 else 0), c, p + across[c])
+            for j, c, p in decode(data, columns)]
+
+
+def runs(columns):
+    """Centres of the runs of consecutive columns."""
+    out, run = [], []
+    for i in sorted(set(columns)):
+        if run and i != run[-1] + 1:
+            out.append(sum(run) / float(len(run)))
+            run = []
+        run.append(i)
+    return out + ([sum(run) / float(len(run))] if run else [])
+
+
+class CalibrationDrawing(unittest.TestCase):
+    def test_registration_is_fixed_on_the_bed(self):
+        d = polydye.PassDrawing(0, 199)
+        d.dot(10, polydye.CYAN, 40)
+        d.dot(10, polydye.MAGENTA, 40)
+        d.dot(100, polydye.YELLOW, 111)
+        for direction in (1, -1):
+            built = polydye.pass_data(d, direction, (-34, 1, 27, 1))
+            # Cyan 34 columns back along +pass in either direction, one position up; yellow moved off the nozzle row is
+            # left out; the pass covers the drawing and the shifted dot.
+            self.assertEqual(sorted(land(built, direction)), [(-24, polydye.CYAN, 41), (10, polydye.MAGENTA, 40)])
+            self.assertEqual(built[1:], (224, -24) if direction > 0 else (224, 199))
+
+    def test_priming_block_goes_first(self):
+        d = polydye.PassDrawing(0, 9)
+        d.prime(-polydye.PRIME_COLUMNS)
+        data, columns, first = polydye.pass_data(d, 1)
+        self.assertEqual((columns, first), (polydye.PRIME_COLUMNS + 10, -polydye.PRIME_COLUMNS))
+        self.assertEqual(data[:polydye.NOZDATA_SIZE], polydye.random_column(0, polydye.STOCK_RANDOM))
+
+    def test_text_reads_along_the_pass_or_across_it(self):
+        d = polydye.PassDrawing()
+        d.text("1", polydye.MAGENTA, 0, 60, 1, 1)
+        # FONT['1']'s top row "00100": column 2, position 60 (the top); its bottom row "01110" 6 positions lower.
+        self.assertIn((2, polydye.MAGENTA, 60), d.dots)
+        self.assertEqual(sorted(i for i, c, p in d.dots if p == 54), [1, 2, 3])
+        d = polydye.PassDrawing()
+        d.text("1", polydye.MAGENTA, 100, 60, 1, 1, rotated=True)
+        self.assertIn((100, polydye.MAGENTA, 58), d.dots)
+        self.assertEqual(sorted(p for i, c, p in d.dots if i == 94), [57, 58, 59])
+
+    def test_plaque_grooves(self):
+        rects = polydye.plaque_rects(100., 50.)
+        inside = lambda x, y: any(x0 <= x <= x1 and y0 <= y <= y1 for x0, y0, x1, y1 in rects)
+        # The grooves: along Y up to 9.3 mm above the centre, along X up to 7.35 mm right of it; plaque beyond.
+        for x, y in ((100., 45.), (100., 58.), (95., 50.), (107., 50.)):
+            self.assertFalse(inside(x, y), (x, y))
+        for x, y in ((100., 60.), (108., 50.), (99., 49.), (101., 51.), (90.3, 29.6), (116.3, 66.9)):
+            self.assertTrue(inside(x, y), (x, y))
+        # The plaque reaches 6.5 mm beyond every drop of ink, the priming blocks included, at nozzle pitches up to
+        # 1/270": ink that far off still lands on plastic.
+        pitch, widest = 25.4 / 847, 25.4 / 270
+        xs, ys = [polydye.pass_data(d, 1) for d in polydye.offset_drawings(847 / 25.4)]
+        ink = [(-(p - polydye.OFFSET_REF_POSITION) * widest * s + dx, i * pitch)
+               for (data, n, first), dx in ((xs, 0.), (ys, polydye.OFFSET_Y_SCALE_X))
+               for i, c, p in land((data, n, first), 1) for s in (1., 0.)]
+        size = polydye.OFFSET_PLAQUE
+        self.assertLessEqual(-size[0] + 6.5, min(x for x, y in ink))
+        self.assertGreaterEqual(size[1] - 6.5, max(x for x, y in ink))
+        self.assertLessEqual(-size[2] + 6.5, min(y for x, y in ink))
+        self.assertGreaterEqual(size[3] - 6.5, max(y for x, y in ink))
+
+    def test_plaque_gcode(self):
+        rects = [(10., 20., 15., 30.)]
+        lines = polydye.plaque_gcode([rects, rects], 0.2, 0.45, 2.405, 0.5)
+        moves = [l for l in lines if l.startswith("G1 X") and " E" in l]
+        # Prime line 3 mm left of the plaque, then every extruding move within the rectangle.
+        self.assertTrue(moves[0].startswith("G1 X7.000 Y30.000 E"))
+        for l in moves[1:]:
+            x, y = float(l.split()[1][1:]), float(l.split()[2][1:])
+            self.assertTrue(10. <= x <= 15. and 20. <= y <= 30., l)
+        # The first perimeter edge: 4.5 mm at 0.5 x 0.2 mm of a 2.405 mm2 filament.
+        first_edge = moves[1].split()
+        self.assertAlmostEqual(float(first_edge[3][1:]), 4.5 * 0.5 * 0.2 / 2.405, 4)
+        fan = lines.index("M106 S255")  # from the second layer (Z 0.4) on
+        self.assertFalse(any("Z0.400" in l for l in lines[:fan]))
+        self.assertIn("G1 Z0.400 F600", lines[fan:])
+        self.assertEqual(lines[-2:], ["G1 E-2 F2700", "M106 S0"])
+
+    def test_cfg_with(self):
+        text = "\n".join(["[mcu polydye]", "serial: /dev/x", "[polydye]", "offset_x: 1.5  # measured",
+                          "#direction_trim: 0", "offset_y: 2", "offset_y: 3", "[gcode_macro A]", "offset_x: 9"])
+        out = polydye.cfg_with(text, {'offset_x': '1.25', 'direction_trim': '-0.41', 'offset_y': '0',
+                                      'cyan_columns': '-34'})
+        self.assertEqual(out.split("\n"), [
+            "[mcu polydye]", "serial: /dev/x", "[polydye]", "cyan_columns: -34", "offset_x: 1.25  # measured",
+            "direction_trim: -0.41", "offset_y: 0", "#offset_y: 3", "[gcode_macro A]", "offset_x: 9"])
+        self.assertEqual(polydye.cfg_value(out, 'offset_y'), '0')
+        self.assertIsNone(polydye.cfg_value(text, 'direction_trim'))
+        with self.assertRaisesRegex(ValueError, r"no \[polydye\] section"):
+            polydye.cfg_with("[printer]\n", {'offset_x': '1'})
+        self.assertEqual([polydye.cfg_number(v) for v in (58.6, -0.0, 10., -0.41, 1. / 3)],
+                         ['58.6', '0', '10', '-0.41', '0.3333'])
+
+    def test_paced_upload_sends_the_whole_frame(self):
+        written = []
+        reply = b"PD" + struct.pack("<BBI", 0x80, 7, 2) + b"{}"
+        reply += struct.pack("<I", zlib.crc32(b"{}", zlib.crc32(reply[2:8])) & 0xffffffff)
+
+        class Serial:
+            def __init__(self, *a, **kw):
+                self.left = bytearray(reply)
+
+            def write(self, b):
+                written.append(bytes(b))
+
+            def read(self, n):
+                out, self.left[:n] = bytes(self.left[:n]), b""
+                return out
+
+            flush = close = lambda self: None
+        payload = bytes(range(256)) * 200
+        with mock.patch.dict(sys.modules, serial=types.SimpleNamespace(Serial=Serial)), \
+                mock.patch.object(polydye.time, "sleep") as sleep:
+            # A chunk a second.
+            self.assertEqual(polydye.data_port_request("/dev/x", 7, 0x10, payload, rate=polydye.DATA_CHUNK), {})
+        self.assertEqual([len(w) for w in written[:-1]], [polydye.DATA_CHUNK] * (len(written) - 1))
+        self.assertEqual(b"".join(written)[8:-4], payload)
+        self.assertEqual(len(written), 4)
+        self.assertEqual(sleep.call_count, 3)
+        # The clock doesn't move while sleep is mocked, so the waits add up.
+        self.assertEqual([round(call[0][0], 1) for call in sleep.call_args_list], [1., 2., 3.])
+
+
+class CalibrationReadings(unittest.TestCase):
+    """The calibration prints' readings, entered as printed, correct a simulated cartridge: a reprint reads 0."""
+
+    def make(self):
+        pd = object.__new__(polydye.PolyDye)
+        pd.pass_axis, pd.dpi, pd.nozzle_dpi = 'y', 847., 300.
+        pd.offset_x, pd.offset_y, pd.direction_trim, pd.registration = 58.6, -8.7, 0., (0, 0, 0, 0)
+        pd._save = mock.Mock()
+        return pd
+
+    def gcmd(self, **params):
+        def get(name, default=None, **kw):
+            return params.get(name, default)
+        return types.SimpleNamespace(get=get, get_float=get, get_int=get, respond_info=lambda msg: None,
+                                     error=RuntimeError)
+
+    def read_page(self, pd, along, across, reverse):
+        """The block number where each row of the alignment page lines up, printed with pd's registration and
+        direction trim on that cartridge (land())."""
+        pitch = 25.4 / pd.dpi
+        page = dict((row, land(polydye.pass_data(d, direction, pd.registration), direction, along, across,
+                               reverse + (pd.direction_trim / pitch if direction < 0 else 0.)))
+                    for row, d, direction in polydye.align_drawings())
+        ks = range(-polydye.ALIGN_K, polydye.ALIGN_K + 1)
+        readings = {}
+        for row, colour, dots in (('C', polydye.CYAN, page['C']), ('Y', polydye.YELLOW, page['Y']),
+                                  ('D', polydye.MAGENTA, page['D-'])):
+            # The bar on positions 50-79 sitting on a block's magenta bar.
+            bars = runs(i for i, c, p in dots if c == colour and 50 <= p <= 79)
+            readings[row] = [k for k in ks if any(abs(b - (polydye.align_centre(k) - 0.5)) < 1 for b in bars)]
+        for row, colour, n in (('CX', polydye.CYAN, 0), ('YX', polydye.YELLOW, 2)):
+            # The block whose colour line lies on the magenta line (positions 49-50), along shift aside.
+            shift = pd.registration[n] + along[colour]
+            line = lambda k: set(p for i, c, p in page[row] if c == colour and
+                                 abs(i - shift - polydye.align_centre(k)) <= 20)
+            readings[row] = [k for k in ks if line(k) == {49, 50}]
+        return readings
+
+    def test_alignment_page(self):
+        pd = self.make()
+        cartridge = dict(along=(33, 0, -27), across=(-1, 0, 0), reverse=14)
+        self.assertEqual(self.read_page(pd, **cartridge), {'C': [-11], 'Y': [9], 'D': [-7], 'CX': [1], 'YX': [0]})
+        pd.cmd_POLYDYE_ALIGN(self.gcmd(CYAN=-11., YELLOW=9., DIRECTION=-7., CYAN_X=1., YELLOW_X=0.))
+        self.assertEqual(pd.registration, (-33, 1, 27, 0))
+        self.assertAlmostEqual(pd.direction_trim, -14 * 25.4 / 847, 4)
+        pd._save.assert_called_once()
+        self.assertEqual(self.read_page(pd, **cartridge), {'C': [0], 'Y': [0], 'D': [0], 'CX': [0], 'YX': [0]})
+
+    def test_alignment_readings_are_checked(self):
+        pd = self.make()
+        with self.assertRaisesRegex(RuntimeError, "give the alignment page's readings"):
+            pd.cmd_POLYDYE_ALIGN(self.gcmd())
+        pd.registration = (-290, 0, 0, 0)
+        with self.assertRaisesRegex(RuntimeError, r"cyan_columns would be -320, beyond \+-300"):
+            pd.cmd_POLYDYE_ALIGN(self.gcmd(CYAN=-10.))
+        self.assertEqual((pd.registration, pd.direction_trim), ((-290, 0, 0, 0), 0.))
+        pd.cmd_POLYDYE_ALIGN(self.gcmd(CYAN_X=-1.4, SAVE=0))
+        self.assertEqual(pd.registration, (-290, -1, 0, 0))
+        pd._save.assert_not_called()
+        # Stored before they apply: if polydye.cfg can't be written nothing changes, so entering the readings again
+        # doesn't apply them twice.
+        pd._save.side_effect = RuntimeError("couldn't store the values")
+        for command, params in ((pd.cmd_POLYDYE_ALIGN, dict(CYAN=2., DIRECTION=1.)),
+                                (pd.cmd_POLYDYE_OFFSET, dict(X_TICK=2., Y_TICK=-1.))):
+            with self.assertRaisesRegex(RuntimeError, "couldn't store"):
+                command(self.gcmd(**params))
+            self.assertEqual((pd.registration, pd.direction_trim, pd.offset_x, pd.offset_y),
+                             ((-290, -1, 0, 0), 0., 58.6, -8.7))
+
+    def test_offset_print(self):
+        pd = self.make()
+        pitch, npitch = 25.4 / pd.dpi, 25.4 / pd.nozzle_dpi
+
+        def read(ex, ey):
+            """The tick in each slot's middle with the ink landing (ex, ey) mm off: the X scale's lines along Y, at
+            bed X = slot - (position - reference) x nozzle pitch, the Y scale's along X at bed Y = slot + column."""
+            xs, ys = [polydye.pass_data(d, 1, pd.registration) for d in polydye.offset_drawings(pd.dpi / 25.4)]
+            x_lines = set(p for i, c, p in land(xs, 1) if 0 <= i < polydye.OFFSET_SLOT_END[1] / pitch)
+            near = min(x_lines, key=lambda p: abs(-(p - polydye.OFFSET_REF_POSITION) * npitch + ex))
+            y_lines = runs(i for i, c, p in land(ys, 1) if p == 85 and i >= -polydye.OFFSET_Y_TICKS * 8 - 2)
+            self.assertEqual(polydye.offset_y_tick(pd.dpi / 25.4), 8)
+            mid = min(y_lines, key=lambda i: abs(i * pitch + ey))
+            return ((polydye.OFFSET_REF_POSITION - near) / float(polydye.OFFSET_X_TICK),
+                    mid / 8.)
+
+        self.assertEqual(read(0., 0.), (0., 0.))
+        # The ink lands 1.3 mm towards +X and 0.75 mm towards -Y of where it should (the offsets are that far off).
+        x_tick, y_tick = read(1.3, -0.75)
+        self.assertEqual((x_tick, y_tick), (-5., 3.))
+        pd.cmd_POLYDYE_OFFSET(self.gcmd(X_TICK=x_tick, Y_TICK=y_tick))
+        pd._save.assert_called_once()
+        ex = 1.3 + (58.6 - pd.offset_x)
+        ey = -0.75 + (-8.7 - pd.offset_y)
+        self.assertLess(abs(ex), npitch * polydye.OFFSET_X_TICK / 2.)
+        self.assertLess(abs(ey), pitch * 8 / 2.)
+
+    def test_offset_reading_checks(self):
+        pd = self.make()
+        with self.assertRaisesRegex(RuntimeError, "give X or X_TICK, not both"):
+            pd.cmd_POLYDYE_OFFSET(self.gcmd(X=1., X_TICK=2.))
+        pd.pass_axis = 'x'
+        with self.assertRaisesRegex(RuntimeError, "for pass_axis: y"):
+            pd.cmd_POLYDYE_OFFSET(self.gcmd(Y_TICK=2.))
+        # Plain offsets aren't stored unless asked.
+        pd._respond_offsets = mock.Mock()
+        pd.cmd_POLYDYE_OFFSET(self.gcmd(X=1., CYAN_COLUMNS=-30))
+        self.assertEqual((pd.offset_x, pd.registration), (1., (-30, 0, 0, 0)))
+        pd._save.assert_not_called()
+
+
+class CalibrationPrints(unittest.TestCase):
+    """POLYDYE_ALIGN_PRINT and POLYDYE_OFFSET_PRINT: checked before anything moves, stored, printed, put back."""
+
+    def make(self, homed='xyz'):
+        pd, board = TestCleanup.make(TestCleanup(), fail_on="NOTHING")
+        pd.offset_x, pd.offset_y, pd.direction_trim, pd.registration = 0., 0., 0., (-34, 1, 27, 0)
+        pd.dpi, pd.nozzle_dpi, pd.pass_speed, pd.extra_run_up, pd.settle_time = 847., 300., 59.5, 1., 0.03
+        pd.data_port, pd.data_seq, pd.cfg_saves, pd.travel_speed = '/dev/serial/by-id/polydye-if02', 0, 0, 150.
+        self.waits = []
+        th = {'homed_axes': homed, 'max_accel': 3000., 'minimum_cruise_ratio': 0.,
+              'axis_minimum': types.SimpleNamespace(x=0., y=0., z=0.),
+              'axis_maximum': types.SimpleNamespace(x=250., y=235., z=250.)}
+        self.extruder = {'target': 210., 'temperature': 210.}
+        self.objects = {
+            'toolhead': types.SimpleNamespace(wait_moves=lambda: self.waits.append(len(board.sent)),
+                                              get_status=lambda eventtime: th),
+            'gcode_move': types.SimpleNamespace(base_position=[0., 0., 0., 0.], get_status=lambda eventtime: {
+                'gcode_position': types.SimpleNamespace(z=1.), 'position': types.SimpleNamespace(z=1.)}),
+            'gcode_macro POLYDYE_WIPE': types.SimpleNamespace(variables={'x': 245, 'z_hop': 1}),
+            'extruder': types.SimpleNamespace(get_status=lambda eventtime: self.extruder),
+            'configfile': types.SimpleNamespace(get_status=lambda eventtime: {'settings': {'extruder': {
+                'filament_diameter': 1.75, 'nozzle_diameter': 0.4, 'min_extrude_temp': 170.}}})}
+        lookup = pd.printer.lookup_object
+        pd.printer.lookup_object = lambda name, default=None: (self.objects[name] if name in self.objects
+                                                               else lookup(name, default))
+        self.uploads = []
+
+        def request(path, seq, ftype, payload=b"", timeout=3., rate=None):
+            self.uploads.append((ftype, payload[:8], len(payload), rate))
+            return {'cart': 'color'} if ftype == polydye.DATA_HELLO else {}
+        patcher = mock.patch.object(polydye, "data_port_request", side_effect=request)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.said = []
+        return pd, board
+
+    def gcmd(self, **params):
+        def get(name, default=None, **kw):
+            return params.get(name, default)
+        return types.SimpleNamespace(get=get, get_float=get, get_int=get, respond_info=self.said.append,
+                                     error=RuntimeError)
+
+    def test_alignment_page(self):
+        pd, board = self.make()
+        pd.cmd_POLYDYE_ALIGN_PRINT(self.gcmd(X=60., Y=50., Z=1.))
+        puts = [u for u in self.uploads if u[0] == polydye.DATA_PUT]
+        self.assertEqual([struct.unpack("<HHBBH", u[1]) for u in puts],
+                         [(polydye.CAL_LAYER, n, 0, 0, 3760) for n in range(7)])
+        self.assertEqual(set(u[3] for u in puts), {polydye.CAL_UPLOAD_RATE})
+        passes = [s for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_PASS")]
+        pitch = 25.4 / 847
+        start, end = 50. - 400 * pitch, 50. + 3759 * pitch
+        self.assertEqual(passes, [
+            "POLYDYE_PASS LAYER=65000 PASS=%d X=%.3f Y=%.3f DIR=%d WARM=0" % (n, x, y, d) for n, x, y, d in (
+                (0, 60., start, 1), (1, 68., start, 1), (2, 76., start, 1), (3, 84., start, 1),
+                (4, 84., end, -1), (5, 92., start, 1), (6, 100., start, 1), (0, 108., start, 1))])
+        # In order: G-code state saved, Z, live ink, the passes (waiting after 4: the board queues at most 8), then
+        # live ink off and the G-code state back.
+        script = [s for s in board.sent if isinstance(s, str)]
+        self.assertEqual(script[:3], ["SAVE_GCODE_STATE NAME=polydye_cal", "G90\nG1 Z1.000 F900",
+                                      "POLYDYE_ENABLE LIVE=1"])
+        self.assertEqual(script[-1], "RESTORE_GCODE_STATE NAME=polydye_cal")
+        self.assertIn(board.sent.index(passes[4]), self.waits)
+        self.assertEqual((board.boost, board.live), (False, False))
+        self.assertIn("POLYDYE_ALIGN CYAN=<C> YELLOW=<Y> DIRECTION=<D> CYAN_X=<CX> YELLOW_X=<YX>", self.said[-1])
+        # Where the paper goes: the rows across X (the nozzle row's half width at 10 % more than nozzle_dpi either
+        # side), the page with its priming blocks along Y.
+        self.assertIn("Its ink spans X 57-111, Y 38-163: the paper must cover that with 5 mm to spare, at least 70 x "
+                      "140 mm", [s for s in self.said if s.startswith("PolyDye alignment page, live ink")][0])
+        # With a G-code offset the ink lands that much further on the bed; the reverse pass's ink moves by
+        # direction_trim, which can make the page too long for the paper.
+        pd, board = self.make()
+        self.objects['gcode_move'].base_position = [2., -10., 0., 0.]
+        pd.direction_trim = -3.
+        pd.cmd_POLYDYE_ALIGN_PRINT(self.gcmd(X=60., Y=60., Z=1.))
+        self.assertIn("Its ink spans X 59-113, Y 38-160",
+                      [s for s in self.said if s.startswith("PolyDye alignment page, live ink")][-1])
+        pd, board = self.make()
+        pd.direction_trim = 10.
+        with self.assertRaisesRegex(RuntimeError, r"the page would need 65 x 145 mm of paper"):
+            pd.cmd_POLYDYE_ALIGN_PRINT(self.gcmd(X=60., Y=50., Z=1.))
+        self.assertEqual(board.sent, [])
+
+    def test_refused_before_anything_is_sent(self):
+        for homed, params, setup, error in (
+                ('', {}, None, "home XY first"),
+                ('xy', dict(Z=1.), None, "home Z first"),
+                ('xyz', {}, lambda pd, board: setattr(board, 'template', 'black_a'), "for the colour cartridge"),
+                ('xyz', {}, lambda pd, board: setattr(pd, 'data_port', None), "set data_port"),
+                ('xyz', dict(X=60., Y=150.), None, r"would take the toolhead to X=60.0 Y=2\d\d.\d, beyond the axis"),
+                ('xyz', {}, lambda pd, board: setattr(board, 'print_state', 'paused'), "not during a print"),
+                ('xyz', dict(SPACING=12.), None, r"at SPACING 12 and dpi 847 the page would need 89 x 135 mm of paper"),
+                ('xyz', {}, lambda pd, board: setattr(pd, 'dpi', 600.), r"dpi 600 the page would need 65 x 186 mm")):
+            pd, board = self.make(homed)
+            if setup:
+                setup(pd, board)
+            with self.assertRaisesRegex(RuntimeError, error):
+                pd.cmd_POLYDYE_ALIGN_PRINT(self.gcmd(**params))
+            self.assertEqual((board.sent, self.uploads), ([], []), error)
+
+    def test_a_failed_pass_still_turns_off_and_restores(self):
+        pd, board = self.make()
+        objects = pd.printer.lookup_object('gcode')
+        run = objects.run_script_from_command
+
+        def failing(script):
+            run(script)
+            if script.startswith("POLYDYE_PASS LAYER=65000 PASS=2"):
+                raise RuntimeError("Move out of range")
+        objects.run_script_from_command = failing
+        with self.assertRaisesRegex(RuntimeError, "out of range"):
+            pd.cmd_POLYDYE_ALIGN_PRINT(self.gcmd())
+        self.assertEqual(board.sent[-1], "RESTORE_GCODE_STATE NAME=polydye_cal")
+        self.assertEqual((board.boost, board.live), (False, False))
+
+    def test_the_head_warms_over_the_sponge_not_at_warm_position(self):
+        # With the automatic warm-up on and the board able to: up by the wipe's Z hop, over the sponge (POLYDYE_WIPE's
+        # X), warmed with the automatic warm-up's recipe, back over the first pass and down; the passes don't warm
+        # again.
+        pd, board = self.make()
+        pd.spit_run_cmd, pd.warm_duty_ppm, pd.warm_max_s = object(), 5800, 30.
+        pd.offset_x, pd.offset_y = 58.6, -8.7
+        pd.cmd_POLYDYE_ALIGN_PRINT(self.gcmd(X=100., Y=50.))
+        script = [s for s in board.sent if isinstance(s, str)]
+        first = 50. - 400 * 25.4 / 847
+        self.assertEqual(script[1:5], ["G90\nG1 Z2.000 F900\nG1 X245.000 F9000",
+                                       "POLYDYE_WARM SECONDS=10 WARM_PULSE=1 WARM_PERIOD_US=254 CONFIRM=1",
+                                       "G1 X%.3f Y%.3f F9000\nG1 Z1.000 F900" % (100. - 58.6, first + 8.7),
+                                       "POLYDYE_ENABLE LIVE=1"])
+        self.assertTrue(all(s.endswith(" WARM=0") for s in script if s.startswith("POLYDYE_PASS")))
+        # No POLYDYE_WIPE to say where the sponge is, or its X at the axis maximum (the hard stop POLYDYE_WIPE refuses
+        # too): refused before anything is sent.
+        for wipe, error in ((None, "no POLYDYE_WIPE macro"), ({'x': 250}, "must be within the X axis, below its max")):
+            pd, board = self.make()
+            pd.spit_run_cmd, pd.warm_duty_ppm = object(), 5800
+            if wipe is None:
+                del self.objects['gcode_macro POLYDYE_WIPE']
+            else:
+                self.objects['gcode_macro POLYDYE_WIPE'].variables = wipe
+            with self.assertRaisesRegex(RuntimeError, error):
+                pd.cmd_POLYDYE_ALIGN_PRINT(self.gcmd(X=100., Y=50.))
+            self.assertEqual((board.sent, self.uploads), ([], []))
+        # Warm-up off: none.
+        pd, board = self.make()
+        pd.spit_run_cmd, pd.warm_duty_ppm, pd.warm_seconds = object(), 5800, 0.
+        pd.cmd_POLYDYE_ALIGN_PRINT(self.gcmd(X=100., Y=50.))
+        self.assertFalse([s for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_WARM")])
+
+    def test_offset_print(self):
+        pd, board = self.make()
+        pd.cmd_POLYDYE_OFFSET_PRINT(self.gcmd(X=120., Y=100., BED_TEMP=60.))
+        script = [s for s in board.sent if isinstance(s, str)]
+        setup = script[1].split("\n")
+        # Heated (the hotend to its current target), the plaque at relative extrusion, then up to the plaque's top
+        # plus the gap with the hotend off; the ink scales after that.
+        self.assertEqual(setup[:7], ["M140 S60", "M190 S60", "M109 S210", "G90", "M83", "M220 S100", "M221 S100"])
+        self.assertEqual(setup[-2:], ["G1 Z2.000 F600", "M104 S0"])
+        # Two solid layers (one rectangle: a travel down to it for the perimeter and one for the fill; the first layer
+        # also comes down for the prime line), then three with the groove (six rectangles).
+        zs = [float(l.split()[1][1:]) for prev, l in zip(setup, setup[1:])
+              if prev.endswith(" F9000") and l.startswith("G1 Z")]
+        self.assertEqual([sum(abs(z - n * 0.2) < 1e-6 for z in zs) for n in range(1, 6)], [3, 2, 12, 12, 12])
+        self.assertEqual(script[2:4], ["G90\nG1 Z2.000 F900", "POLYDYE_ENABLE LIVE=1"])
+        pitch = 25.4 / 847
+        self.assertEqual([s for s in script if s.startswith("POLYDYE_PASS")], [
+            "POLYDYE_PASS LAYER=65000 PASS=0 X=120.000 Y=%.3f DIR=1 WARM=0" % (100. - 367 * pitch,),
+            "POLYDYE_PASS LAYER=65000 PASS=1 X=126.500 Y=%.3f DIR=1 WARM=0" % (100. - 467 * pitch,)])
+        self.assertEqual(script[-2:], ["M104 S0\nM106 S0", "RESTORE_GCODE_STATE NAME=polydye_cal"])
+        self.assertIn("POLYDYE_OFFSET X_TICK=<X scale> Y_TICK=<Y scale>", self.said[-1])
+
+    def test_a_failed_plaque_turns_the_hotend_and_fan_off(self):
+        pd, board = self.make()
+        gcode = pd.printer.lookup_object('gcode')
+        run = gcode.run_script_from_command
+
+        def failing(script):
+            run(script)
+            if script.startswith("M140"):
+                raise RuntimeError("Heater extruder not heating at expected rate")
+        gcode.run_script_from_command = failing
+        with self.assertRaisesRegex(RuntimeError, "not heating"):
+            pd.cmd_POLYDYE_OFFSET_PRINT(self.gcmd(X=120., Y=100., BED_TEMP=60.))
+        script = [s for s in board.sent if isinstance(s, str)]
+        self.assertEqual(script[-2:], ["M104 S0\nM106 S0", "RESTORE_GCODE_STATE NAME=polydye_cal"])
+
+    def test_offset_print_checks(self):
+        pd, board = self.make()
+        self.extruder['target'] = 0.
+        with self.assertRaisesRegex(RuntimeError, "heat the hotend for PLA first"):
+            pd.cmd_POLYDYE_OFFSET_PRINT(self.gcmd())
+        with self.assertRaisesRegex(RuntimeError, r"the plaque \(X -5.8-23.4, Y -18.6-19.0 with its prime line\)"):
+            pd.cmd_POLYDYE_OFFSET_PRINT(self.gcmd(X=7., Y=2., EXTRUDER_TEMP=215.))
+        # The scales keep their size in mm at another dpi (600 fits), but at dpi 100 a column is 0.25 mm: the Y scale's
+        # ticks, a column apart, would leave the plaque.
+        x0, y0, x1, y1 = polydye.offset_ink_extent(600., 300.)
+        size = polydye.OFFSET_PLAQUE
+        self.assertTrue(-size[0] + 6.5 <= x0 and x1 <= size[1] - 6.5 and -size[2] + 6.5 <= y0 and y1 <= size[3] - 6.5)
+        pd.dpi = 100.
+        with self.assertRaisesRegex(RuntimeError, "at dpi 100 and nozzle_dpi 300 the scales would reach .* beyond the "
+                                                  "plaque less its 6.5 mm margin"):
+            pd.cmd_POLYDYE_OFFSET_PRINT(self.gcmd(X=120., Y=100., EXTRUDER_TEMP=215.))
+        pd.dpi = 847.
+        # With the plaque the ink goes GAP above it: a Z that could be lower is refused.
+        with self.assertRaisesRegex(RuntimeError, "Z goes with PLAQUE=0"):
+            pd.cmd_POLYDYE_OFFSET_PRINT(self.gcmd(X=120., Y=100., EXTRUDER_TEMP=215., Z=0.2))
+        self.assertEqual((board.sent, self.uploads), ([], []))
+        # Only the ink: no plaque, nothing heated, Z as given.
+        pd.cmd_POLYDYE_OFFSET_PRINT(self.gcmd(X=120., Y=100., PLAQUE=0, Z=1.2))
+        script = [s for s in board.sent if isinstance(s, str)]
+        self.assertEqual(script[:3], ["SAVE_GCODE_STATE NAME=polydye_cal", "G90\nG1 Z1.200 F900",
+                                      "POLYDYE_ENABLE LIVE=1"])
+        pd.pass_axis = 'x'
+        with self.assertRaisesRegex(RuntimeError, "needs pass_axis: y"):
+            pd.cmd_POLYDYE_OFFSET_PRINT(self.gcmd())
+
+    def test_save(self):
+        import tempfile
+        pd, board = self.make()
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = os.path.join(tmp, "polydye.cfg")
+            with open(cfg, "w") as f:
+                f.write("[polydye]\npass_axis: y\noffset_x: 58.6\noffset_y: -8.7\nyellow_positions: 2\n")
+            os.chmod(cfg, 0o640)
+            pd.printer.get_start_args = lambda: {'config_file': os.path.join(tmp, "printer.cfg")}
+            pd.offset_x, pd.direction_trim, pd.registration = 58.25, -0.41, (-34, 1, 0, 0)
+            with mock.patch.object(polydye.os, "sync", create=True):
+                pd.cmd_POLYDYE_SAVE(self.gcmd())
+            with open(cfg) as f:
+                text = f.read()
+            # Registration only where it isn't zero or polydye.cfg has it already.
+            self.assertEqual(text, "[polydye]\ndirection_trim: -0.41\ncyan_columns: -34\ncyan_positions: 1\n"
+                                   "pass_axis: y\noffset_x: 58.25\noffset_y: 0\nyellow_positions: 0\n")
+            self.assertEqual(os.stat(cfg).st_mode & 0o777, 0o640)
+            self.assertEqual((pd.cfg_saves, os.listdir(tmp)), (1, ["polydye.cfg"]))
+            os.remove(cfg)
+            with self.assertRaisesRegex(RuntimeError, "couldn't store the values in"):
+                pd.cmd_POLYDYE_SAVE(self.gcmd())
 
 
 if __name__ == "__main__":
