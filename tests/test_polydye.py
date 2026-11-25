@@ -18,6 +18,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import polydye  # noqa: E402
 
 
+def bare_polydye():
+    """A PolyDye without its __init__ (no Klipper), with the state every command needs."""
+    pd = object.__new__(polydye.PolyDye)
+    pd.prewarm_cmd = pd.query_prewarm_cmd = pd.prewarm_sent = pd.prewarm_state = pd.boost_ready = None
+    pd.prewarm_seconds, pd.prewarm_gen = polydye.AUTO_PREWARM_S, 0
+    return pd
+
+
 class PassTiming(unittest.TestCase):
     def test_first_column_after_run_up(self):
         # 50 mm/s at 3000 mm/s^2: 1/60 s and 5/12 mm to reach speed; the rest of a 3 mm run-up is at full speed.
@@ -110,7 +118,7 @@ class StatusPoll(unittest.TestCase):
     """PolyDye._status_event, the background query that keeps printer.polydye current."""
 
     def make(self, query):
-        pd = object.__new__(polydye.PolyDye)
+        pd = bare_polydye()
         reactor = types.SimpleNamespace(NEVER=9e99)
         state = {'shutdown': False}
         pd.printer = types.SimpleNamespace(is_shutdown=lambda: state['shutdown'], get_reactor=lambda: reactor,
@@ -153,7 +161,7 @@ class StatusPoll(unittest.TestCase):
 
 class PrintEnd(unittest.TestCase):
     def test_a_cancelled_or_failed_print_turns_live_ink_off(self):
-        pd = object.__new__(polydye.PolyDye)
+        pd = bare_polydye()
         pd.oid, pd.boost_idle_s, pd.print_live, pd.last_fire, pd.live_off_pending = 0, 1800, False, 50., False
         sent, said = [], []
         pd.cancel_cmd = types.SimpleNamespace(send=lambda args: sent.append('cancel'))
@@ -249,7 +257,7 @@ class PrintEnd(unittest.TestCase):
 class StatusCommand(unittest.TestCase):
     def test_answers_while_the_first_background_query_is_in_flight(self):
         # Just after connecting: the poll's first query is waiting for the board and nothing is cached yet.
-        pd = object.__new__(polydye.PolyDye)
+        pd = bare_polydye()
         pd.querying, pd.last_status, pd.oid, pd.query_level_cmd = True, {}, 0, None
 
         def pause(waketime):
@@ -351,7 +359,7 @@ class TestCleanup(unittest.TestCase):
 
     def make(self, fail_on):
         board = FakeBoard()
-        pd = object.__new__(polydye.PolyDye)
+        pd = bare_polydye()
         pd.oid, pd.pass_axis = 0, 'y'
         pd.query_cartridge_cmd = object()
         pd.spit_patterns = tuple(polydye.SPIT_PATTERNS)
@@ -1264,6 +1272,137 @@ class AutoWarm(unittest.TestCase):
         self.assertIn("warm_seconds must be 0 (off) to 30", polydye.auto_warm_error(31., 8, 508))
 
 
+class Prewarm(unittest.TestCase):
+    """POLYDYE_PREWARM: a burst scheduled with the moves, and what it means for the next pass's warm-up."""
+
+    make = AutoWarm.make
+    warm = AutoWarm.warm
+
+    def gcmd(self, **params):
+        def get(name, default=None, **kw):
+            return params.get(name, default)
+        return types.SimpleNamespace(get=get, get_float=get, get_int=get, respond_info=self.said.append,
+                                     error=RuntimeError)
+
+    def board(self, pd, board):
+        """The board's burst commands: what was sent, and the last burst's state (clocks at 10 MHz)."""
+        self.sent, self.callbacks = [], []
+        pd.prewarm_cmd = types.SimpleNamespace(send=lambda args, reqclock=0: self.sent.append((args, reqclock)))
+        board.burst = {'state': 0, 'start': 0, 'end': 0, 'columns': 0}
+        pd.query_prewarm_cmd = types.SimpleNamespace(send=lambda args: dict(board.burst))
+        pd.mcu = types.SimpleNamespace(estimated_print_time=lambda eventtime: board.print_time,
+                                       print_time_to_clock=lambda t: int(round(t * 1e7)),
+                                       clock_to_print_time=lambda clock: clock / 1e7)
+        self.objects['toolhead'].register_lookahead_callback = self.callbacks.append
+        pd.warm_idle_time = 5.
+
+    def test_a_burst_goes_with_the_moves_and_turns_live_ink_on(self):
+        pd, board, runs, moves = self.make()
+        self.board(pd, board)
+        self.objects['toolhead'].dwell = lambda t: self.fail("no pause in the moves for the boost")
+        pd.cmd_POLYDYE_PREWARM(self.gcmd())
+        self.assertEqual((board.boost, board.live), (True, True))
+        # Sent once the moves before it are planned, for when they end: 6 s (prewarm_seconds) of 1-word pulses every
+        # 254 us.
+        self.assertEqual(self.sent, [])
+        self.callbacks[0](123.4)
+        self.assertEqual(self.sent, [([0, 1234000000, 23622, 254], 1234000000)])
+        self.assertEqual(pd.prewarm_sent['seconds'], 23622 * 254 / 1e6)
+        pd.cmd_POLYDYE_PREWARM(self.gcmd(SECONDS=3.))
+        self.callbacks[1](500.)  # the clock wraps at 32 bits
+        self.assertEqual(self.sent[-1], ([0, 5000000000 & 0xffffffff, 11811, 254], 5000000000))
+        # The boost was off: the moves went on, but the next pass waits for it to settle (0.15 s after it came on).
+        self.assertEqual(pd.boost_ready, 100.15)
+        dwells = []
+        self.objects['toolhead'].dwell = dwells.append
+        board.queued_until = 100.05
+        pd._wait_for_boost()
+        self.assertEqual([round(d, 6) for d in dwells], [0.1])
+        board.queued_until = 101.
+        pd._wait_for_boost()
+        self.assertEqual(len(dwells), 1)
+        with self.assertRaisesRegex(RuntimeError, "SECONDS=20 is too long: a burst is at most 65535 columns, 16.6 s"):
+            pd.cmd_POLYDYE_PREWARM(self.gcmd(SECONDS=20.))
+        self.assertEqual(len(self.callbacks), 2)
+        # Cancelled, or live ink off, before its moves were planned: the burst isn't sent.
+        for cancel in (lambda: pd.cmd_POLYDYE_CANCEL(self.gcmd()),
+                       lambda: pd.cmd_POLYDYE_ENABLE(self.gcmd(LIVE=0))):
+            sent = len(self.sent)
+            pd.cmd_POLYDYE_PREWARM(self.gcmd())
+            cancel()
+            self.callbacks[-1](600.)
+            self.assertEqual(len(self.sent), sent)
+        pd.cmd_POLYDYE_PREWARM(self.gcmd())
+        self.callbacks[-1](700.)
+        self.assertEqual(self.sent[-1][0][1], 7000000000 & 0xffffffff)
+        pd.prewarm_cmd = None
+        with self.assertRaisesRegex(RuntimeError, "POLYDYE_PREWARM: needs newer PolyDye board firmware"):
+            pd.cmd_POLYDYE_PREWARM(self.gcmd())
+
+    def test_a_pass_after_a_burst_needs_no_warm_up_of_its_own(self):
+        pd, board, runs, moves = self.make()
+        self.board(pd, board)
+        board.live, board.print_time = True, 100.
+        # No burst sent yet: a cold head, warmed at the warm spot.
+        self.warm(pd)
+        self.assertEqual(len(runs), 1)
+        pd.last_fire, pd.prewarm_sent = None, {'start': 190., 'end': 200., 'seconds': 10., 'clock': int(190e7)}
+        board.print_time = 200.
+        for state, start, end, columns, warms in (
+                (1, 190., 200., 0, False),        # queued: the pass cuts it short
+                (2, 190., 200., 0, False),        # firing: likewise
+                (2, 160., 170., 0, True),         # firing, but due to end 30 s before the pass: cold by then
+                (3, 187., 197., 39370, False),    # done 3 s before the pass
+                (4, 190., 199., 35000, False),    # made way for it
+                (3, 160., 170., 39370, True),     # done 30 s before: cold again
+                (4, 199.99, 199.99, 0, True),     # made way before a column
+                (5, 195., 195., 0, True)):        # skipped (live ink was off, say)
+            board.burst = {'state': state, 'start': int(start * 1e7), 'end': int(end * 1e7), 'columns': columns}
+            before, pd.last_fire = len(runs), None
+            self.warm(pd)
+            self.assertEqual(len(runs) > before, warms, (state, end))
+        self.assertIn("the head won't have fired for 30 s when the pass starts", self.said[-3])
+        self.assertIn("the head hasn't fired since Klipper started", self.said[-1])
+        # The board's 32-bit clocks are read near the burst's own, not now's: a burst that ended 430 s ago (more than
+        # half the 32-bit clock's 429.5 s round at 10 MHz) is still long ago.
+        pd.last_fire, pd.prewarm_sent = None, {'start': 500., 'end': 510., 'seconds': 10., 'clock': int(500e7)}
+        board.burst = {'state': 3, 'start': int(500e7) & 0xffffffff, 'end': int(510e7) & 0xffffffff, 'columns': 39370}
+        board.print_time, before = 940., len(runs)
+        self.warm(pd)
+        self.assertEqual(len(runs), before + 1)
+        self.assertIn("the head won't have fired for 430 s when the pass starts", self.said[-1])
+
+    def test_the_burst_in_status(self):
+        pd, board, runs, moves = self.make()
+        self.board(pd, board)
+        pd.warm_period_us = 254
+        self.assertEqual(pd._prewarm_text(), "prewarm burst: none since Klipper started")
+        self.assertEqual((pd._prewarm_status(), pd._head_idle_s(0.)),
+                         ({'available': True, 'state': 'none', 'seconds': None}, None))
+        pd.prewarm_sent = {'start': 90., 'end': 100., 'seconds': 10., 'clock': int(90e7)}
+        board.print_time = 104.
+        board.burst = {'state': 4, 'start': int(90e7), 'end': int(99e7), 'columns': 35433}
+        self.assertEqual(pd._prewarm_text(), "prewarm burst: made way after 9.0 s, 5 s ago")
+        self.assertEqual((pd._prewarm_status(), pd._head_idle_s(0.)),
+                         ({'available': True, 'state': 'made way', 'seconds': 9.0}, 5.0))
+        board.burst['state'] = 5
+        self.assertIn("prewarm burst: skipped", pd._prewarm_text())
+        pd.prewarm_cmd = None
+        self.assertEqual(pd._prewarm_text(), "prewarm bursts: need newer board firmware")
+
+    def test_warm_up_columns_keep_to_the_boards_limit(self):
+        # The board's rule is columns x period_us <= 30,000,000 in whole us: 30 s at 1016 us is 29527 columns, not
+        # 29528 (30.000448 s, refused with a shutdown on 2026-11-25).
+        self.assertEqual(polydye.warm_columns(30., 1016, 30.), 29527)
+        self.assertEqual(polydye.warm_columns(10., 254, 30.), 39370)
+        self.assertEqual(polydye.warm_columns(10., 254, 10.), 39370)
+        self.assertEqual(polydye.warm_columns(0.0001, 254, 30.), 1)
+        for period in range(254, 3000, 7):
+            self.assertLessEqual(polydye.warm_columns(30., period, 30.) * period, 30000000)
+        pd, board, runs, moves = self.make()
+        self.assertEqual(pd._warm_plan(self.gcmd(), "POLYDYE_WARM", 30., 1, 1016), (1, 1016, 29527))
+
+
 class RandomPattern(unittest.TestCase):
     """The random pattern's columns are the board's (printcart_pattern_random), so a fire test prints what a spit test
     fires."""
@@ -1335,7 +1474,7 @@ class BuildConfig(unittest.TestCase):
         returns (pd, the polydye_set_* commands sent on connect) or (pd, the config error)."""
         class ConfigError(Exception):
             pass
-        pd = object.__new__(polydye.PolyDye)
+        pd = bare_polydye()
         pd.oid, pd.cartridge_template, pd.pulse_words = 0, template, pulse_words
         pd.spit_patterns = pd.templates = ()
         pd.spit_run_cmd = pd.spit_random_cmd = None
@@ -1491,13 +1630,17 @@ class ConfigOptions(unittest.TestCase):
     def test_auto_warm_options(self):
         pd = self.load()
         self.assertEqual((pd.warm_seconds, pd.warm_pulse, pd.warm_period_us, pd.warm_idle_time, pd.warm_position,
-                          pd.warm_clearance, pd.warm_prespit), (10., 1, 254, 60., 'sponge', 10., 0.))
+                          pd.warm_clearance, pd.warm_prespit), (6., 1, 254, 5., 'sponge', 10., 0.))
         pd = self.load(warm_seconds='0', warm_position=' 5, 200.5 ')
         self.assertEqual((pd.warm_seconds, pd.warm_position), (0., (5., 200.5)))
         self.assertEqual(self.load(warm_position='Pass').warm_position, 'pass')
         self.assertIn("warm_position must be sponge (the default), X, Y", self.load(warm_position='here'))
         self.assertIn("heater duty", self.load(warm_pulse='8', warm_period_us='400'))
         self.assertIn("warm_position must be sponge (the default), X, Y", self.load(warm_position='5'))
+        # A burst is at most 65535 columns: 16.6 s at 254 us.
+        self.assertIn("prewarm_seconds 17 is too long: a burst is at most 65535 columns, 16.6 s at warm_period_us 254",
+                      self.load(prewarm_seconds='17'))
+        self.assertEqual(self.load(prewarm_seconds='16.5').prewarm_seconds, 16.5)
 
 
 
@@ -1651,7 +1794,7 @@ class CalibrationReadings(unittest.TestCase):
     """The calibration prints' readings, entered as printed, correct a simulated cartridge: a reprint reads 0."""
 
     def make(self):
-        pd = object.__new__(polydye.PolyDye)
+        pd = bare_polydye()
         pd.pass_axis, pd.dpi, pd.nozzle_dpi = 'y', 847., 300.
         pd.offset_x, pd.offset_y, pd.direction_trim, pd.registration = 58.6, -8.7, 0., (0, 0, 0, 0)
         pd._save = mock.Mock()
