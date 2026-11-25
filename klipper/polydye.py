@@ -1586,36 +1586,36 @@ class PolyDye:
         return True
 
     def _warmed_until(self, now):
-        """The print time the head last fired or was warmed until: the last fire, or the end of the last prewarm burst
-        if later. A burst still queued or firing warms until `now`, when the pass cuts it short; one skipped doesn't
-        count."""
-        last = self.last_fire
-        if self.prewarm_sent is None or self.query_prewarm_cmd is None:
-            return last
-        st = self._query_prewarm()
-        if st['state'] in ('queued', 'firing'):
-            end = now
-        elif st['state'] in ('done', 'made way') and st['columns']:
-            end = st['end']
-        else:
-            return last
-        return end if last is None else max(last, end)
+        """The print time the head last fired or was warmed until (by `now`, when a pass is due): the last fire, or the
+        end of the last prewarm burst if later. A burst still queued or firing warms until its planned end, or `now`
+        if the pass cuts it short first; one skipped, or ended before firing a column, doesn't count."""
+        if self.prewarm_sent is not None and self.query_prewarm_cmd is not None:
+            self._query_prewarm()
+        return self._warmed_cached(now)
 
     def _warmed_cached(self, now):
         """_warmed_until() from the board's last answer, without asking it again (for get_status())."""
         st = self.prewarm_state
+        last = self.last_fire
         if st is None or st['state'] not in ('queued', 'firing', 'done', 'made way'):
-            return self.last_fire
+            return last
         if st['state'] in ('done', 'made way') and not st['columns']:
-            return self.last_fire
-        end = now if st['state'] in ('queued', 'firing') else st['end']
-        return end if self.last_fire is None else max(self.last_fire, end)
+            return last
+        end = min(now, st['end']) if st['state'] in ('queued', 'firing') else st['end']
+        return end if last is None else max(last, end)
 
     def _query_prewarm(self):
-        """The board's account of the last prewarm burst: state, its start and end as print times, columns fired."""
+        """The board's account of the last prewarm burst (the last one sent: each replaces the board's record): state,
+        its start and end as print times, columns fired. Its 32-bit clocks are within seconds of the clock the burst
+        was sent for, not of now: the record stays as it was for as long as no burst follows, beyond the 7 minutes
+        after which a 32-bit clock read against now comes round again."""
         params = self.query_prewarm_cmd.send([self.oid])
         n = params['state']
-        to_time = lambda clock: self.mcu.clock_to_print_time(self.mcu.clock32_to_clock64(clock))
+        sent = self.prewarm_sent['clock']
+
+        def to_time(clock):
+            diff = (clock - sent) & 0xffffffff
+            return self.mcu.clock_to_print_time(sent + diff - ((diff & 0x80000000) << 1))
         self.prewarm_state = {'state': PREWARM_STATES[n] if n < len(PREWARM_STATES) else str(n),
                               'start': to_time(params['start']), 'end': to_time(params['end']),
                               'columns': params['columns']}
@@ -1648,7 +1648,7 @@ class PolyDye:
         clock = self.mcu.print_time_to_clock(print_time)
         self.prewarm_cmd.send([self.oid, clock & 0xffffffff, columns, period], reqclock=clock)
         self.prewarm_sent = {'start': print_time, 'end': print_time + columns * period / 1e6,
-                             'seconds': columns * period / 1e6}
+                             'seconds': columns * period / 1e6, 'clock': clock}
         logging.info("polydye: prewarm burst at print_time %.3f: %d columns every %d us (%.1f s)", print_time,
                      columns, period, columns * period / 1e6)
 

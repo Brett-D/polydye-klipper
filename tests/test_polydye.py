@@ -1292,7 +1292,6 @@ class Prewarm(unittest.TestCase):
         pd.query_prewarm_cmd = types.SimpleNamespace(send=lambda args: dict(board.burst))
         pd.mcu = types.SimpleNamespace(estimated_print_time=lambda eventtime: board.print_time,
                                        print_time_to_clock=lambda t: int(round(t * 1e7)),
-                                       clock32_to_clock64=lambda clock: clock,
                                        clock_to_print_time=lambda clock: clock / 1e7)
         self.objects['toolhead'].register_lookahead_callback = self.callbacks.append
         pd.warm_idle_time = 5.
@@ -1336,11 +1335,12 @@ class Prewarm(unittest.TestCase):
         # No burst sent yet: a cold head, warmed at the warm spot.
         self.warm(pd)
         self.assertEqual(len(runs), 1)
-        pd.last_fire, pd.prewarm_sent = None, {'start': 88., 'end': 98., 'seconds': 10.}
+        pd.last_fire, pd.prewarm_sent = None, {'start': 190., 'end': 200., 'seconds': 10., 'clock': int(190e7)}
         board.print_time = 200.
         for state, start, end, columns, warms in (
                 (1, 190., 200., 0, False),        # queued: the pass cuts it short
                 (2, 190., 200., 0, False),        # firing: likewise
+                (2, 160., 170., 0, True),         # firing, but due to end 30 s before the pass: cold by then
                 (3, 187., 197., 39370, False),    # done 3 s before the pass
                 (4, 190., 199., 35000, False),    # made way for it
                 (3, 160., 170., 39370, True),     # done 30 s before: cold again
@@ -1352,6 +1352,14 @@ class Prewarm(unittest.TestCase):
             self.assertEqual(len(runs) > before, warms, (state, end))
         self.assertIn("the head won't have fired for 30 s when the pass starts", self.said[-3])
         self.assertIn("the head hasn't fired since Klipper started", self.said[-1])
+        # The board's 32-bit clocks are read near the burst's own, not now's: a burst that ended 430 s ago (more than
+        # half the 32-bit clock's 429.5 s round at 10 MHz) is still long ago.
+        pd.last_fire, pd.prewarm_sent = None, {'start': 500., 'end': 510., 'seconds': 10., 'clock': int(500e7)}
+        board.burst = {'state': 3, 'start': int(500e7) & 0xffffffff, 'end': int(510e7) & 0xffffffff, 'columns': 39370}
+        board.print_time, before = 940., len(runs)
+        self.warm(pd)
+        self.assertEqual(len(runs), before + 1)
+        self.assertIn("the head won't have fired for 430 s when the pass starts", self.said[-1])
 
     def test_the_burst_in_status(self):
         pd, board, runs, moves = self.make()
@@ -1360,7 +1368,7 @@ class Prewarm(unittest.TestCase):
         self.assertEqual(pd._prewarm_text(), "prewarm burst: none since Klipper started")
         self.assertEqual((pd._prewarm_status(), pd._head_idle_s(0.)),
                          ({'available': True, 'state': 'none', 'seconds': None}, None))
-        pd.prewarm_sent = {'start': 90., 'end': 100., 'seconds': 10.}
+        pd.prewarm_sent = {'start': 90., 'end': 100., 'seconds': 10., 'clock': int(90e7)}
         board.print_time = 104.
         board.burst = {'state': 4, 'start': int(90e7), 'end': int(99e7), 'columns': 35433}
         self.assertEqual(pd._prewarm_text(), "prewarm burst: made way after 9.0 s, 5 s ago")
