@@ -93,8 +93,9 @@ does. It shows:
   `[polydye]` section of `polydye.cfg`. Klipper applies them after a restart.
 - **Ink position:** live nudges for lining the ink up with the plastic. Pick a step (0.02–0.4 mm) and move the
   ink ±X or ±Y, or move only the reverse passes along the pass axis (direction trim). Nudges apply from the next
-  pass, also during a print, with no restart. Values not yet in `polydye.cfg` show "not stored". **Store** writes
-  them into `polydye.cfg` and **Back to stored values** undoes the nudges.
+  pass, also during a print, with no restart. The colour registration is shown too. Values not yet in `polydye.cfg`
+  show "not stored". **Store** writes them into `polydye.cfg` (`POLYDYE_SAVE`) and **Back to stored values** undoes
+  the nudges.
 - **Calibration:**
   - **Fire test** (live ink on paper, with a confirmation): one stripe per template and fire pulse, side by side, with
     a table of where each stripe goes (`PD_FIRE_TEST`). The default is one stripe of the stock firmware's settings and
@@ -105,6 +106,8 @@ does. It shows:
   - Both tests have the **like stock** pattern with its knobs (density, repeat, colours, first and last position,
     heaters per pulse; shown when it is picked), and a **warm-up** (seconds, pulse, period): the spit test's runs in
     the same board run right before the spit, the fire test's right before each stripe.
+  - **Alignment page** and **Offset print** (see "Calibration prints"): print buttons, then boxes for the numbers you
+    read off the print; **Apply and store** corrects the settings and writes them into `polydye.cfg`.
 - **Signal check** (cartridge out, multimeter): a guided check of where each cartridge signal arrives. The page
   holds one line HIGH at a time (`POLYDYE_LEVEL`) and shows the voltage to expect. You probe at one of two places:
   - **CD4504 output legs** on the daughter board, black lead on pin 8: the page shows the leg each line should
@@ -252,6 +255,11 @@ offset_y: -8.7
 #warm_position: sponge # where warm-ups run: sponge (POLYDYE_WIPE's X), X, Y over printed plastic, or pass
 #warm_clearance: 10   # mm behind the pass's run-up start, for warm_position: pass
 #warm_prespit: 0      # s of stock-pattern spit at the warm spot right after a warm-up (0: none; up to 5)
+#cyan_columns: 0      # colour registration (POLYDYE_ALIGN sets these): cyan's and yellow's dots against magenta's,
+#cyan_positions: 0    #   in bus columns along the pass (DIR=1's order) and nozzle positions across it
+#yellow_columns: 0
+#yellow_positions: 0
+#nozzle_dpi: 300      # nozzles per inch across the pass: the offset print's X scale
 #mcu: polydye
 #data_port:           # the board's data port; default: the [mcu polydye] serial path with -if02 instead of -if00
 ```
@@ -336,7 +344,11 @@ If anything would print a pass wrongly, Klipper stops with a readable reason, fo
 | `POLYDYE_CANCEL` | Drops passes that are scheduled but not started (for a cancel macro). The add-on does this itself, and turns live ink off, within 2 s of a print being cancelled or stopping with an error: the print's own `POLYDYE_ENABLE LIVE=0` never runs then (`CANCEL_PRINT` waits for the command running, such as a pass's warm-up) |
 | `POLYDYE_STATUS` | Board status: boost, live, passes printed and queued, worst column lateness, faults, stored passes, cartridge template, fire pulse; and the offsets and direction trim in use |
 | `POLYDYE_NUDGE [X=] [Y=] [TRIM=]` | Moves where the ink lands by `X`, `Y` mm on the bed, and the ink of reverse passes by `TRIM` mm along the pass axis (each at most ±5 mm), from the next pass on. Changes `offset_x`/`offset_y` (in the opposite direction: the offset is where the cartridge is) and `direction_trim` until the next restart |
-| `POLYDYE_OFFSET [X=] [Y=] [TRIM=]` | Sets `offset_x`, `offset_y` and `direction_trim` until the next restart; without arguments, shows them |
+| `POLYDYE_OFFSET [X=] [Y=] [TRIM=] [CYAN_COLUMNS=] [CYAN_POSITIONS=] [YELLOW_COLUMNS=] [YELLOW_POSITIONS=] [X_TICK=] [Y_TICK=] [SAVE=]` | Sets `offset_x`, `offset_y`, `direction_trim` and the colour registration until the next restart; without arguments, shows them. `X_TICK`, `Y_TICK` are the offset print's readings: they move the ink by that many ticks and store the offsets in `polydye.cfg` (`SAVE=0`: don't). `SAVE=1` stores the others too |
+| `POLYDYE_SAVE` | Stores the offsets, direction trim and colour registration in use in `polydye.cfg` (next to `printer.cfg`; the colour registration once it isn't zero) |
+| `POLYDYE_ALIGN_PRINT [X=] [Y=] [Z=] [SPACING=8]` | **Live ink, on paper only.** The alignment page (see "Calibration prints"), its rows `SPACING` mm apart across the pass axis, the first at `X`, `Y` (default: centred where the cartridge reaches). Moves to `Z` first if given. Doesn't home (`PD_ALIGN_PRINT` does) |
+| `POLYDYE_ALIGN [CYAN=] [YELLOW=] [DIRECTION=] [CYAN_X=] [YELLOW_X=] [SAVE=1]` | The alignment page's readings, the block number where each row lines up (−16 to 16; e.g. −11.5 between two blocks): corrects the colour registration and `direction_trim` and stores them in `polydye.cfg` (`SAVE=0`: until the next restart only) |
+| `POLYDYE_OFFSET_PRINT [X=] [Y=] [LAYERS=5] [LAYER_HEIGHT=0.2] [GAP=1] [EXTRUDER_TEMP=] [BED_TEMP=] [PLAQUE=1] [Z=]` | **PLA and live ink** (`pass_axis: y`). A PLA plaque with a cross-shaped groove in its top 3 layers, centred on `X`, `Y`, then ink scales across the groove from `GAP` mm above the plaque; read them with `POLYDYE_OFFSET X_TICK= Y_TICK=` (see "Calibration prints"). Heats to `EXTRUDER_TEMP` and `BED_TEMP` if given, else needs the hotend's target set for PLA; the hotend and the part fan are off afterwards, also after an error. `PLAQUE=0` prints only the ink onto a plaque printed before, at `Z` (default: its top, `LAYERS` × `LAYER_HEIGHT`, plus `GAP`). Refused if the scales wouldn't stay 6.5 mm inside the plaque at the `dpi` and `nozzle_dpi` set. Doesn't home (`PD_OFFSET_PRINT` does) |
 | `POLYDYE_CARTRIDGE [TEMPLATE=color_b_late\|black_a\|black_b] [PULSE=6..8]` | Switches the board's waveform template and fire pulse until the next restart (to compare them at the nozzle check); without arguments, shows them and the bus clock. Only with live ink off and no passes queued (with older board firmware, the boost off too) |
 | `POLYDYE_UPLOAD_TEST_PASS [LAYER=0] [PASS=0] [COLUMNS=600] [PATTERN=alternate\|all\|none\|stock] [REPEAT=1] [DENSITY=] [COLORS=] [FIRST=] [LAST=] [PER_PULSE=]` | Uploads a test pass over the board's data port. `alternate` (the dry run's) fires every nozzle in every other column, `all` in every column and `none` in none; `stock` is the stock firmware's random pattern with its knobs (below; `REPEAT` defaults to 2 there, at most 16; colour cartridges only); `REPEAT` sends each column that many times in a row, so the pass has `COLUMNS` × `REPEAT` columns (at most 65535). Not during a print: it briefly blocks Klipper while it sends |
 | `POLYDYE_FIRE_TEST [X=70] [Y=60] [Z=] [SPACING=18] [STRIPES=…] [PATTERN=stock\|all] [DENSITY=] [REPEAT=] [COLORS=] [FIRST=] [LAST=] [PER_PULSE=] [WARM=0] [WARM_PULSE=] [WARM_PERIOD_US=] [COLUMNS=600] [UPLOAD=1] [LAYER=0] [PASS=0]` | **Live ink.** Prints one stripe per `TEMPLATE:PULSE` in `STRIPES` (e.g. `color_b_late:6,color_b_late:8`): a pass of `COLUMNS` columns along the pass axis, the stripes `SPACING` mm apart across it, the first at `X`, `Y`. The default is one stripe with the stock firmware's settings, `color_b_late:6`. `PATTERN=stock` (the default) prints the stock firmware's random pattern, the one that ejects ink on a cold head, with the spit test's knobs (below), on any board firmware: the add-on makes the columns. Without `WARM` each stripe's pass warms a cold head by itself (see "Automatic head warm-up"); `WARM` instead warms the head for that many seconds right before each stripe (its `POLYDYE_PASS WARM`, with the stripe's template, at the pass's warm spot, so only a short travel and the run-up come in between; board firmware with the warm-up), and `WARM=0` not at all. `UPLOAD=0` prints the pass already stored as `LAYER`, `PASS` instead. Moves to `Z` first if given. Refused during a print, also a paused one, and with a black stripe for `PATTERN=stock` (a colour pattern) before anything moves. Afterwards, also after an error, turns live ink off (and the boost too with older board firmware; with this add-on's bundled firmware the boost stays on, as stock keeps it, until `POLYDYE_DISABLE`, a shutdown or 30 min unused; see "Stock baseline") and puts the template, pulse and G-code state back. Doesn't home (`PD_FIRE_TEST` does) |
@@ -351,6 +363,8 @@ Macros (Mainsail's Macros panel, while the board is plugged in):
 | `PD_STATUS` | `POLYDYE_STATUS` |
 | `PD_DRY_RUN_TEST [X=100] [Y=40]` | Homes if needed, lifts Z to 20 mm, uploads a test pass and prints it in both directions without ink, then reports status. The printer moves; nothing fires |
 | `PD_OFF` | Drops queued passes, then turns live output and the boost off |
+| `PD_ALIGN_PRINT [X=] [Y=] [Z=1] [SPACING=8]` | **Live ink, on paper only.** Refused during a print. Homes if needed, then prints the alignment page (`POLYDYE_ALIGN_PRINT`) at `Z` |
+| `PD_OFFSET_PRINT [X=] [Y=] [LAYERS=] [LAYER_HEIGHT=] [GAP=] [EXTRUDER_TEMP=] [BED_TEMP=]` | **PLA and live ink.** Refused during a print. Homes if needed, then runs `POLYDYE_OFFSET_PRINT` |
 | `PD_FIRE_TEST [X=70] [Y=60] [Z=0.5] [SPACING=18] [PATTERN=stock\|all] [STRIPES=…] [COLUMNS=] [DENSITY=] [REPEAT=] [COLORS=] [FIRST=] [LAST=] [PER_PULSE=] [WARM=] [WARM_PULSE=] [WARM_PERIOD_US=]` | **Live ink.** Refused during a print (also a paused one) before anything moves. Homes if needed, then runs `POLYDYE_FIRE_TEST` at `Z`; the knobs mean `PATTERN=stock` unless you give another |
 | `POLYDYE_WIPE [X=245] [LENGTH=25] [STROKES=3] [SPEED=50] [Z_HOP=1]` | Wipes the cartridge on a damp sponge at the right end of the X gantry: lifts Z by `Z_HOP`, moves to `X` (G-code coordinates; 245 suits the PolyDye mount and keeps clear of the parts at the end of the gantry), strokes `STROKES` times between `X` and `X - LENGTH` at `SPEED` mm/s, then returns. It refuses an `X` at or beyond the X axis maximum (your hard stop) before homing or moving. Homes first if needed |
 
@@ -493,6 +507,51 @@ and `WARM=0` for none.
   with older firmware passes go ahead unwarmed, and the page says so.
 - `printer.polydye.auto_warm` has the settings (and `available`), `head_idle_s` the seconds since the head last fired
   (none yet: null); the page's Board card shows the head.
+
+### Calibration prints
+
+Two prints, drawn by the add-on on the Pi (no PC or slicer), set the colour registration, the direction trim and the
+cartridge offset. **No ink may land on the glass bed**, so all their ink goes on paper (the alignment page) or on
+printed PLA (the offset print), the priming included, and the head warms over the wipe sponge. Each strip starts with a priming block, 300
+columns (9 mm) of the stock pattern in all three colours, printed first: nozzles that hadn't fired for a while missed
+their first marks even right after a warm-up, and strips led in like this printed every colour from their first column
+(vernier page 2, 2026-11-25). The passes go on the board as layer 65000 (it replaces what was there), at 128 kB/s.
+Then the head warms once with the automatic warm-up's settings (if it's on) over the wipe sponge at `POLYDYE_WIPE`'s
+X, whatever `warm_position` says: up by its `z_hop`, across, warm, back over the first strip at that height and down.
+The passes follow without warming again; each strip's priming block fires real ink right before its marks.
+Afterwards, also after an error, live ink goes off and the G-code state is put back.
+
+**Alignment page** (`PD_ALIGN_PRINT`, **on paper only**: tape at least 70 × 130 mm of paper over the glass where the
+cartridge reaches; 7 rows 8 mm apart, 113 mm long, plus the priming blocks). Every row has blocks −16 to 16,
+2.9 mm apart, numbered on the first and last rows; find the block where the row's marks line up best:
+
+| Row | Marks | Reading |
+|---|---|---|
+| C, Y | a magenta bar, and the cyan (yellow) bar 3k columns further | `CYAN=k`, `YELLOW=k`: that colour's dots move 3k columns |
+| D | magenta bars printed forwards, and backwards 2k columns further | `DIRECTION=k`: `direction_trim` changes by 2k × 25.4 / dpi mm |
+| CX, YX | a 2-position magenta line, and the cyan (yellow) line k positions further across | `CYAN_X=k`, `YELLOW_X=k`: that colour's dots move k positions |
+
+Then `POLYDYE_ALIGN CYAN= YELLOW= DIRECTION= CYAN_X= YELLOW_X=` (any of them) corrects the settings and stores them;
+print the page again to check that every row reads 0. The colour rows sit side by side along the pass, so their
+offset is fixed on the bed: in a reverse pass a colour's dots move the other way in column order (the corrected word
+printed without fringes in both directions on page 2). Brett's cartridge: `cyan_columns: -34`, `cyan_positions: 1`,
+`yellow_columns: 27`, `yellow_positions: 0`, `direction_trim: -0.41`.
+
+**The colour registration applies to the passes the add-on draws** (these prints, and the test image to come).
+The board doesn't know a pass's direction, so `.pdj` jobs need it applied by whatever makes them.
+
+**Offset print** (`PD_OFFSET_PRINT`, `pass_axis: y`). A 26 × 38 mm PLA plaque, `LAYERS` of `LAYER_HEIGHT` (5 × 0.2
+mm), with a 1 mm cross-shaped groove through its top 3 layers centred on `X`, `Y`; then, from `GAP` (1 mm) above the
+plaque, two magenta scales across the groove: the X scale's lines run along Y, 3 nozzle positions apart (0.254 mm at
+`nozzle_dpi: 300`), the Y scale's run along X, about 0.24 mm apart (8 columns at `dpi: 847`). The plaque reaches 6.5 mm
+beyond all the ink, so ink that lands that far off still lands on plastic. Tick 0 is where the groove's middle should
+be: it is the longest, every 4th tick is long and every 8th numbered. On each scale find the tick in the middle of the
+groove (halfway between the last whole ticks either side of it; between two ticks reads as e.g. 2.5) and enter it:
+`POLYDYE_OFFSET X_TICK= Y_TICK=` moves the ink there and stores `offset_x` and `offset_y`. Print again to check that
+both read 0. If the groove misses a scale (beyond ±2.8 mm in X or ±2.9 mm in Y), correct the offset by what you
+measure with a ruler (`POLYDYE_NUDGE`) and print again. `nozzle_dpi` sets the X scale's tick size; if it's off, the
+reading is too by the same factor, and a second print corrects the rest. A prime line of PLA goes down 3 mm left of
+the plaque.
 
 ### Experimental: head warm-up
 
