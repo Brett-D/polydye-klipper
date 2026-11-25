@@ -235,6 +235,7 @@ function headText(pd) {
   const fired = idle === null || idle === undefined ? 'not fired since Klipper started'
     : `last fired ${idle < 120 ? `${Math.round(idle)} s` : `${(idle / 60).toFixed(0)} min`} ago`;
   if (!warm || !warm.seconds) return `${fired} (automatic warm-up off)`;
+  if (warm.available === false) return `${fired} (automatic warm-up needs newer board firmware: Update to bundled firmware)`;
   const cold = idle === null || idle === undefined || idle > warm.idle_time;
   return cold ? `${fired}: a live pass warms it first (${warm.seconds} s)` : `${fired}: warm`;
 }

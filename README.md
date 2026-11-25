@@ -245,11 +245,11 @@ offset_y: -8.7
 #extra_run_up: 1.0    # mm added to the computed run-up
 #settle_time:         # s; default: the input shaper's impulse length for the pass axis
 #min_lead_time: 0.025 # s; a pass must be scheduled at least this far ahead
-#warm_seconds: 10     # s of automatic head warm-up before a live pass on a cold head; 0 turns it off
-#warm_pulse: 8        # its pulse in bus words (8 = 2.80 us)
-#warm_period_us: 508  # one all-nozzle warm-up column every this many us (at most 0.58 % heater duty)
+#warm_seconds: 13     # s of automatic head warm-up before a live pass on a cold head; 0 turns it off
+#warm_pulse: 2        # its pulse in bus words (2 = 0.70 us, too short to boil ink; up to 8 = 2.80 us)
+#warm_period_us: 250  # one all-nozzle warm-up column every this many us (at most 0.58 % heater duty)
 #warm_idle_time: 60   # s without firing after which the head counts as cold again
-#warm_position: sponge # where warm-ups run: sponge (POLYDYE_WIPE's X), X, Y (bed spot of the cartridge), or here
+#warm_position: here  # where warm-ups run: here, sponge (POLYDYE_WIPE's X), or X, Y (bed spot of the cartridge)
 #mcu: polydye
 #data_port:           # the board's data port; default: the [mcu polydye] serial path with -if02 instead of -if00
 ```
@@ -448,32 +448,38 @@ On paper the stock pattern needs a hot head too (4 of 4 bold three-colour spits 
 ### Automatic head warm-up
 
 The cartridge prints only with a warm head: on 13c5d27 (2026-11-24) a cold head gave nothing, or cyan only, and the
-same stripe or spit right after 10 s of every nozzle at 2.80 µs every 508 µs printed all three colours. The head cools
-again within minutes (4–13). So a live `POLYDYE_PASS` (a print's, the fire test's, an alignment print's) warms the
-head first when it hasn't fired since Klipper started or not for `warm_idle_time` seconds (60): it waits for the moves
-and passes before it, then the board runs `warm_seconds` (10) of every nozzle at `warm_pulse` words (8, 2.80 µs) every
-`warm_period_us` (508), standing still over a waste spot (below), and the pass follows with live ink still on. The
-decision is made for when the pass can start, after the moves already queued. A dry-run pass (`POLYDYE_ENABLE
-LIVE=0`) fires nothing, so it neither warms nor keeps the head warm; spit tests and warm-ups count as firing.
+same stripe or spit right after a warm-up printed all three colours. The head cools again within minutes (4–13). So a
+live `POLYDYE_PASS` (a print's, the fire test's, an alignment print's) warms the head first when it won't have fired
+since Klipper started, or not for `warm_idle_time` seconds (60), by the time the pass can start (after the moves
+already queued). It waits for the moves and passes before it, then the board runs `warm_seconds` (13) of every nozzle
+at `warm_pulse` words (2: 0.70 µs) every `warm_period_us` (250), standing still, and the pass follows with live ink
+still on. A dry-run pass (`POLYDYE_ENABLE LIVE=0`) fires nothing, so it neither warms nor keeps the head warm; live
+passes (also with the warm-up off), spit tests and warm-ups count as firing.
 
-- **Never over the print.** On a cold head every nozzle at once only heats it, but a head still hot from firing spits
-  during the warm-up: on 48483ab, back-to-back fire tests with `WARM=10` left a big C/M/Y blob a few mm past each
-  previous stripe, where the next warm-up ran. So warm-ups (and the fire test's `WARM`) run over `warm_position`:
-  - `sponge` (the default): the wipe sponge, at `POLYDYE_WIPE`'s X (G-code coordinates; `variable_x`, 245);
-  - `X, Y`: a bed spot for the cartridge (bed coordinates, like `POLYDYE_PASS`'s X and Y), e.g. a strip of paper towel;
-  - `here`: where the toolhead stands (bench use only).
+- **Sub-threshold by default.** 0.70 µs is too short to boil ink, so the warm-up heats the head without spitting: on
+  48483ab (2026-11-25) 10 s of it every 192 µs, then a stripe, printed a dark 3-colour stripe with no blob, as good as
+  after a 2.80 µs warm-up. A 2.80 µs warm-up (8 words, the 13c5d27 recipe) spits a puddle once the head is warm, which
+  left a C/M/Y blob past each stripe of back-to-back fire tests. At 192 µs, the fastest a 2-word column allows, the
+  board missed 92 column times with the bus still busy, so the default period is 250 µs, for 13 s: the same 52,000
+  pulses per nozzle.
+- **Where:** `warm_position` is `here` by default (in place). A longer warm-up pulse, or belt and braces, can run over a
+  waste spot instead; the fire test's `WARM` runs there too:
+  - `sponge`: the wipe sponge, at `POLYDYE_WIPE`'s X (G-code coordinates; `variable_x`, 245);
+  - `X, Y`: a bed spot for the cartridge (bed coordinates, like `POLYDYE_PASS`'s X and Y), e.g. a strip of paper towel.
 
-  The toolhead rises by `POLYDYE_WIPE`'s `z_hop` (1 mm), travels there at `travel_speed`, warms, travels back at that
-  height and comes down, so the pass (or stripe) starts from where it was.
+  The toolhead rises by `POLYDYE_WIPE`'s `z_hop` (1 mm, no higher than the Z axis allows), travels there at
+  `travel_speed`, warms, travels back at that height and comes down, so the pass (or stripe) starts from where it was.
+  If a warm-up there fails, the board's run is cancelled and the cartridge goes back only once the board is seen idle;
+  otherwise it stays over the spot.
 - During a print it costs `warm_seconds` each time the head has been idle that long (between layers, typically), with
   the hotend standing still.
 - `POLYDYE_FIRE_TEST` without `WARM` warms through its passes like this; `WARM=` gives each stripe its own warm-up
   instead (over `warm_position` too), and `WARM=0` none (for a cold-head comparison). `POLYDYE_SPIT` and
   `POLYDYE_WARM` warm only when asked, in place (they don't move).
 - `warm_seconds: 0` turns it off. It needs board firmware with the warm-up duty limit (this add-on's bundled firmware);
-  with older firmware passes go ahead unwarmed.
-- `printer.polydye.auto_warm` has the settings and `head_idle_s` the seconds since the head last fired (none yet:
-  null).
+  with older firmware passes go ahead unwarmed, and the page says so.
+- `printer.polydye.auto_warm` has the settings (and `available`), `head_idle_s` the seconds since the head last fired
+  (none yet: null); the page's Board card shows the head.
 
 ### Experimental: head warm-up
 
