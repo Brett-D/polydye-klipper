@@ -229,6 +229,17 @@ class Ink(unittest.TestCase):
         self.assertLess(min(d[4] for d in dots), 95.1)
         self.assertLess(min(d[3] for d in dots), 95.1)
 
+    def test_no_ink_beyond_the_models_surface(self):
+        # With a brim below, the plastic reaches past the block's surface (X, Y 94.99, its outer lines' edges): the
+        # ink still stops --inset (0.05 mm) inside it, and reaches it with --inset 0; 0.2 keeps it 0.2 mm in.
+        for args, inside in (((), 0.05), (("--inset", "0"), 0.), (("--inset", "0.2"), 0.2)):
+            out, _ = run(block_gcode(layers=4, brim=True), *args)
+            _, _, dots = job_dots(out)
+            xs, ys = [d[3] for d in dots], [d[4] for d in dots]
+            edge = 94.99 + inside
+            self.assertTrue(edge <= min(xs) < edge + 0.12 and edge <= min(ys) < edge + 0.12, (args, min(xs), min(ys)))
+            self.assertTrue(200. - edge - 0.12 < max(xs) <= 200. - edge, (args, max(xs)))
+
     def test_every_fire_is_at_least_two_columns(self):
         # Whatever the registration moves (an odd number of columns too) and in both directions.
         out, _ = run(block_gcode(layers=3, band=4., config={'filament_colour': '#FFFFFF;#4060A0'}), "--edge-margin",
@@ -243,7 +254,8 @@ class Ink(unittest.TestCase):
         # #FF00FF: no cyan or yellow, magenta at the ink limit: every dot by default (100 %, solid), half the dots at
         # 50 %, a quarter at 25 %.
         for limit, share in (("100", 1.), ("50", 0.5), ("25", 0.25)):
-            out, _ = run(block_gcode(layers=1, band=4., top=True), "--edge-margin", "0", "--ink-limit", limit)
+            out, _ = run(block_gcode(layers=1, band=4., top=True), "--edge-margin", "0", "--inset", "0",
+                         "--ink-limit", limit)
             _, records, dots = job_dots(out)
             # The band: 9.6 mm lines 0.4 mm apart filling 4 mm, plus the lines' half widths all round.
             area = (9.6 + 0.42) * (4. + 0.02) / (SX * PITCH)

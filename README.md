@@ -323,9 +323,11 @@ after the layer's last extrusion, `--gap` mm (1) above it, so the next layer sea
    post-processor refuses differing ones). **A filament's colour is the ink**: white (`#FFFFFF`) prints none; any other
    colour becomes cyan, magenta and yellow (`1 − R`, `1 − G`, `1 − B`).
 4. Process: **Prime tower off**; **Arc fitting off** (Quality > Precision); Print sequence **By layer**; no spiral vase;
-   Multimaterial > *Maximum width of a segmented region* **1.5 mm**, so painted colours are a thin shell. A **brim** is
-   recommended: ink is only put where a drop that lands up to `--edge-margin` (0.5 mm) off still lands on plastic, so
-   without one the first layers' colours stop short of the model's edge.
+   Multimaterial > *Maximum width of a segmented region* **2.5 mm**, so painted colours are a shell that deep: through
+   translucent PLA a deeper shell reads stronger (on the first full-colour box, 2–2.5 mm deep walls came out solid and
+   crisp, 1.6 mm streaky, 1.2 mm light and streaked; 2.5 mm at 100 % bonded fine). A **brim** is recommended: ink is
+   only put where a drop that lands up to `--edge-margin` (0.5 mm) off still lands on plastic, so without one the
+   first layers' colours stop short of the model's edge.
 5. Others > Post-processing Scripts: `"C:\path\to\python.exe" "C:\path\to\polydye_post.py";` (add options before
    the `;`, e.g. `--prime-idle 60`).
 
@@ -357,7 +359,8 @@ ink, one object at a time, cut into passes along Y about 5.8 mm wide (68 nozzle 
   made with them); `dpi` and `nozzle_dpi` must match (the job is refused otherwise). It needs `data_port`.
 
 **Options** (all optional): `--ink-limit` %, `--wall-coats`, `--top-coats`, `--gap` mm, `--dry` s (5: the ink dries
-before the next layer), `--retract` mm (1.5), `--travel` mm/s (150), `--edge-margin` mm (0.5), `--positions` (16-83:
+before the next layer), `--retract` mm (1.5), `--travel` mm/s (150), `--edge-margin` mm (0.5), `--inset` mm (0.05: the ink stops that far
+inside the model's surface, so none lands on a base or brim below it), `--positions` (16-83:
 two to spare each way for the colour registration), `--one-direction`, `--prewarm` s (6; 0: none), `--prime-idle` s
 (90; 0: never), `--dpi`, `--nozzle-dpi`, `--pass-speed` (polydye.cfg's), and `--accel`, `--scv`, `--max-velocity` for
 the timing (default: the profile's). `--dry-run` runs the passes with live ink off, and without bursts or primes.

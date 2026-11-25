@@ -20,7 +20,9 @@ post-processing script, this then rewrites the G-code:
   PolyDye Klipper add-on stream it to the board while the print runs.
 
 No ink on the glass bed: a dot is only inked where a drop landing up to --edge-margin mm off still lands on plastic
-printed so far (with a brim, the colour reaches the model's edge).
+printed so far (with a brim, the colour reaches the model's edge). Nor beyond the model's surface: a dot is only inked
+where the layer's own part reaches at least --inset mm further out (ink outside the wall fell on the base below and
+smeared at its foot, 2026-11-25).
 
 The add-on applies the colour registration and direction trim from polydye.cfg, so recalibrating needs no re-slice;
 dpi and nozzle_dpi must be the ones in polydye.cfg (POLYDYE_JOB checks).
@@ -425,6 +427,8 @@ def layer_passes(layer, grid, support, tools, objects, opts, pitch):
     # Snapped to cells, the support can reach half a cell diagonal past the lines: the margin allows for that.
     margin = opts.edge_margin + math.hypot(grid.sx, grid.sy) / 2. if opts.edge_margin else 0.
     hy, hx = int(math.ceil(margin / grid.sy)), int(math.ceil(margin / grid.sx))
+    # The model's surface: its cells (snapped like the ink's) eroded by --inset, at least a cell where it's set.
+    iy, ix = ((int(math.ceil(opts.inset / grid.sy)), int(math.ceil(opts.inset / grid.sx))) if opts.inset else (0, 0))
     p_lo, p_hi = opts.positions
     width = p_hi - p_lo + 1
     bayer = (np.array(BAYER, np.float32) + .5) / 64.
@@ -444,6 +448,14 @@ def layer_passes(layer, grid, support, tools, objects, opts, pitch):
         allowed = erode(close(support[wr0:r1 + hy + 1, wg0:g1 + hx + 1]), hy, hx)
         allowed = allowed[r0 - wr0:, g0 - wg0:][:r1 - r0, :g1 - g0]
         shape = (r1 - r0, g1 - g0)
+        if iy or ix:
+            # In a window wider than the ink's, so its edge isn't taken for the surface.
+            br0, bg0 = max(0, r0 - iy - 2), max(0, g0 - ix - 2)
+            br1, bg1 = min(grid.ny, r1 + iy + 2), min(grid.nx, g1 + ix + 2)
+            body = np.zeros((br1 - br0, bg1 - bg0), bool)
+            stamp(body, br0, bg0, grid, segs[(meta[:, 2] == obj) & (meta[:, 1] != OTHER)])
+            body = erode(close(body), iy, ix)
+            allowed &= body[r0 - br0:r0 - br0 + shape[0], g0 - bg0:g0 - bg0 + shape[1]]
         coats = []  # per tool: (coverage, cells and how many coats each)
         for t in inked:
             here = (meta[:, 2] == obj) & (meta[:, 0] == t)
@@ -708,6 +720,8 @@ def options(argv=None):
     ap.add_argument("--travel", type=float, default=150., help="mm/s back to the layer after the ink (default 150)")
     ap.add_argument("--edge-margin", type=float, default=0.5, help="mm a drop may land off and still be on plastic "
                     "printed so far; ink nearer the edge than that is left out, so none reaches the bed (default 0.5)")
+    ap.add_argument("--inset", type=float, default=0.05, help="mm inside the model's surface the ink stops, so none "
+                    "lands beyond it on what's below (default 0.05)")
     ap.add_argument("--positions", type=positions, default=DEFAULT_POSITIONS, help="nozzle positions a pass draws on, "
                     "FIRST-LAST (default 16-83: 2 to spare for the colour registration each way)")
     ap.add_argument("--one-direction", dest="bidirectional", action="store_false",
@@ -729,8 +743,8 @@ def options(argv=None):
                     "(default: the profile's maximum X speed)")
     opts = ap.parse_args(argv)
     for name, lo in (('dpi', 1.), ('nozzle_dpi', 1.), ('ink_limit', 0.), ('gap', 0.), ('dry', 0.), ('retract', 0.),
-                     ('travel', 1.), ('edge_margin', 0.), ('prewarm', 0.), ('prime_idle', 0.), ('pass_speed', 1.),
-                     ('accel', 0.), ('scv', 0.), ('max_velocity', 0.)):
+                     ('travel', 1.), ('edge_margin', 0.), ('inset', 0.), ('prewarm', 0.), ('prime_idle', 0.),
+                     ('pass_speed', 1.), ('accel', 0.), ('scv', 0.), ('max_velocity', 0.)):
         if getattr(opts, name) < lo:
             ap.error("--%s must be at least %g" % (name.replace('_', '-'), lo))
     if opts.ink_limit > 100.:
