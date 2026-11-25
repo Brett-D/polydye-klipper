@@ -2283,6 +2283,9 @@ class CalibrationPrints(unittest.TestCase):
                 ('xyz', {}, lambda pd, board: setattr(pd, 'pass_axis', 'x'), "needs pass_axis: y"),
                 ('xyz', {}, lambda pd, board: setattr(pd, 'spit_run_cmd', None), "needs newer PolyDye board firmware"),
                 ('xyz', dict(WARM=20.), None, r"at a 254 us warm-up period the warm-up lasts at most 16.65 s"),
+                # Older board firmware warms for at most 10 s; Klipper doesn't bound a default (prewarm_seconds).
+                ('xyz', {}, lambda pd, board: setattr(pd, 'warm_max_s', 5.),
+                 r"a 6 s warm-up is longer than the board takes \(5 s\)"),
                 ('xyz', {}, lambda pd, board: setattr(pd, 'registration', (0, 4, 0, 0)),
                  r"cyan_positions 4, yellow_positions 0\) moves the page's squares"),
                 ('xy', {}, None, "home Z first"),
@@ -2303,6 +2306,37 @@ class CalibrationPrints(unittest.TestCase):
         pd.cmd_POLYDYE_TEST_PAGE(self.gcmd(WARM=0., PRIME=0.))
         script = [s for s in board.sent if isinstance(s, str)]
         self.assertEqual(script[1:4], ["G90\nG1 Z1.000 F900", "POLYDYE_ENABLE LIVE=1", "POLYDYE_INK_MOTION"])
+
+    def test_the_test_page_moves_gently_within_a_console_ink_motion(self):
+        # POLYDYE_INK_MOTION from the console (500 mm/s^2, SCV 0.5): the page lowers no further and leaves it in force,
+        # still to be put back to 3000 and 5 by its RESTORE=1.
+        pd, board = self.make()
+        pd.spit_run_cmd, pd.warm_duty_ppm, pd.warm_max_s = object(), 5800, 30.
+        th = self.objects['toolhead'].get_status(0.)
+        th['square_corner_velocity'] = 5.
+        gcode = pd.printer.lookup_object('gcode')
+        run = gcode.run_script_from_command
+
+        def dispatch(script):
+            if script.startswith("POLYDYE_INK_MOTION"):
+                params = dict(w.split("=") for w in script.split()[1:])
+                pd.cmd_POLYDYE_INK_MOTION(self.gcmd(**dict((k, float(v)) for k, v in params.items())))
+                return
+            run(script)
+            if script.startswith("SET_VELOCITY_LIMIT"):
+                v = dict(w.split("=") for w in script.split()[1:])
+                th['max_accel'], th['square_corner_velocity'] = float(v['ACCEL']), float(v['SQUARE_CORNER_VELOCITY'])
+        gcode.run_script_from_command = dispatch
+        dispatch("POLYDYE_INK_MOTION ACCEL=500 SCV=0.5")
+        pd.cmd_POLYDYE_TEST_PAGE(self.gcmd(X=120., Y=100.))
+        self.assertEqual((th['max_accel'], th['square_corner_velocity'], pd.ink_motion),
+                         (500., 0.5, (3000., 5., False)))
+        dispatch("POLYDYE_INK_MOTION RESTORE=1")
+        self.assertEqual((th['max_accel'], th['square_corner_velocity'], pd.ink_motion), (3000., 5., None))
+        # Without one, the page's own goes and comes back.
+        pd.cmd_POLYDYE_TEST_PAGE(self.gcmd(X=120., Y=100.))
+        self.assertEqual((th['max_accel'], th['square_corner_velocity'], pd.ink_motion), (3000., 5., None))
+        self.assertIn("SET_VELOCITY_LIMIT ACCEL=1000.000 SQUARE_CORNER_VELOCITY=1.000", board.sent)
 
     def test_a_failed_test_page_puts_the_motion_limits_back(self):
         pd, board = self.make()

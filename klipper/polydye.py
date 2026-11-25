@@ -2835,12 +2835,13 @@ class PolyDye:
         the automatic warm-up's settings, or with `warm` (seconds of warm-up, seconds of prime) that long with its pulse
         and period, then that long of the stock pattern at the template and pulse the passes print with, in the same
         board run (POLYDYE_SPIT WARM=). The passes don't warm again; with `ink_motion` they move gently
-        (POLYDYE_INK_MOTION). Afterwards, also after an error, the motion limits are put back, live ink goes off
+        (POLYDYE_INK_MOTION, its own: one lowered from the console before carries on afterwards, from the limits it
+        set). Afterwards, also after an error, the motion limits are put back, live ink goes off
         (_restore_after_test()) and the G-code state back, and after a plaque the hotend and the part fan are off."""
         toolhead = self.printer.lookup_object('toolhead')
         run = self.printer.lookup_object('gcode').run_script_from_command
         before = (st['cartridge_template'], st['pulse_words'])
-        lowered = False
+        lowered, outer = False, self.ink_motion
         run("SAVE_GCODE_STATE NAME=polydye_cal")
         try:
             if setup:
@@ -2867,7 +2868,7 @@ class PolyDye:
                                                            self.travel_speed * 60, here))
             run("POLYDYE_ENABLE LIVE=1")
             if ink_motion:
-                lowered = True
+                lowered, self.ink_motion = True, None
                 run("POLYDYE_INK_MOTION")
             for i, (n, x, y, direction) in enumerate(prints):
                 if i and i % 4 == 0:
@@ -2879,6 +2880,7 @@ class PolyDye:
                     run("POLYDYE_INK_MOTION RESTORE=1")
                 except Exception:
                     logging.exception("polydye: %s couldn't put the motion limits back", cmd)
+                self.ink_motion = outer
             if setup and not self.printer.is_shutdown():
                 try:
                     run("M104 S0\nM106 S0")
@@ -2974,6 +2976,9 @@ class PolyDye:
             raise gcmd.error("%s: warms and primes the head the way a colour print does, which needs newer PolyDye "
                              "board firmware; update it from the PolyDye page (Board firmware: Update to bundled "
                              "firmware)" % (cmd,))
+        if warm > self.warm_max_s + 1e-9:  # prewarm_seconds, which polydye.cfg bounds only by the newest board's
+            raise gcmd.error("%s: a %g s warm-up is longer than the board takes (%g s): set WARM, or a shorter "
+                             "prewarm_seconds" % (cmd, warm, self.warm_max_s))
         if warm:
             self._warm_plan(gcmd, cmd, warm, self.warm_pulse, self.warm_period_us)
         lo, hi = TEST_POSITIONS
