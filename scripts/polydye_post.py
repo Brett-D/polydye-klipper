@@ -46,7 +46,9 @@ except ImportError:  # reported by main(), so the module still imports for its t
 
 # The job format, read by the add-on (klipper/polydye.py, "Ink jobs"). After the print:
 #   ; POLYDYE_JOB_BEGIN
-#   ;PDJ version=1 dpi=847 nozzle_dpi=300 pass_axis=y positions=16-83 passes=N layers=M prewarms=B primes=P ...
+#   ;PDJ version=1 dpi=847 nozzle_dpi=300 pass_axis=y positions=16-83 passes=N layers=M prewarms=B primes=P
+#        ink_accel=A ink_z=Z ...   (the lowest acceleration in force at an ink block, 0 if the G-code sets none, and
+#                                   the highest Z an ink block goes to, so POLYDYE_JOB can check the reach)
 #   ;PDP n=0 layer=3 pass=0 coat=1 object=NAME dir=1 x=112.3456 y=95.12345 columns=812 colours=cm
 #   ;PDD <base64>   (one or more: the pass's data, zlib-compressed)
 #   ...
@@ -105,6 +107,7 @@ class Layer:
         self.last_line = None  # the line of its last extrusion
         self.end = None  # (x, y, z) after it
         self.end_object = None  # the EXCLUDE_OBJECT name it was in, or None
+        self.accel = None  # the acceleration the G-code set (if any) at its last extrusion: its ink block's
 
 
 def parse(lines):
@@ -181,7 +184,7 @@ def parse(lines):
             if de > 0 and (nx != x or ny != y) and cur is not None:
                 index = objects.setdefault(obj, len(objects))
                 cur.segs.append((tool, kind, index, x, y, nx, ny, width))
-                cur.last_line, cur.end, cur.end_object = n, (nx, ny, nz), obj
+                cur.last_line, cur.end, cur.end_object, cur.accel = n, (nx, ny, nz), obj, accel
             if de or nx != x or ny != y or nz != z:
                 moves.append((n, nx - x, ny - y, nz - z, de, speed, accel, scv, flush))
                 flush = False
@@ -527,13 +530,15 @@ def ink_block(layer, passes, opts, inside, prime=False):
     return g
 
 
-def job_block(passes, opts, layers, prewarms=0, primes=0):
+def job_block(passes, opts, layers, prewarms=0, primes=0, ink_accel=0., ink_z=0.):
     """The job's lines: its index and the passes' data. `prewarms`, `primes` count the G-code's POLYDYE_PREWARM and
-    POLYDYE_PRIME, so POLYDYE_JOB can refuse a board that can't run them before the print starts."""
+    POLYDYE_PRIME, so POLYDYE_JOB can refuse a board that can't run them before the print starts; `ink_accel` (0:
+    none set) and `ink_z` let it check the passes' run-ups and the ink blocks' height against the axes."""
     out = ["; POLYDYE_JOB_BEGIN",
            ";PDJ version=%d dpi=%g nozzle_dpi=%g pass_axis=y positions=%d-%d passes=%d layers=%d prewarms=%d primes=%d "
-           "generator=%s" % (JOB_VERSION, opts.dpi, opts.nozzle_dpi, opts.positions[0], opts.positions[1], len(passes),
-                             layers, prewarms, primes, os.path.basename(__file__))]
+           "ink_accel=%g ink_z=%.3f generator=%s" % (
+               JOB_VERSION, opts.dpi, opts.nozzle_dpi, opts.positions[0], opts.positions[1], len(passes), layers,
+               prewarms, primes, ink_accel, ink_z, os.path.basename(__file__))]
     for p in passes:
         out.append(";PDP n=%d layer=%d pass=%d coat=%d object=%s dir=%d x=%.4f y=%.5f columns=%d colours=%s" % (
             p.n, p.layer, p.number, p.coat, p.obj or '-', p.dir, p.x, p.y, p.columns, p.colours))
@@ -576,6 +581,9 @@ def process(lines, opts):
     for n, p in enumerate(passes):
         p.n = n
     before, primes = warm_and_prime(lines, layers, plan, config, timing, opts)
+    ink_accel = min([layer.accel for layer, _ in plan if layer.accel] or [0.])
+    ink_z = max(layer.end[2] + opts.gap for layer, _ in plan)
+    job = job_block(passes, opts, len(plan), len(before), len(primes), ink_accel, ink_z)
     size = sum(len(p.data) for p in passes)
     summary = ("PolyDye ink job: %d passes on %d layers, %.2f MB; dpi %g, nozzle_dpi %g, ink limit %g %%; %d prewarm "
                "bursts, %d primes" % (len(passes), len(plan), size / 1e6, opts.dpi, opts.nozzle_dpi,
@@ -596,7 +604,7 @@ def process(lines, opts):
     job_at = markers['config_start'] if markers['config_start'] is not None else len(lines)
     for n, line in enumerate(lines):
         if n == job_at:
-            out += [ln + "\n" for ln in job_block(passes, opts, len(plan), len(before), len(primes))] + ["\n"]
+            out += [ln + "\n" for ln in job] + ["\n"]
         if n == job_cmd_at:
             out += ["; %s (polydye_post.py)\n" % (summary,), "POLYDYE_JOB\n"]
         if n in before:
@@ -608,7 +616,7 @@ def process(lines, opts):
     if job_at == len(lines):
         if out and not out[-1].endswith("\n"):
             out[-1] += "\n"
-        out += [ln + "\n" for ln in job_block(passes, opts, len(plan), len(before), len(primes))]
+        out += [ln + "\n" for ln in job]
     return out, summary
 
 

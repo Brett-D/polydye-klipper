@@ -1134,7 +1134,8 @@ def _job_fields(line):
 
 def job_load(path):
     """Reads a job's index: (header, records). header has version, dpi, nozzle_dpi, pass_axis, positions (lo, hi),
-    passes, layers, and how many POLYDYE_PREWARM and POLYDYE_PRIME its G-code has (prewarms, primes);
+    passes, layers, how many POLYDYE_PREWARM and POLYDYE_PRIME its G-code has (prewarms, primes), the lowest
+    acceleration its G-code sets for an ink block (ink_accel, 0: none) and the highest Z an ink block goes to (ink_z);
     each record n, layer, pass, coat, object, dir, x, y, columns, colours, size (nozzle data bytes, at most) and
     where its data lines are (start, end)."""
     with open(path, 'rb') as f:
@@ -1166,7 +1167,8 @@ def job_load(path):
         header = {'version': JOB_VERSION, 'dpi': float(header['dpi']), 'nozzle_dpi': float(header['nozzle_dpi']),
                   'pass_axis': header.get('pass_axis', 'y'), 'positions': (lo, hi), 'passes': int(header['passes']),
                   'layers': int(header.get('layers', 0)), 'prewarms': int(header.get('prewarms', 0)),
-                  'primes': int(header.get('primes', 0))}
+                  'primes': int(header.get('primes', 0)), 'ink_accel': float(header.get('ink_accel', 0)),
+                  'ink_z': float(header.get('ink_z', 0))}
         for n, rec in enumerate(records):
             for key in ('n', 'layer', 'pass', 'coat', 'dir', 'columns'):
                 rec[key] = int(rec[key])
@@ -1373,8 +1375,9 @@ class JobStreamer:
                     with self.lock:
                         deletes, self.deletes = self.deletes, []
                         n = self.next
+                        size = self.records[n].get('size', 0) if n < len(self.records) else 0
                         room = not self.sizes or (len(self.sizes) < self.ahead_passes and
-                                                  sum(self.sizes.values()) < self.ahead_bytes)
+                                                  sum(self.sizes.values()) + size <= self.ahead_bytes)
                         skip = n in self.skipped
                     for d in deletes:
                         self._retry(lambda: self.delete(self.records[d]['layer'], self.records[d]['pass']))
@@ -2389,6 +2392,7 @@ class PolyDye:
             gcmd.get_int(key.upper(), now, minval=-limit, maxval=limit) for key, now, limit in
             zip(REG_KEYS, self.registration, (REG_MAX_COLUMNS, REG_MAX_POSITIONS, REG_MAX_COLUMNS, REG_MAX_POSITIONS)))
         skew = gcmd.get_float('SKEW', self.nozzle_skew, minval=-SKEW_MAX, maxval=SKEW_MAX)
+        self._check_no_job(gcmd, cmd, registration, skew)
         save = gcmd.get_int('SAVE', 1 if ticks else 0, minval=0, maxval=1)
         # The tick in the groove is where the ink landed against where it should be: move it back by that many ticks.
         dx, dy = (x_tick or 0.) * self._x_tick_mm(), (y_tick or 0.) * self._y_tick_mm()
@@ -2426,6 +2430,7 @@ class PolyDye:
                                 (REG_MAX_COLUMNS, REG_MAX_POSITIONS, REG_MAX_COLUMNS, REG_MAX_POSITIONS)):
             if abs(v) > most:
                 raise gcmd.error("%s: %s would be %d, beyond +-%d; check the reading" % (cmd, key, v, most))
+        self._check_no_job(gcmd, cmd, tuple(registration), self.nozzle_skew)
         trim = self.direction_trim
         if read['DIRECTION'] is not None:
             trim = round(trim + 2. * read['DIRECTION'] * 25.4 / self.dpi, 4)
@@ -2435,6 +2440,13 @@ class PolyDye:
         self.registration, self.direction_trim = tuple(registration), trim
         if not save:
             self._respond_offsets(gcmd)
+
+    def _check_no_job(self, gcmd, cmd, registration, skew):
+        """Refuses a new colour registration or nozzle skew while an ink job is loaded: its passes are made (some
+        already uploaded) with the ones in use."""
+        if self.job is not None and (tuple(registration) != tuple(self.registration) or skew != self.nozzle_skew):
+            raise gcmd.error("%s: an ink job is loaded, and its passes are made with the colour registration and "
+                             "nozzle skew in use: change them between prints (POLYDYE_JOB_END unloads it)" % (cmd,))
 
     cmd_POLYDYE_SAVE_help = ("Store the live cartridge offsets, direction trim, colour registration and nozzle skew in "
                              "polydye.cfg (next to printer.cfg)")
@@ -2884,8 +2896,9 @@ class PolyDye:
 
     def _check_job(self, gcmd, cmd, header, records):
         """Refuses, before anything moves, a job sliced for other settings, one the colour registration would move off
-        the nozzles, or one that would take the toolhead beyond the axis limits. Notes each pass's size on the board
-        (at most: its colours spread by the registration) as its 'size'."""
+        the nozzles, or one that would take the toolhead beyond the axis limits (each pass's run-up at the acceleration
+        the G-code sets for the ink, or JOB_REACH_ACCEL if it sets none; the ink blocks' height). Notes each pass's
+        size on the board (at most: its colours spread by the registration and skew) as its 'size'."""
         if header['pass_axis'] != 'y':
             raise gcmd.error("%s: the job is drawn for pass_axis %s" % (cmd, header['pass_axis']))
         for key, have in (('dpi', self.dpi), ('nozzle_dpi', self.nozzle_dpi)):
@@ -2905,8 +2918,11 @@ class PolyDye:
         eventtime = self.printer.get_reactor().monotonic()
         th = self.printer.lookup_object('toolhead').get_status(eventtime)
         base = self.printer.lookup_object('gcode_move').base_position
-        slow = dict(th, max_accel=min(th['max_accel'], JOB_REACH_ACCEL))
+        slow = dict(th, max_accel=min(th['max_accel'], header['ink_accel'] or JOB_REACH_ACCEL))
         low, high = th['axis_minimum'], th['axis_maximum']
+        if high.z > low.z and header['ink_z'] + base[2] > high.z:
+            raise gcmd.error("%s: the ink goes up to Z=%.2f (the job's --gap above the layer), beyond the Z axis "
+                             "maximum: slice again with a smaller --gap" % (cmd, header['ink_z']))
         pitch = 25.4 / self.dpi
         before, after = min(0, reg[0], reg[2]), max(0, reg[0], reg[2])
         skew = self._skew()

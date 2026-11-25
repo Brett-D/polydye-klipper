@@ -148,6 +148,15 @@ class Structure(unittest.TestCase):
         self.assertTrue(tail.endswith("; filament used [mm] = 1.0, 1.0\n"))
         self.assertLess(tail.index("; POLYDYE_JOB_END"), tail.index("; CONFIG_BLOCK_START"))
 
+    def test_the_job_says_how_high_and_how_slow_its_ink_goes(self):
+        # The ink 1 mm (--gap) above the top inked layer (Z 0.6); the acceleration the G-code sets (none: 0).
+        out, _ = run(block_gcode(layers=3))
+        self.assertIn(" ink_accel=0 ink_z=1.600 ", "".join(out))
+        src = block_gcode(layers=3)
+        src.insert(src.index("G90\n"), "SET_VELOCITY_LIMIT ACCEL=1500\n")
+        out, _ = run(src, "--gap", "2")
+        self.assertIn(" ink_accel=1500 ink_z=2.600 ", "".join(out))
+
     def test_directions_alternate_unless_one_direction(self):
         out, _ = run(block_gcode(layers=2, band=4.), "--edge-margin", "0")
         dirs = [int(d) for d in re.findall(r"POLYDYE_JOB_PASS N=\d+ ; layer 1 .* DIR=(-?1)", "".join(out))]
