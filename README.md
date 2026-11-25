@@ -249,7 +249,7 @@ offset_y: -8.7
 #warm_pulse: 1        # its pulse in bus words (1 = 0.35 us: no ink even on a hot head; up to 8 = 2.80 us)
 #warm_period_us: 254  # one all-nozzle warm-up column every this many us (at most 0.58 % heater duty)
 #warm_idle_time: 60   # s without firing after which the head counts as cold again
-#warm_position: pass  # where warm-ups run: pass (warm_clearance mm behind the pass's run-up), sponge, or X, Y
+#warm_position: sponge # where warm-ups run: sponge (POLYDYE_WIPE's X), X, Y over printed plastic, or pass
 #warm_clearance: 10   # mm behind the pass's run-up start, for warm_position: pass
 #warm_prespit: 0      # s of stock-pattern spit at the warm spot right after a warm-up (0: none; up to 5)
 #mcu: polydye
@@ -464,20 +464,24 @@ and `WARM=0` for none.
   17 mm before a cyan text pass: 0.35 µs every 508 µs lost the word's first 10 mm; **0.35 µs every 254 µs printed it
   complete, with no dot where it warmed** (2 of 39,370 column times missed); 0.70 µs every 508 µs printed it complete
   but left a small dot, every 192 µs a blob; 2.80 µs spat a puddle.
-- **Where: `warm_position`, never over the print.** A hot head can put ink down during a warm-up, and a long travel
-  after it lets the head cool (140 mm from a park spot lost the first ~6 mm of the pass). So by default (`pass`) it
-  warms `warm_clearance` mm (10) behind the pass's run-up start along the pass axis, at the pass's Z and within the
-  axis, and the pass travels on from there. Or:
-  - `sponge`: the wipe sponge, at `POLYDYE_WIPE`'s X (G-code coordinates; `variable_x`, 245);
-  - `X, Y`: a bed spot for the cartridge (bed coordinates, like `POLYDYE_PASS`'s X and Y), e.g. a strip of paper towel.
+- **Where: `warm_position`, never over the print, and no ink on the glass bed.** A hot head can put ink down during a
+  warm-up, a pre-spit does on purpose, and the spot is often beyond the print. So by default (`sponge`) it warms over
+  the wipe sponge at the X gantry's right end, at `POLYDYE_WIPE`'s X (G-code coordinates; `variable_x`, 245). Nothing
+  wipes the cartridge there (`POLYDYE_WIPE` does that on its own). Or:
+  - `X, Y`: a bed spot for the cartridge (bed coordinates, like `POLYDYE_PASS`'s X and Y) over printed plastic, e.g. a
+    prime pad printed first;
+  - `pass`: `warm_clearance` mm (10) behind the pass's run-up start along the pass axis, at the pass's Z and within the
+    axis, and the pass travels on from there. Only where printed plastic lies under it, such as a base under the part.
+    A long travel after a warm-up lets the head cool (140 mm from a park spot lost the first ~6 mm of the pass), and
+    `pass` keeps it short; a pre-spit at the sponge is the other cure.
 
-  For those two the toolhead rises by `POLYDYE_WIPE`'s `z_hop` (1 mm, no higher than the Z axis allows), travels
-  there at `travel_speed`, warms, travels back at that height and comes down.
+  For `sponge` and `X, Y` the toolhead rises by `POLYDYE_WIPE`'s `z_hop` (1 mm, no higher than the Z axis allows),
+  travels there at `travel_speed`, warms, travels back at that height and comes down.
 - **Optional pre-spit (testing):** `warm_prespit` (or `POLYDYE_PASS PRESPIT=`, passed on by the fire test) adds that
   many seconds of the stock pattern every 508 µs right after the warm-up, at the warm spot, in the same board run, for
   testing whether cyan, which still missed the first 9–14 mm of some passes after a gentle warm-up, needs real
-  ejection first. It puts ink down there (on paper, `warm_clearance` behind the run-up). Off by default; colour
-  templates only.
+  ejection first. It puts ink down there: at the sponge by default, or on the printed plastic under an `X, Y` or `pass`
+  spot; never on the glass. Off by default; colour templates only.
 - **If a warm-up fails,** the board's run is cancelled, and the cartridge goes back (or the pass goes on) only once the
   board is seen idle; otherwise it stays over the warm spot and the pass doesn't run.
 - During a print it costs `warm_seconds` each time the head has been idle that long (between layers, typically), with

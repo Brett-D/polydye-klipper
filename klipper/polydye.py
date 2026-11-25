@@ -87,11 +87,14 @@ SPIT_PATTERNS = {'all': 0, 'stock': 3}
 # 1 word (0.35 us) every 254 us for 10 s. Brett's ladder on 48483ab (2026-11-25), each warm-up on a hot head 17 mm
 # before a cyan text pass: 0.35 us every 508 us lost the word's first 10 mm; 0.35 us every 254 us printed it complete
 # with no dot where it warmed (2 of 39,370 column times missed); 0.70 us every 508 us was complete but left a dot, and
-# every 192 us a blob; 2.80 us spat a puddle. The pulse width matters, not just the energy. It runs
-# AUTO_WARM_CLEARANCE mm behind the pass's run-up start (warm_position: pass, warm_clearance).
+# every 192 us a blob; 2.80 us spat a puddle. The pulse width matters, not just the energy. No ink may land on the glass
+# bed (Brett, 2026-11-25), and the warm-up's spot (with any pre-spit) is often beyond the print: so it runs over the
+# wipe sponge at the X gantry's right end by default (warm_position: sponge); `pass` (AUTO_WARM_CLEARANCE mm behind the
+# pass's run-up start, warm_clearance) only suits a print with plastic there, such as a base under the part.
 AUTO_WARM_S, AUTO_WARM_WORDS, AUTO_WARM_PERIOD_US, AUTO_WARM_IDLE_S = 10., 1, 254, 60.
 AUTO_WARM_CLEARANCE = 10.
-# An optional pre-spit right after a pass's warm-up, at the warm spot, in the same board run ([polydye] warm_prespit,
+# An optional pre-spit right after a pass's warm-up, at the warm spot (the sponge by default), in the same board run
+# ([polydye] warm_prespit,
 # POLYDYE_PASS PRESPIT): the stock pattern every STOCK_PERIOD_US for that many seconds (at most PRESPIT_MAX_S). Off by
 # default; for testing whether cyan, which still missed the first 9-14 mm of some passes after a gentle warm-up, needs
 # real ejection first.
@@ -665,11 +668,12 @@ class PolyDye:
         # Bus columns per inch along the pass and the pass speed: by default the stock firmware's cadence, 3,333 bus
         # columns per 100 mm (each 423 dpi image column twice) at 59.5 mm/s, a column every 504 us (stock: ~508 us).
         # Automatic head warm-up before a live pass when the head is cold (head_cold()); warm_seconds: 0 turns it off.
-        # warm_position: where a pass's warm-up runs, never over the print (a hot head puts ink down during a 0.70 us
-        # warm-up: a 4 mm C/M/Y blob on the PolyDye text print, 48483ab). `pass` (the default): warm_clearance mm behind
-        # the pass's run-up start along pass_axis, so the pass follows after a short travel and the head stays hot
-        # (140 mm of travel from a park spot lost the first mm of the pass); `sponge`: the wipe sponge at POLYDYE_WIPE's
-        # X; or X, Y: a bed spot for the cartridge (like POLYDYE_PASS's X and Y).
+        # warm_position: where a pass's warm-up (and pre-spit) runs, never over the print (a hot head puts ink down
+        # during a 0.70 us warm-up: a 4 mm C/M/Y blob on the PolyDye text print, 48483ab) nor the glass bed. `sponge`
+        # (the default): the wipe sponge at POLYDYE_WIPE's X; X, Y: a bed spot for the cartridge (like POLYDYE_PASS's X
+        # and Y) over printed plastic, e.g. a prime pad; or `pass`: warm_clearance mm behind the pass's run-up start
+        # along pass_axis, so the pass follows after a short travel (140 mm of travel from a park spot lost the first
+        # mm of the pass), only where printed plastic is under it.
         self.warm_seconds = config.getfloat('warm_seconds', AUTO_WARM_S, minval=0., maxval=WARM_MAX_S)
         self.warm_pulse = config.getint('warm_pulse', AUTO_WARM_WORDS, minval=1, maxval=PULSE_MAX)
         self.warm_period_us = config.getint('warm_period_us', AUTO_WARM_PERIOD_US, minval=1, maxval=65535)
@@ -679,7 +683,7 @@ class PolyDye:
             raise config.error("[polydye] %s" % (error,))
         self.warm_clearance = config.getfloat('warm_clearance', AUTO_WARM_CLEARANCE, minval=0.)
         self.warm_prespit = config.getfloat('warm_prespit', 0., minval=0., maxval=PRESPIT_MAX_S)
-        position = config.get('warm_position', 'pass').strip().lower()
+        position = config.get('warm_position', 'sponge').strip().lower()
         if position in ('pass', 'sponge'):
             self.warm_position = position
         else:
@@ -688,8 +692,8 @@ class PolyDye:
             except ValueError:
                 self.warm_position = ()
             if len(self.warm_position) != 2:
-                raise config.error("[polydye] warm_position must be pass (the default), sponge, or X, Y (bed "
-                                   "coordinates of the cartridge over a waste spot, off the print), not %r"
+                raise config.error("[polydye] warm_position must be sponge (the default), X, Y (bed coordinates "
+                                   "of the cartridge over printed plastic, off the print) or pass, not %r"
                                    % (position,))
         self.last_fire = None  # print time the head last fired (a live pass, spit test or warm-up); None: not yet
         self.dpi = config.getfloat('dpi', 847., above=0.)

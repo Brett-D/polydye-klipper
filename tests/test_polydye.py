@@ -1382,13 +1382,13 @@ class ConfigOptions(unittest.TestCase):
     def test_auto_warm_options(self):
         pd = self.load()
         self.assertEqual((pd.warm_seconds, pd.warm_pulse, pd.warm_period_us, pd.warm_idle_time, pd.warm_position,
-                          pd.warm_clearance, pd.warm_prespit), (10., 1, 254, 60., 'pass', 10., 0.))
+                          pd.warm_clearance, pd.warm_prespit), (10., 1, 254, 60., 'sponge', 10., 0.))
         pd = self.load(warm_seconds='0', warm_position=' 5, 200.5 ')
         self.assertEqual((pd.warm_seconds, pd.warm_position), (0., (5., 200.5)))
-        self.assertEqual(self.load(warm_position='Sponge').warm_position, 'sponge')
-        self.assertIn("warm_position must be pass (the default), sponge, or X, Y", self.load(warm_position='here'))
+        self.assertEqual(self.load(warm_position='Pass').warm_position, 'pass')
+        self.assertIn("warm_position must be sponge (the default), X, Y", self.load(warm_position='here'))
         self.assertIn("heater duty", self.load(warm_pulse='8', warm_period_us='400'))
-        self.assertIn("warm_position must be pass (the default), sponge, or X, Y", self.load(warm_position='5'))
+        self.assertIn("warm_position must be sponge (the default), X, Y", self.load(warm_position='5'))
 
 
 if __name__ == "__main__":
