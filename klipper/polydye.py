@@ -1129,13 +1129,15 @@ def job_find(f):
 
 
 def _job_fields(line):
-    return dict(kv.split('=', 1) for kv in line.decode('ascii', 'replace').split() if '=' in kv)
+    # UTF-8, as polydye_post.py writes it: object names must match EXCLUDE_OBJECT's.
+    return dict(kv.split('=', 1) for kv in line.decode('utf-8', 'replace').split() if '=' in kv)
 
 
 def job_load(path):
     """Reads a job's index: (header, records). header has version, dpi, nozzle_dpi, pass_axis, positions (lo, hi),
     passes, layers, how many POLYDYE_PREWARM and POLYDYE_PRIME its G-code has (prewarms, primes), the lowest
-    acceleration its G-code sets for an ink block (ink_accel, 0: none) and the highest Z an ink block goes to (ink_z);
+    acceleration its G-code sets for an ink block (ink_accel, 0: none), the highest Z an ink block goes to (ink_z) and
+    its bursts' SECONDS (prewarm_s, 0: none given);
     each record n, layer, pass, coat, object, dir, x, y, columns, colours, size (nozzle data bytes, at most) and
     where its data lines are (start, end)."""
     with open(path, 'rb') as f:
@@ -1168,7 +1170,7 @@ def job_load(path):
                   'pass_axis': header.get('pass_axis', 'y'), 'positions': (lo, hi), 'passes': int(header['passes']),
                   'layers': int(header.get('layers', 0)), 'prewarms': int(header.get('prewarms', 0)),
                   'primes': int(header.get('primes', 0)), 'ink_accel': float(header.get('ink_accel', 0)),
-                  'ink_z': float(header.get('ink_z', 0))}
+                  'ink_z': float(header.get('ink_z', 0)), 'prewarm_s': float(header.get('prewarm_s', 0))}
         for n, rec in enumerate(records):
             for key in ('n', 'layer', 'pass', 'coat', 'dir', 'columns'):
                 rec[key] = int(rec[key])
@@ -1331,6 +1333,7 @@ class JobStreamer:
         self.ready = {}  # n -> (columns, first)
         self.sizes = {}  # n -> bytes stored, until consumed
         self.consumed, self.skipped, self.deletes = set(), set(), []
+        self.holding = {}  # n -> print time its pass ends: printed, but still on the board until then
         self.next = 0  # the next pass to upload
         self.printed = 0
         self.error = None
@@ -1343,8 +1346,10 @@ class JobStreamer:
     def stop(self):
         self.stopping.set()
 
-    def consume(self, n, skipped=False):
-        """Pass n is printed (scheduled), or skipped: it no longer counts as ahead; a skipped one stored is deleted."""
+    def consume(self, n, skipped=False, until=None):
+        """Pass n is printed, or skipped (a skipped one stored is deleted). A printed one scheduled to end at print time
+        `until` still counts as ahead (its data is on the board, which drops it once printed) until release() passes
+        that time; with `until` None, at once."""
         with self.lock:
             if n in self.consumed:
                 return
@@ -1354,9 +1359,20 @@ class JobStreamer:
             else:
                 self.printed += 1
             if n in self.sizes:
-                del self.sizes[n]
                 if skipped:
+                    del self.sizes[n]
                     self.deletes.append(n)
+                elif until is None:
+                    del self.sizes[n]
+                else:
+                    self.holding[n] = until
+
+    def release(self, print_time):
+        """The passes scheduled to end by `print_time` are printed, so off the board: no longer ahead."""
+        with self.lock:
+            for n in [n for n, until in self.holding.items() if until <= print_time]:
+                del self.holding[n]
+                self.sizes.pop(n, None)
 
     def state(self, n):
         """(error, (columns, first) once pass n is on the board or None, passes uploaded so far)."""
@@ -1744,6 +1760,8 @@ class PolyDye:
         # itself, or it would retry a dead link every STATUS_INTERVAL until the next restart.
         if not self.printer.is_shutdown() and not self.querying:
             self._check_job_end(eventtime)
+            if self.job is not None:
+                self.job['streamer'].release(self.mcu.estimated_print_time(eventtime))
             try:
                 self._check_print_end(eventtime)
             except Exception:
@@ -2858,6 +2876,13 @@ class PolyDye:
         if header['prewarms'] and self.prewarm_cmd is None:
             raise gcmd.error("%s: the job's prewarm bursts (POLYDYE_PREWARM) need newer PolyDye board firmware; update "
                              "it from the PolyDye page (Board firmware: Update to bundled firmware)" % (cmd,))
+        if header['prewarms']:
+            seconds, period = header['prewarm_s'] or self.prewarm_seconds, self.warm_period_us
+            longest = min(self.warm_max_s, WARM_MAX_COLUMNS * period / 1e6)
+            if seconds > self.warm_max_s or warm_columns(seconds, period, self.warm_max_s) > WARM_MAX_COLUMNS:
+                raise gcmd.error("%s: the job's prewarm bursts are %g s, longer than the board takes at "
+                                 "warm_period_us %d (%.1f s): slice again with --prewarm %g or less"
+                                 % (cmd, seconds, period, longest, math.floor(longest * 10) / 10))
         if header['primes']:
             if self.spit_run_cmd is None or 'stock' not in self.spit_patterns:
                 raise gcmd.error("%s: the job's primes (POLYDYE_PRIME) need newer PolyDye board firmware; update it "
@@ -2967,16 +2992,24 @@ class PolyDye:
             "POLYDYE_PASS LAYER=%d PASS=%d X=%.4f Y=%.5f DIR=%d" % (rec['layer'], rec['pass'], rec['x'],
                                                                    rec['y'] + first * 25.4 / self.dpi, rec['dir']))
         job['since_wait'] += 1
-        streamer.consume(n)
+        # On the board until it has printed: it still counts against the room for the passes ahead.
+        streamer.consume(n, until=self.printer.lookup_object('toolhead').get_last_move_time())
+        streamer.release(self.mcu.estimated_print_time(self.printer.get_reactor().monotonic()))
 
     def _wait_job_pass(self, gcmd, cmd, streamer, n):
         """(columns, first) of job pass n once it's on the board; raises if its upload failed or stalled."""
         reactor = self.printer.get_reactor()
-        said, last, since = False, None, reactor.monotonic()
+        said, last, since, drained = False, None, reactor.monotonic(), False
         while True:
+            streamer.release(self.mcu.estimated_print_time(reactor.monotonic()))
             error, ready, uploaded = streamer.state(n)
             if ready is not None:
                 return ready
+            if not drained and not error:
+                # The room for it may be held by passes still to print: let them print (the board drops each).
+                self.printer.lookup_object('toolhead').wait_moves()
+                drained = True
+                continue
             if error:
                 raise gcmd.error("%s: the ink job's upload to the board failed: %s" % (cmd, error))
             if streamer.stopping.is_set():

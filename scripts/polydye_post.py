@@ -49,8 +49,8 @@ except ImportError:  # reported by main(), so the module still imports for its t
 # The job format, read by the add-on (klipper/polydye.py, "Ink jobs"). After the print:
 #   ; POLYDYE_JOB_BEGIN
 #   ;PDJ version=1 dpi=847 nozzle_dpi=300 pass_axis=y positions=16-83 passes=N layers=M prewarms=B primes=P
-#        ink_accel=A ink_z=Z ...   (the lowest acceleration in force at an ink block, 0 if the G-code sets none, and
-#                                   the highest Z an ink block goes to, so POLYDYE_JOB can check the reach)
+#        ink_accel=A ink_z=Z prewarm_s=S ...   (the lowest acceleration in force at an ink block, 0 if the G-code
+#        sets none, the highest Z an ink block goes to, and each burst's SECONDS, so POLYDYE_JOB can check them)
 #   ;PDP n=0 layer=3 pass=0 coat=1 object=NAME dir=1 x=112.3456 y=95.12345 columns=812 colours=cm
 #   ;PDD <base64>   (one or more: the pass's data, zlib-compressed)
 #   ...
@@ -181,8 +181,9 @@ def parse(lines):
                 nx, ny, nz = x + p.get('X', 0.), y + p.get('Y', 0.), z + p.get('Z', 0.)
             de = 0.
             if 'E' in p:
-                de = p['E'] if e_relative else p['E'] - e
-                e = e + de if e_relative else p['E']
+                rel = e_relative or not absolute  # G91 makes E relative too, whatever M82 says (as Klipper)
+                de = p['E'] if rel else p['E'] - e
+                e = e + de if rel else p['E']
             if de > 0 and (nx != x or ny != y) and cur is not None:
                 index = objects.setdefault(obj, len(objects))
                 cur.segs.append((tool, kind, index, x, y, nx, ny, width))
@@ -418,12 +419,47 @@ class InkPass:
         self.n = self.number = self.dir = None
 
 
+class Support:
+    """The plastic printed so far (all layers up to the one being inked), per object: its own lines and those outside
+    any object, which no EXCLUDE_OBJECT can take away. An object's ink never counts on another object's plastic, which
+    could be excluded before it prints. Each object's cells are kept over its lines' extent, `pad` mm around."""
+
+    def __init__(self, grid, layers, objects, pad):
+        self.grid = grid
+        self.shared = objects.index(None) if None in objects else None
+        self.windows = {}
+        for k in range(len(objects)):
+            pts = np.array([s[3:7] for layer in layers for s in layer.segs if s[2] == k], float).reshape(-1, 4)
+            if not len(pts):
+                continue
+            r0 = max(0, int((pts[:, [1, 3]].min() - pad - grid.y0) / grid.sy))
+            r1 = min(grid.ny, int((pts[:, [1, 3]].max() + pad - grid.y0) / grid.sy) + 2)
+            g0 = max(0, int((pts[:, [0, 2]].min() - pad - grid.x0) / grid.sx))
+            g1 = min(grid.nx, int((pts[:, [0, 2]].max() + pad - grid.x0) / grid.sx) + 2)
+            self.windows[k] = (r0, g0, np.zeros((r1 - r0, g1 - g0), bool))
+
+    def add(self, segs, meta):
+        """Adds a layer's lines (segs: x0, y0, x1, y1, width; meta: tool, kind, object)."""
+        for k, (r0, g0, cells) in self.windows.items():
+            stamp(cells, r0, g0, self.grid, segs[(meta[:, 2] == k) | (meta[:, 2] == self.shared)])
+
+    def cells(self, k, ra, rb, ga, gb):
+        """Object k's support over rows ra..rb - 1 and columns ga..gb - 1 of the grid (none outside its extent)."""
+        out = np.zeros((rb - ra, gb - ga), bool)
+        r0, g0, cells = self.windows[k]
+        a, b = max(ra, r0), min(rb, r0 + cells.shape[0])
+        c, d = max(ga, g0), min(gb, g0 + cells.shape[1])
+        if a < b and c < d:
+            out[a - ra:b - ra, c - ga:d - ga] = cells[a - r0:b - r0, c - g0:d - g0]
+        return out
+
+
 def layer_passes(layer, grid, support, tools, objects, opts, pitch):
-    """The ink passes for `layer`, in printing order, with their directions; `support` (cells with plastic so far, all
+    """The ink passes for `layer`, in printing order, with their directions; `support` (a Support: plastic so far, all
     layers up to this one) is updated with the layer."""
     segs = np.array([s[3:] for s in layer.segs], float).reshape(-1, 5)
     meta = np.array([s[:3] for s in layer.segs], int).reshape(-1, 3)
-    stamp(support, 0, 0, grid, segs)
+    support.add(segs, meta)
     # Snapped to cells, the support can reach half a cell diagonal past the lines: the margin allows for that.
     margin = opts.edge_margin + math.hypot(grid.sx, grid.sy) / 2. if opts.edge_margin else 0.
     hy, hx = int(math.ceil(margin / grid.sy)), int(math.ceil(margin / grid.sx))
@@ -445,7 +481,8 @@ def layer_passes(layer, grid, support, tools, objects, opts, pitch):
         r0 = max(0, int((s[:, [1, 3]].min() - reach - grid.y0) / grid.sy))
         r1 = min(grid.ny, int((s[:, [1, 3]].max() + reach - grid.y0) / grid.sy) + 2)
         wr0, wg0 = max(0, r0 - hy - 1), max(0, g0 - hx - 1)
-        allowed = erode(close(support[wr0:r1 + hy + 1, wg0:g1 + hx + 1]), hy, hx)
+        allowed = erode(close(support.cells(obj, wr0, min(grid.ny, r1 + hy + 1), wg0, min(grid.nx, g1 + hx + 1))),
+                        hy, hx)
         allowed = allowed[r0 - wr0:, g0 - wg0:][:r1 - r0, :g1 - g0]
         shape = (r1 - r0, g1 - g0)
         if iy or ix:
@@ -542,15 +579,16 @@ def ink_block(layer, passes, opts, inside, prime=False):
     return g
 
 
-def job_block(passes, opts, layers, prewarms=0, primes=0, ink_accel=0., ink_z=0.):
+def job_block(passes, opts, layers, prewarms=0, primes=0, ink_accel=0., ink_z=0., prewarm_s=0.):
     """The job's lines: its index and the passes' data. `prewarms`, `primes` count the G-code's POLYDYE_PREWARM and
-    POLYDYE_PRIME, so POLYDYE_JOB can refuse a board that can't run them before the print starts; `ink_accel` (0:
-    none set) and `ink_z` let it check the passes' run-ups and the ink blocks' height against the axes."""
+    POLYDYE_PRIME, so POLYDYE_JOB can refuse a board that can't run them before the print starts (`prewarm_s`: each
+    burst's SECONDS); `ink_accel` (0: none set) and `ink_z` let it check the passes' run-ups and the ink blocks' height
+    against the axes."""
     out = ["; POLYDYE_JOB_BEGIN",
            ";PDJ version=%d dpi=%g nozzle_dpi=%g pass_axis=y positions=%d-%d passes=%d layers=%d prewarms=%d primes=%d "
-           "ink_accel=%g ink_z=%.3f generator=%s" % (
+           "ink_accel=%g ink_z=%.3f prewarm_s=%g generator=%s" % (
                JOB_VERSION, opts.dpi, opts.nozzle_dpi, opts.positions[0], opts.positions[1], len(passes), layers,
-               prewarms, primes, ink_accel, ink_z, os.path.basename(__file__))]
+               prewarms, primes, ink_accel, ink_z, prewarm_s, os.path.basename(__file__))]
     for p in passes:
         out.append(";PDP n=%d layer=%d pass=%d coat=%d object=%s dir=%d x=%.4f y=%.5f columns=%d colours=%s" % (
             p.n, p.layer, p.number, p.coat, p.obj or '-', p.dir, p.x, p.y, p.columns, p.colours))
@@ -579,7 +617,7 @@ def process(lines, opts):
     x0, y0 = pts[:, [0, 2]].min() - pad, pts[:, [1, 3]].min() - pad
     grid = Grid(x0, y0, int((pts[:, [0, 2]].max() + pad - x0) / sx) + 1, int((pts[:, [1, 3]].max() + pad - y0) / sy)
                 + 1, sx, sy)
-    support = np.zeros((grid.ny, grid.nx), bool)
+    support = Support(grid, layers, objects, pad)
     plan = []  # (layer, passes)
     for layer in layers:
         if not layer.segs:
@@ -595,7 +633,8 @@ def process(lines, opts):
     before, primes = warm_and_prime(lines, layers, plan, config, timing, opts)
     ink_accel = min([layer.accel for layer, _ in plan if layer.accel] or [0.])
     ink_z = max(layer.end[2] + opts.gap for layer, _ in plan)
-    job = job_block(passes, opts, len(plan), len(before), len(primes), ink_accel, ink_z)
+    job = job_block(passes, opts, len(plan), len(before), len(primes), ink_accel, ink_z,
+                    opts.prewarm if before else 0.)
     size = sum(len(p.data) for p in passes)
     summary = ("PolyDye ink job: %d passes on %d layers, %.2f MB; dpi %g, nozzle_dpi %g, ink limit %g %%; %d prewarm "
                "bursts, %d primes" % (len(passes), len(plan), size / 1e6, opts.dpi, opts.nozzle_dpi,
