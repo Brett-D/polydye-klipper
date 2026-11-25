@@ -1102,6 +1102,10 @@ class JobError(Exception):
     pass
 
 
+class JobStopped(Exception):
+    """A stopped job's upload thread tried the data port (a new job may have cleared the store since)."""
+
+
 def job_find(f):
     """(start, end) byte offsets of the job in the open binary G-code file `f`: its BEGIN line's start and its END
     line's start, searched for from the file's end (the job is near it)."""
@@ -1313,12 +1317,15 @@ class JobStreamer:
     `ahead_passes` of them stored and not yet printed (consume()), but always the next one. `put(payload)` stores one
     (a data port PUT), `delete(layer, pass)` drops one never printed (skipped)."""
 
-    def __init__(self, path, records, registration, put, delete, ahead_bytes, ahead_passes, skew=None):
+    def __init__(self, path, records, registration, put, delete, ahead_bytes, ahead_passes, skew=None,
+                 stopping=None):
         self.path, self.records, self.registration, self.skew = path, records, registration, skew
         self.put, self.delete = put, delete
         self.ahead_bytes, self.ahead_passes = ahead_bytes, ahead_passes
         self.lock = threading.Lock()
-        self.stopping = threading.Event()
+        # Set by stop(); `put` and `delete` should refuse once it's set (JobStopped), checked where the data port is
+        # used one request at a time, so nothing of this job reaches the board after a new job clears it.
+        self.stopping = stopping or threading.Event()
         self.ready = {}  # n -> (columns, first)
         self.sizes = {}  # n -> bytes stored, until consumed
         self.consumed, self.skipped, self.deletes = set(), set(), []
@@ -1382,6 +1389,8 @@ class JobStreamer:
                         self.stopping.wait(0.05)
                         continue
                     self._upload(f, n)
+        except JobStopped:
+            logging.info("polydye: ink job uploads stopped")
         except Exception as e:
             logging.exception("polydye: ink job upload failed")
             with self.lock:
@@ -2469,9 +2478,12 @@ class PolyDye:
 
     # ---- calibration prints ------------------------------------------------------------------------------------------
 
-    def _data_sync(self, ftype, payload=b"", rate=None):
-        """A data port request (data_port_request()) from any thread, one at a time."""
+    def _data_sync(self, ftype, payload=b"", rate=None, stopped=None):
+        """A data port request (data_port_request()) from any thread, one at a time; raises JobStopped instead if the
+        event `stopped` (a job's) is set by the time it's this request's turn."""
         with self.data_lock:
+            if stopped is not None and stopped.is_set():
+                raise JobStopped()
             self.data_seq = (self.data_seq + 1) & 0xff
             return data_port_request(self.data_port, self.data_seq, ftype, payload, rate=rate)
 
@@ -2843,23 +2855,24 @@ class PolyDye:
             self._cal_sponge(gcmd, cmd)  # the automatic warm-up's sponge must be there before the print starts
         largest = max(records, key=lambda rec: rec['size'])
         try:
-            hello = self._data_request(DATA_HELLO)
-            if hello.get('cart') == 'black':
+            if self._data_request(DATA_HELLO).get('cart') == 'black':
                 raise ValueError("the board is set for a black cartridge; ink jobs are for the colour cartridge")
-            free = int(hello.get('free') or 0)
+            # The passes of an earlier job (a cancelled print's) are dropped: they'd never be printed. Then the room
+            # left is the board's.
+            self._data_request(DATA_CLEAR)
+            free = int(self._data_request(DATA_HELLO).get('free') or 0)
             if free and largest['size'] > free * 0.9:
                 raise ValueError("pass %d needs %d kB on the board, which has %d kB free"
                                  % (largest['n'], largest['size'] // 1024, free // 1024))
-            # The passes of an earlier job (a cancelled print's) are dropped: they'd never be printed.
-            self._data_request(DATA_CLEAR)
         except (DataPortError, OSError, ValueError) as e:
             raise gcmd.error("%s: %s" % (cmd, e))
         ahead = max(min(JOB_AHEAD_BYTES, free // 2) if free else JOB_AHEAD_BYTES, largest['size'])
-        skew = self._skew()
+        stopping = threading.Event()
         streamer = JobStreamer(path, records, self.registration,
-                               lambda payload: self._data_sync(DATA_PUT, payload, JOB_UPLOAD_RATE),
-                               lambda layer, n: self._data_sync(DATA_DELETE, struct.pack("<HH", layer, n)),
-                               ahead, JOB_AHEAD_PASSES, skew)
+                               lambda payload: self._data_sync(DATA_PUT, payload, JOB_UPLOAD_RATE, stopping),
+                               lambda layer, n: self._data_sync(DATA_DELETE, struct.pack("<HH", layer, n), None,
+                                                                stopping),
+                               ahead, JOB_AHEAD_PASSES, self._skew(), stopping)
         self.job = {'streamer': streamer, 'header': header, 'records': records, 'from_print': from_print,
                     'path': path, 'since_wait': 0}
         streamer.start()

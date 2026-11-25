@@ -198,13 +198,14 @@ def parse(lines):
         elif cmd == 'M204':
             p = dict((w[0].upper(), w[1:]) for w in words[1:] if w)
             try:
-                accel = float(p['S']) if 'S' in p else min(float(p[k]) for k in 'PT' if k in p)
+                v = float(p['S']) if 'S' in p else min(float(p[k]) for k in 'PT' if k in p)
+                accel = v if v > 0 else accel  # 0: the G-code's own limit off
             except ValueError:
                 pass
         elif cmd == 'SET_VELOCITY_LIMIT':
             p = dict(w.upper().split('=', 1) for w in words[1:] if '=' in w)
             try:
-                accel = float(p['ACCEL']) if 'ACCEL' in p else accel
+                accel = float(p['ACCEL']) if float(p.get('ACCEL', 0)) > 0 else accel
                 scv = float(p['SQUARE_CORNER_VELOCITY']) if 'SQUARE_CORNER_VELOCITY' in p else scv
             except ValueError:
                 pass
@@ -622,8 +623,10 @@ def warm_and_prime(lines, layers, plan, config, timing, opts):
     before, primes = {}, set()
     if opts.dry_run:
         return before, primes
-    durations = line_times(len(lines), timing, opts.accel or float(config.get('default_acceleration', 0) or 3000),
-                           opts.scv, opts.max_velocity or first_value(config.get('machine_max_speed_x'), 500.))
+    # The profile's limits (0 there: off), else Klipper-like defaults.
+    accel = opts.accel or first_value(config.get('default_acceleration'), 0.) or 3000.
+    vmax = opts.max_velocity or first_value(config.get('machine_max_speed_x'), 0.) or 500.
+    durations = line_times(len(lines), timing, accel, opts.scv, vmax)
     at = np.concatenate([[0.], np.cumsum(durations)])  # at[n]: when line n starts
     pitch = 25.4 / opts.dpi
     last_eject, ink_time = {}, 0.  # colour: when it last ejected; the ink so far (not in the lines)
@@ -631,12 +634,22 @@ def warm_and_prime(lines, layers, plan, config, timing, opts):
     for k, (layer, passes) in enumerate(plan):
         e = layer.last_line
         ink_start = at[e + 1] + ink_time
-        used = set(''.join(p.colours for p in passes))
-        prime = opts.prime_idle > 0 and (k == 0 or any(c not in last_eject or ink_start - last_eject[c] >=
-                                                       opts.prime_idle for c in used))
+        # Each pass's start and end after the ink's moves up and over (and a prime's trip, if any).
+        t, spans = INK_MOVES_S / 2., []
+        for p in passes:
+            took = (p.columns * pitch + 2 * RUN_UP_MM) / opts.pass_speed + 60. / opts.travel
+            spans.append((t, t + took))
+            t += took
+        first_use = {}
+        for p, (a, _) in zip(passes, spans):
+            for c in p.colours:
+                first_use.setdefault(c, ink_start + a)
+        prime = opts.prime_idle > 0 and (k == 0 or any(c not in last_eject or at_use - last_eject[c] >=
+                                                       opts.prime_idle for c, at_use in first_use.items()))
+        trip = PRIME_TRIP_S if prime else 0.
         if prime:
             primes.add(layer.index)
-            last_eject = dict.fromkeys(CHANNELS, ink_start)
+            last_eject = dict.fromkeys(CHANNELS, ink_start + INK_MOVES_S / 2. + trip)
         if opts.prewarm > 0:
             target = at[e + 1] + (0. if prime else PREWARM_LEAD_S) - opts.prewarm
             n = int(np.searchsorted(at, target, side='right')) - 1
@@ -644,11 +657,10 @@ def warm_and_prime(lines, layers, plan, config, timing, opts):
             before[n] = ("POLYDYE_PREWARM SECONDS=%g ; warms the head for layer %d's ink: %.1f s of moves to go"
                          % (opts.prewarm, layer.index, at[e + 1] - at[n]))
         bound = e + 1
-        took = INK_MOVES_S + opts.dry + (PRIME_TRIP_S if prime else 0.)
-        for p in passes:
-            took += (p.columns * pitch + 2 * RUN_UP_MM) / opts.pass_speed + 60. / opts.travel
-        ink_time += took
-        last_eject.update(dict.fromkeys(used, ink_start + took))
+        # Each colour ejects last at the end of its last pass here; the ink dries after that.
+        for p, (_, b) in zip(passes, spans):
+            last_eject.update(dict.fromkeys(p.colours, ink_start + trip + b))
+        ink_time += trip + t + opts.dry + INK_MOVES_S / 2.
     return before, primes
 
 

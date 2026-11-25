@@ -2467,13 +2467,15 @@ class InkJobs(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.path = os.path.join(self.tmp, "print.gcode")
         write_job(self.path, self.PASSES if passes is None else passes, **job)
-        self.frames = []
+        self.frames, self.hook, self.hello = [], None, {'cart': 'color', 'free': 8000000}
 
         def request(path, seq, ftype, payload=b"", timeout=3., rate=None):
+            if self.hook is not None:
+                self.hook(ftype, payload)
             self.frames.append((ftype, payload, rate))
             if fail is not None and ftype == fail:
                 raise polydye.DataPortError("no reply from the PolyDye data port")
-            return {'cart': 'color', 'free': 8000000} if ftype == polydye.DATA_HELLO else {}
+            return dict(self.hello) if ftype == polydye.DATA_HELLO else {}
         patcher = mock.patch.object(polydye, "data_port_request", side_effect=request)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -2541,6 +2543,48 @@ class InkJobs(unittest.TestCase):
                          [(0, 2), (1, 0)])
         pd.cmd_POLYDYE_JOB_END(self.gcmd())
         self.assertEqual(self.said[-1], "PolyDye ink job done: 4 of 6 passes printed, 2 skipped (objects excluded)")
+
+    def test_a_new_job_stops_the_old_ones_uploads_before_it_clears_the_board(self):
+        # The first job's thread is still making its first pass's data when a second job is loaded and clears the
+        # board: that pass never goes up, so the board has only the second job's passes after the clear.
+        pd, board = self.make()
+        making, release = threading.Event(), threading.Event()
+        real = polydye.job_pass_data
+
+        def slow(*args, **kw):
+            if not making.is_set():
+                making.set()
+                release.wait(5.)
+            return real(*args, **kw)
+        second = os.path.join(self.tmp, "second.gcode")
+        write_job(second, [(7, 0, 'A', 120., 100., 1, 40, bar(1, 40, 30, 33))])
+        with mock.patch.object(polydye, "job_pass_data", slow):
+            pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
+            self.assertTrue(making.wait(5.))
+            pd.cmd_POLYDYE_JOB(self.gcmd(FILE=second))
+            self.wait_for(lambda: (7, 0) in [struct.unpack("<HH", p[:4]) for t, p, _ in self.frames
+                                             if t == polydye.DATA_PUT])
+            release.set()
+            time.sleep(0.3)
+        clear = max(n for n, f in enumerate(self.frames) if f[0] == polydye.DATA_CLEAR)
+        self.assertEqual([struct.unpack("<HH", p[:4]) for t, p, _ in self.frames[clear:] if t == polydye.DATA_PUT],
+                         [(7, 0)])
+        self.assertIsNone(pd.job['streamer'].status()['error'])
+
+    def test_the_room_on_the_board_is_what_the_clear_leaves(self):
+        # An earlier job's passes fill the board: after the clear there's room again.
+        pd, board = self.make()
+        self.hello['free'] = 2000
+        self.hook = lambda ftype, payload: ftype == polydye.DATA_CLEAR and self.hello.update(free=8000000)
+        pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
+        self.assertEqual([f[0] for f in self.frames[:3]], [polydye.DATA_HELLO, polydye.DATA_CLEAR, polydye.DATA_HELLO])
+        pd._stop_job(None)
+        # Still too little: refused, nothing uploaded.
+        self.hook, self.frames[:] = None, []
+        self.hello['free'] = 2000
+        with self.assertRaisesRegex(RuntimeError, r"pass 1 needs \d+ kB on the board, which has 1 kB free"):
+            pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
+        self.assertEqual([f[0] for f in self.frames], [polydye.DATA_HELLO, polydye.DATA_CLEAR, polydye.DATA_HELLO])
 
     def test_uploads_stay_a_few_passes_ahead(self):
         with mock.patch.object(polydye, "JOB_AHEAD_PASSES", 2):

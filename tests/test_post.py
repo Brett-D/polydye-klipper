@@ -366,11 +366,42 @@ class WarmAndPrime(unittest.TestCase):
         self.assertEqual(re.findall(r"; PolyDye ink: layer (\d+)", text), ["6", "7"])
         self.assertEqual(text.split("; PolyDye ink: layer 7")[0].count("POLYDYE_PRIME ;"), 1)
         self.assertEqual(text.count("POLYDYE_PRIME ;"), 1)
+        # Accelerations and speeds of 0 in the profile (Orca's "off") fall back to the defaults.
+        out, summary = run(block_gcode(layers=3, feed=600, config={'default_acceleration': '0',
+                                                                    'machine_max_speed_x': '0,0'}) +
+                           ["SET_VELOCITY_LIMIT ACCEL=0\n", "M204 S0\n"])
+        self.assertIn("3 prewarm bursts, 1 primes", summary)
         # Off: neither.
         out, summary = run(src, "--prime-idle", "0", "--prewarm", "0")
         self.assertNotIn("POLYDYE_PRIME", "".join(out))
         self.assertNotIn("POLYDYE_PREWARM", "".join(out))
         self.assertIn("0 prewarm bursts, 0 primes", summary)
+
+
+@unittest.skipIf(post.np is None, "needs numpy")
+class Decap(unittest.TestCase):
+    def test_a_colour_is_idle_from_its_own_last_pass(self):
+        # Layer 0: a short cyan pass, then 120 s of magenta passes; layer 1, 2 s of moves later: cyan again. Cyan
+        # last ejected at its own pass, over 90 s before, so layer 1 primes; magenta's ink 2 s ago doesn't count.
+        opts = post.options(["--dry", "5", "x.gcode"])
+        pitch = 25.4 / opts.dpi
+
+        def ink(colours, seconds):
+            columns = int(round((seconds - 60. / opts.travel) * opts.pass_speed / pitch)) - int(2 * 3. / pitch)
+            return post.InkPass(0, 1, None, 100., 100., columns, colours, b"")
+
+        layers = []
+        for n, (start, last) in enumerate(((0, 1), (2, 3))):
+            layer = post.Layer(n)
+            layer.start_line, layer.last_line = start, last
+            layers.append(layer)
+        timing = {'moves': [], 'dwells': [(1, 1.), (3, 1.)]}
+        plan = [(layers[0], [ink('c', 5.)] + [ink('m', 40.) for _ in range(3)]), (layers[1], [ink('c', 5.)])]
+        before, primes = post.warm_and_prime(["G4\n"] * 5, layers, plan, {}, timing, opts)
+        self.assertEqual(primes, {0, 1})
+        # Magenta's passes last: it's fresh, so a magenta layer after it doesn't prime.
+        plan[1] = (layers[1], [ink('m', 5.)])
+        self.assertEqual(post.warm_and_prime(["G4\n"] * 5, layers, plan, {}, timing, opts)[1], {0})
 
 
 if __name__ == "__main__":
