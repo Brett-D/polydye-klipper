@@ -664,6 +664,8 @@ class PolyDye:
         gcode.register_command('POLYDYE_FIRE_TEST', self.cmd_POLYDYE_FIRE_TEST, desc=self.cmd_POLYDYE_FIRE_TEST_help)
         gcode.register_command('POLYDYE_SPIT', self.cmd_POLYDYE_SPIT, desc=self.cmd_POLYDYE_SPIT_help)
         gcode.register_command('POLYDYE_WARM', self.cmd_POLYDYE_WARM, desc=self.cmd_POLYDYE_WARM_help)
+        gcode.register_command('POLYDYE_CLOCK_TEST', self.cmd_POLYDYE_CLOCK_TEST,
+                               desc=self.cmd_POLYDYE_CLOCK_TEST_help)
 
     def _build_config(self):
         self.mcu.add_config_cmd("config_polydye oid=%d" % (self.oid,))
@@ -1328,6 +1330,14 @@ class PolyDye:
 
     def cmd_POLYDYE_SPIT(self, gcmd):
         self._spit(gcmd, "POLYDYE_SPIT", warm_only=False)
+
+    cmd_POLYDYE_CLOCK_TEST_help = "Removed in the stock-only cleanup: the bus runs only at the stock clock"
+
+    def cmd_POLYDYE_CLOCK_TEST(self, gcmd):
+        # Kept so old macros and notes get the reason rather than Klipper's unknown-command error.
+        raise gcmd.error("POLYDYE_CLOCK_TEST was removed: the bus runs only at the stock clock (2.857 MHz), set once at "
+                         "boot, so there are no clock switches to test; the board still measures the clock before "
+                         "every live run")
 
     cmd_POLYDYE_WARM_help = ("LIVE, no motion, EXPERIMENTAL: warm the cartridge head for SECONDS (max 30) by firing "
                              "every nozzle (WARM_PULSE words, up to 2.9 us; by default too short to boil ink) as fast "

@@ -434,7 +434,9 @@ class TestCleanup(unittest.TestCase):
                 (lambda: pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b_late:6:half", **self.FIRE)),
                  "^POLYDYE_FIRE_TEST: STRIPES: color_b_late:6:half: CLOCK=half was removed"),
                 (lambda: pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b:6", **self.FIRE)),
-                 "^POLYDYE_FIRE_TEST: STRIPES: color_b:6: TEMPLATE=color_b was removed")):
+                 "^POLYDYE_FIRE_TEST: STRIPES: color_b:6: TEMPLATE=color_b was removed"),
+                (lambda: pd.cmd_POLYDYE_CLOCK_TEST(self.gcmd(COUNT=5)),
+                 "^POLYDYE_CLOCK_TEST was removed: the bus runs only at the stock clock \\(2.857 MHz\\)")):
             with self.assertRaisesRegex(RuntimeError, message):
                 run()
         self.assertEqual((board.sent, sent), ([], []))
