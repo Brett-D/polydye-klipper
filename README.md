@@ -380,7 +380,8 @@ The add-on and its bundled board firmware keep the stock baseline and drop the d
   `POLYDYE_UPLOAD_TEST_PASS`: use `stock` with its knobs (`PER_PULSE=1` for one heater per fire pulse) or `all`;
 - the extended spit test (`POLYDYE_SPIT EXTENDED=1`, pulses of 3–5 µs): the fire pulse is at most 2.9 µs (8 words).
 
-Old parameters are refused with a plain "removed" error before anything is sent or moves, e.g. `POLYDYE_SPIT: EXTENDED
+Old parameters are refused with a plain "removed" error before anything is sent to the board, and by the
+`POLYDYE_*` commands before anything moves (the `PD_FIRE_TEST` macro homes an unhomed printer first), e.g. `POLYDYE_SPIT: EXTENDED
 was removed (stock baseline): the fire pulse is at most 2.9 us (8 words)`, `POLYDYE_CARTRIDGE: TEMPLATE=deskjet was
 removed (stock baseline): use color_b_late, black_a or black_b` or `[polydye] bus_clock: ours was removed: the board
 runs only the stock clock (2.857 MHz); remove bus_clock from polydye.cfg`. `CLOCK=stock`, `:stock` stripes,

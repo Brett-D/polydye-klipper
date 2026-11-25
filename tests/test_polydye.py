@@ -384,6 +384,21 @@ class TestCleanup(unittest.TestCase):
             pd.cmd_POLYDYE_ENABLE(self.gcmd(LIVE=1))
         self.assertEqual(board.sent, [])
 
+    def test_tests_and_live_ink_refuse_a_board_on_another_clock(self):
+        # Older firmware switched to half on its console after connecting: the add-on's timing assumes the stock clock.
+        pd, board = self.make(fail_on="NOTHING")
+        status = board.status
+        pd._fresh_status = pd._query_status = lambda: dict(status(), bus_clock='half')
+        pd.spit_cmd = pd.spit_run_cmd = types.SimpleNamespace(send=lambda args: board.sent.append('spit'))
+        pd.mode_cmd = types.SimpleNamespace(send=lambda args: board.sent.append('mode'))
+        for run in (lambda: pd.cmd_POLYDYE_SPIT(self.gcmd(SECONDS=0.2, PERIOD_US=200, CONFIRM=1)),
+                    lambda: pd.cmd_POLYDYE_WARM(self.gcmd(SECONDS=0.5, CONFIRM=1)),
+                    lambda: pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b_late:6", PATTERN='all', **self.FIRE)),
+                    lambda: pd.cmd_POLYDYE_ENABLE(self.gcmd(LIVE=1))):
+            with self.assertRaisesRegex(RuntimeError, "runs the half bus clock .* FIRMWARE_RESTART sets it back"):
+                run()
+        self.assertEqual(board.sent, [])
+
     def test_removed_settings_are_refused_before_anything_is_sent(self):
         pd, board = self.make(fail_on="NOTHING")
         sent = []
@@ -947,16 +962,26 @@ class BuildConfig(unittest.TestCase):
         pd, sent = self.build(STOCK_ONLY, 8, 'black_b')
         self.assertEqual(sent, ["polydye_set_template oid=0 template=3", "polydye_set_pulse oid=0 words=8",
                                 "polydye_set_clock oid=0 stock=1"])
-        # Older board firmware may still be at ours with 9 words, 3.15 us at the stock clock: a pulse within the limit
-        # goes first. It still works, with a warning to update it.
+        # Older board firmware may still be at ours with 9 words (3.15 us at the stock clock) or at half with 4 words
+        # (6 words there would be 3.6 us): ours first, where any valid pulse is within the limit, then a pulse within
+        # it at the stock clock, then the stock clock. It still works, with a warning to update it.
         pd, sent = self.build({'POLYDYE_SOFT_RESET': 1})
-        self.assertEqual(sent, ["polydye_set_pulse oid=0 words=6", "polydye_set_clock oid=0 stock=1"])
+        self.assertEqual(sent, ["polydye_set_clock oid=0 stock=0", "polydye_set_pulse oid=0 words=6",
+                                "polydye_set_clock oid=0 stock=1"])
+        for clock, words in (('ours', 9), ('half', 4), ('stock', 8)):
+            for step in sent:
+                if step.startswith("polydye_set_clock"):
+                    clock = polydye.CLOCK_NAMES[int(step.rsplit("=", 1)[1])]
+                else:
+                    words = int(step.rsplit("=", 1)[1])
+                hz = {'ours': polydye.OURS_HZ, 'stock': polydye.BUS_HZ, 'half': polydye.OURS_HZ // 2}[clock]
+                self.assertLessEqual(words * 1e6 / hz, polydye.PULSE_MAX_US, (clock, words, step))
         self.assertEqual(len(pd.test_warnings), 1)
         self.assertIn("predates the stock-only cleanup: update it from the PolyDye page (Board firmware: Update to "
                       "bundled firmware)", pd.test_warnings[0])
         pd, sent = self.build({'POLYDYE_SOFT_RESET': 1}, 7, 'color_b_late')
-        self.assertEqual(sent, ["polydye_set_template oid=0 template=4", "polydye_set_pulse oid=0 words=7",
-                                "polydye_set_clock oid=0 stock=1"])
+        self.assertEqual(sent, ["polydye_set_template oid=0 template=4", "polydye_set_clock oid=0 stock=0",
+                                "polydye_set_pulse oid=0 words=7", "polydye_set_clock oid=0 stock=1"])
         # Board firmware without polydye_set_clock runs ours, without color_b_late: no clock to send.
         pd, sent = self.build({}, 7, missing=("polydye_query_clock",))
         self.assertEqual(sent, ["polydye_set_pulse oid=0 words=7"])

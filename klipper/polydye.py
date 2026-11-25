@@ -541,14 +541,18 @@ def init_pulse_clock(oid, pulse_words, has_clock, stock_only):
     stock clock.
 
     Board firmware with POLYDYE_STOCK_ONLY runs only the stock clock and takes it as a no-op. Older board firmware may
-    be at another clock (it booted on ours, or kept a clock across a Klipper RESTART) and refuses any moment where the
-    pulse would be over the limit, so it gets a pulse within the limit at the stock clock first, 6 words unless
-    polydye.cfg sets one: 9 words left from ours would be 3.15 us there. Firmware without polydye_set_clock gets just
-    the pulse, if set.
+    be at another clock (it booted on ours, or kept ours or half across a Klipper RESTART) and refuses any moment where
+    the pulse would be over the limit. So it goes to ours first, the fastest clock, where any pulse within the limit at
+    some clock is within it too; then a pulse within the limit at the stock clock, 6 words unless polydye.cfg sets one
+    (9 words left from ours would be 3.15 us there, and 6-8 words set at half would be 3.6-4.8 us); then the stock
+    clock. Firmware without polydye_set_clock gets just the pulse, if set.
     """
-    if pulse_words is None and has_clock and not stock_only:
+    legacy = has_clock and not stock_only
+    if pulse_words is None and legacy:
         pulse_words = PULSE_MIN
-    cmds = [] if pulse_words is None else ["polydye_set_pulse oid=%d words=%d" % (oid, pulse_words)]
+    cmds = ["polydye_set_clock oid=%d stock=%d" % (oid, CLOCK_NAMES.index('ours'))] if legacy else []
+    if pulse_words is not None:
+        cmds.append("polydye_set_pulse oid=%d words=%d" % (oid, pulse_words))
     if has_clock:
         cmds.append("polydye_set_clock oid=%d stock=%d" % (oid, CLOCK_NAMES.index('stock')))
     return cmds
@@ -943,7 +947,14 @@ class PolyDye:
 
     def _check_current_pulse(self, gcmd, name, st):
         """Refuses to go on from a board whose current pulse is over the limit (older firmware doesn't always stop
-        that), so live ink never uses it and a test can't put it back afterwards."""
+        that), so live ink never uses it and a test can't put it back afterwards; and from a board on a clock other
+        than the stock one (older firmware's console can still switch it), where the add-on's pulse, column and
+        warm-up timing, all worked out for the stock clock, would be wrong."""
+        clock = st.get('bus_clock')
+        if clock not in (None, 'stock'):
+            raise gcmd.error("%s: the board runs the %s bus clock (set on its console?), but only the stock clock is "
+                             "left: FIRMWARE_RESTART sets it back, and updating the board firmware from the PolyDye "
+                             "page (Board firmware: Update to bundled firmware) removes the others" % (name, clock))
         if st.get('pulse_words') is not None and pulse_limit_error(st['pulse_words']):
             raise gcmd.error("%s: the board is set to an over-limit pulse: %s. Set a shorter one first, e.g. "
                              "POLYDYE_CARTRIDGE PULSE=%d" % (name, pulse_limit_error(st['pulse_words']), PULSE_MAX))
