@@ -13,8 +13,8 @@ post-processing script, this then rewrites the G-code:
 - after each layer's last extrusion, POLYDYE_JOB_PASS prints those passes --gap mm above it, so the next layer seals the
   ink in, in --wall-coats and --top-coats coats (1);
 - the head is hot and its nozzles primed when the ink comes: POLYDYE_PREWARM about --prewarm s (6) of moves before each
-  ink layer's end warms it during the plastic, and POLYDYE_PRIME spits at the wipe sponge before the first ink layer and
-  any layer using a colour that hasn't ejected for --prime-idle s (90), by the print time estimated here (Klipper's
+  ink layer's end warms it during the plastic, and POLYDYE_PRIME spits at the wipe sponge before the first ink pass and
+  any pass using a colour that hasn't ejected for --prime-idle s (90), by the print time estimated here (Klipper's
   planning of the moves);
 - the passes' nozzle data goes into the G-code too, as comments after the print; POLYDYE_JOB at the start has the
   PolyDye Klipper add-on stream it to the board while the print runs.
@@ -548,10 +548,10 @@ def layer_passes(layer, grid, support, tools, objects, opts, pitch):
     return out
 
 
-def ink_block(layer, passes, opts, inside, prime=False):
+def ink_block(layer, passes, opts, inside, primes=()):
     """G-code that inks `passes` after `layer`'s last extrusion and comes back: out of the object it's in (`inside`),
-    retracted, up by --gap, a prime at the sponge if `prime`, the passes with live ink, a pause for the ink to dry, back
-    and down."""
+    retracted, up by --gap, the passes with live ink (a prime at the sponge before each pass whose index is in
+    `primes`), a pause for the ink to dry, back and down."""
     x, y, z = layer.end
     g = ["; PolyDye ink: layer %d (Z %.3f), %d pass%s" % (layer.index, z, len(passes), "" if len(passes) == 1 else
                                                          "es")]
@@ -561,10 +561,10 @@ def ink_block(layer, passes, opts, inside, prime=False):
     if opts.retract:
         g.append("G1 E-%.2f F2700" % (opts.retract,))
     g += ["G1 Z%.3f F600" % (z + opts.gap,), "POLYDYE_ENABLE LIVE=%d" % (0 if opts.dry_run else 1)]
-    if prime:
-        g.append("POLYDYE_PRIME ; colours idle %g s or more (or the first ink): primed at the sponge"
-                 % (opts.prime_idle,))
-    for p in passes:
+    for k, p in enumerate(passes):
+        if k in primes:
+            g.append("POLYDYE_PRIME ; colours idle %g s or more (or the first ink): primed at the sponge"
+                     % (opts.prime_idle,))
         g.append("POLYDYE_JOB_PASS N=%d ; layer %d pass %d, coat %d, %s, X=%.3f Y=%.3f DIR=%d" % (
             p.n, p.layer, p.number, p.coat, p.colours, p.x, p.y, p.dir))
     g += ["M400", "POLYDYE_ENABLE LIVE=0"]
@@ -633,16 +633,17 @@ def process(lines, opts):
     before, primes = warm_and_prime(lines, layers, plan, config, timing, opts)
     ink_accel = min([layer.accel for layer, _ in plan if layer.accel] or [0.])
     ink_z = max(layer.end[2] + opts.gap for layer, _ in plan)
-    job = job_block(passes, opts, len(plan), len(before), len(primes), ink_accel, ink_z,
+    count = sum(len(v) for v in primes.values())
+    job = job_block(passes, opts, len(plan), len(before), count, ink_accel, ink_z,
                     opts.prewarm if before else 0.)
     size = sum(len(p.data) for p in passes)
     summary = ("PolyDye ink job: %d passes on %d layers, %.2f MB; dpi %g, nozzle_dpi %g, ink limit %g %%; %d prewarm "
                "bursts, %d primes" % (len(passes), len(plan), size / 1e6, opts.dpi, opts.nozzle_dpi,
-                                      opts.ink_limit * 100, len(before), len(primes)))
+                                      opts.ink_limit * 100, len(before), count))
     insert = {}
     for layer, ps in plan:
         insert.setdefault(layer.last_line, []).extend(ink_block(layer, ps, opts, layer.end_object,
-                                                                layer.index in primes))
+                                                                primes.get(layer.index, ())))
     insert[plan[-1][0].last_line].append("POLYDYE_JOB_END")
     drop = set(tool_lines)
     out = []
@@ -672,14 +673,15 @@ def process(lines, opts):
 
 
 def warm_and_prime(lines, layers, plan, config, timing, opts):
-    """Where the ink layers' prewarm bursts go and which layers prime first, by the print time estimated
-    (line_times()): ({line: the POLYDYE_PREWARM line to put before it}, {layer index: primes}).
-    - A layer primes (POLYDYE_PRIME, at the sponge) if it's the first ink layer or uses a colour that hasn't ejected for
-      --prime-idle s; a prime ejects every colour.
+    """Where the ink layers' prewarm bursts go and where the primes go, by the print time estimated (line_times()):
+    ({line: the POLYDYE_PREWARM line to put before it}, {layer index: indices of its passes that prime first}).
+    - A pass primes first (POLYDYE_PRIME, at the sponge) if it's the print's first ink pass or uses a colour that
+      hasn't ejected for --prime-idle s, counting the passes before it in a long ink block; a prime ejects every
+      colour.
     - Its burst (--prewarm s) starts where the moves before it end, so it goes before the line from which the layer's
       moves take that long to its end, less the lead to the first pass (the prime trip instead: the spit would cut a
       burst still firing); no earlier than the previous ink (or the first layer), so a short layer warms through."""
-    before, primes = {}, set()
+    before, primes = {}, {}
     if opts.dry_run:
         return before, primes
     # The profile's limits (0 there: off), else Klipper-like defaults.
@@ -693,22 +695,18 @@ def warm_and_prime(lines, layers, plan, config, timing, opts):
     for k, (layer, passes) in enumerate(plan):
         e = layer.last_line
         ink_start = at[e + 1] + ink_time
-        # Each pass's start and end after the ink's moves up and over (and a prime's trip, if any).
-        t, spans = INK_MOVES_S / 2., []
-        for p in passes:
-            took = (p.columns * pitch + 2 * RUN_UP_MM) / opts.pass_speed + 60. / opts.travel
-            spans.append((t, t + took))
-            t += took
-        first_use = {}
-        for p, (a, _) in zip(passes, spans):
-            for c in p.colours:
-                first_use.setdefault(c, ink_start + a)
-        prime = opts.prime_idle > 0 and (k == 0 or any(c not in last_eject or at_use - last_eject[c] >=
-                                                       opts.prime_idle for c, at_use in first_use.items()))
-        trip = PRIME_TRIP_S if prime else 0.
-        if prime:
-            primes.add(layer.index)
-            last_eject = dict.fromkeys(CHANNELS, ink_start + INK_MOVES_S / 2. + trip)
+        # The passes in order after the ink's moves up and over: each primes first if one of its colours has been
+        # idle too long by then (the print's first pass always); each colour ejects last at the end of its last pass.
+        now = ink_start + INK_MOVES_S / 2.
+        for j, p in enumerate(passes):
+            if opts.prime_idle > 0 and ((k == 0 and j == 0) or any(
+                    c not in last_eject or now - last_eject[c] >= opts.prime_idle for c in p.colours)):
+                primes.setdefault(layer.index, []).append(j)
+                now += PRIME_TRIP_S
+                last_eject = dict.fromkeys(CHANNELS, now)
+            now += (p.columns * pitch + 2 * RUN_UP_MM) / opts.pass_speed + 60. / opts.travel
+            last_eject.update(dict.fromkeys(p.colours, now))
+        prime = 0 in primes.get(layer.index, ())
         if opts.prewarm > 0:
             target = at[e + 1] + (0. if prime else PREWARM_LEAD_S) - opts.prewarm
             n = int(np.searchsorted(at, target, side='right')) - 1
@@ -716,10 +714,8 @@ def warm_and_prime(lines, layers, plan, config, timing, opts):
             before[n] = ("POLYDYE_PREWARM SECONDS=%g ; warms the head for layer %d's ink: %.1f s of moves to go"
                          % (opts.prewarm, layer.index, at[e + 1] - at[n]))
         bound = e + 1
-        # Each colour ejects last at the end of its last pass here; the ink dries after that.
-        for p, (_, b) in zip(passes, spans):
-            last_eject.update(dict.fromkeys(p.colours, ink_start + trip + b))
-        ink_time += trip + t + opts.dry + INK_MOVES_S / 2.
+        # The ink dries after its last pass, then the moves back.
+        ink_time = now + opts.dry + INK_MOVES_S / 2. - at[e + 1]
     return before, primes
 
 

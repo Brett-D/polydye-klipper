@@ -2943,6 +2943,10 @@ class PolyDye:
         eventtime = self.printer.get_reactor().monotonic()
         th = self.printer.lookup_object('toolhead').get_status(eventtime)
         base = self.printer.lookup_object('gcode_move').base_position
+        if self.pass_speed > th['max_velocity']:
+            raise gcmd.error("%s: the passes go at pass_speed %.1f mm/s, over max_velocity %.1f: raise max_velocity "
+                             "or lower pass_speed (and slice again with --pass-speed)"
+                             % (cmd, self.pass_speed, th['max_velocity']))
         slow = dict(th, max_accel=min(th['max_accel'], header['ink_accel'] or JOB_REACH_ACCEL))
         low, high = th['axis_minimum'], th['axis_maximum']
         if high.z > low.z and header['ink_z'] + base[2] > high.z:

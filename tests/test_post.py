@@ -449,10 +449,21 @@ class Decap(unittest.TestCase):
         timing = {'moves': [], 'dwells': [(1, 1.), (3, 1.)]}
         plan = [(layers[0], [ink('c', 5.)] + [ink('m', 40.) for _ in range(3)]), (layers[1], [ink('c', 5.)])]
         before, primes = post.warm_and_prime(["G4\n"] * 5, layers, plan, {}, timing, opts)
-        self.assertEqual(primes, {0, 1})
+        self.assertEqual(primes, {0: [0], 1: [0]})
         # Magenta's passes last: it's fresh, so a magenta layer after it doesn't prime.
         plan[1] = (layers[1], [ink('m', 5.)])
-        self.assertEqual(post.warm_and_prime(["G4\n"] * 5, layers, plan, {}, timing, opts)[1], {0})
+        self.assertEqual(post.warm_and_prime(["G4\n"] * 5, layers, plan, {}, timing, opts)[1], {0: [0]})
+        # Within one long ink block: cyan again after 120 s of magenta primes again, right before that pass.
+        plan = [(layers[0], [ink('c', 5.)] + [ink('m', 40.) for _ in range(3)] + [ink('c', 5.), ink('m', 5.)])]
+        primes = post.warm_and_prime(["G4\n"] * 5, layers, plan, {}, timing, opts)[1]
+        self.assertEqual(primes, {0: [0, 4]})
+        layers[0].end = (100., 100., 0.2)
+        for n, p in enumerate(plan[0][1]):
+            p.n, p.number, p.dir = n, n, 1
+        block = post.ink_block(layers[0], plan[0][1], opts, None, primes[0])
+        self.assertEqual([ln.split(" ;")[0] for ln in block if ln.startswith(("POLYDYE_PRIME", "POLYDYE_JOB_PASS"))],
+                         ["POLYDYE_PRIME"] + ["POLYDYE_JOB_PASS N=%d" % n for n in range(4)] +
+                         ["POLYDYE_PRIME", "POLYDYE_JOB_PASS N=4", "POLYDYE_JOB_PASS N=5"])
 
 
 if __name__ == "__main__":

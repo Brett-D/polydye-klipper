@@ -2021,7 +2021,7 @@ class CalibrationPrints(unittest.TestCase):
         pd.dpi, pd.nozzle_dpi, pd.pass_speed, pd.extra_run_up, pd.settle_time = 847., 300., 59.5, 1., 0.03
         pd.data_port, pd.data_seq, pd.cfg_saves, pd.travel_speed = '/dev/serial/by-id/polydye-if02', 0, 0, 150.
         self.waits = []
-        th = {'homed_axes': homed, 'max_accel': 3000., 'minimum_cruise_ratio': 0.,
+        th = {'homed_axes': homed, 'max_accel': 3000., 'max_velocity': 300., 'minimum_cruise_ratio': 0.,
               'axis_minimum': types.SimpleNamespace(x=0., y=0., z=0.),
               'axis_maximum': types.SimpleNamespace(x=250., y=235., z=250.)}
         self.extruder = {'target': 210., 'temperature': 210.}
@@ -2681,6 +2681,13 @@ class InkJobs(unittest.TestCase):
         pd, board = self.make([(0, 0, '-', 120., 224.7, 1, 2, bar(1, 2, 30, 33))], ink_accel=500.)
         self.objects['toolhead'].get_status(0.)['minimum_cruise_ratio'] = 0.6
         pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
+
+    def test_a_pass_speed_over_max_velocity_is_refused_at_the_start(self):
+        pd, board = self.make()
+        self.objects['toolhead'].get_status(0.)['max_velocity'] = 50.
+        with self.assertRaisesRegex(RuntimeError, r"the passes go at pass_speed 59.5 mm/s, over max_velocity 50.0"):
+            pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
+        self.assertEqual(self.frames, [])
 
     def test_object_names_and_burst_lengths(self):
         # A non-ASCII object name (Orca keeps the model's) still matches the excluded object's.
