@@ -342,9 +342,9 @@ class Ink(unittest.TestCase):
         self.assertEqual({r['object'] for r in records}, {"-"})
 
     def test_swaths_tile_the_nozzle_grid(self):
-        # Sweeps side by side over 55 positions (28-82), sharing one (--overlap 1) so their seams don't show white;
-        # with --overlap 0 the next starts one pitch past the last one's.
-        for args, step in (((), 54.), (("--overlap", "0"), 55.)):
+        # Sweeps over 55 positions (28-82), overlapping by 6 (--feather 6); with --feather 0 side by side, the next
+        # starting one pitch past the last one's.
+        for args, step in (((), 49.), (("--feather", "0"), 55.)):
             out, _ = run(block_gcode(layers=1, band=4.), "--edge-margin", "0", *args)
             _, records, _ = job_dots(out)
             xs = sorted(r['x'] for r in records)
@@ -360,16 +360,51 @@ class Ink(unittest.TestCase):
         firsts = {}
         for r in records:
             firsts.setdefault(r['layer'], []).append(r['x'])
-        self.assertEqual({len(v) for v in firsts.values()}, {3})  # 9.6 + 0.42 mm over 54-position steps
+        self.assertEqual({len(v) for v in firsts.values()}, {3})  # 9.6 + 0.42 mm over 49-position steps
         offsets = [round((min(v) - 94.) / SX) for _, v in sorted(firsts.items())]
         self.assertGreater(len(set(offsets)), 5, offsets)
         self.assertEqual(post.swaths(10, 129, 55, 1, 0.), [10, 64, 118])  # 120 columns: 3 sweeps, 43 to spare
         self.assertEqual(post.swaths(10, 129, 55, 1, 0.999), [-33, 21, 75])
-        # Every layer's ink is all there: as much as with the grid fixed, the overlap's doubled line aside.
+        # Every layer's ink is all there, each dot once, wherever the seams fall.
         per_layer = {}
         for r, c, p, x, y, _ in dots:
-            per_layer.setdefault(r['layer'], set()).add((round(x / SX), round(y / PITCH)))
-        self.assertEqual(len({len(v) for v in per_layer.values()}), 1)
+            per_layer.setdefault(r['layer'], []).append((c, round(x / SX), round(y / PITCH)))
+        self.assertEqual({len(v) for v in per_layer.values()}, {len(set(per_layer[0]))})
+        self.assertEqual({len(v) - len(set(v)) for v in per_layer.values()}, {0})
+
+    def test_feathered_joins_share_the_band_once(self):
+        # Magenta at 100 % (one ink: 2 + 2 per packet, so nothing is capped): with the joins feathered over 6
+        # positions, each dot prints exactly once, the same dots as with the sweeps side by side; in each band the
+        # cells go from one sweep to the next along a ramp, a whole cell (two column pairs) to one sweep.
+        src = block_gcode(layers=1, band=4.)
+        feathered, _ = run(src, "--edge-margin", "0", "--inset", "0")
+        plain, _ = run(src, "--edge-margin", "0", "--inset", "0", "--feather", "0")
+        _, records, dots = job_dots(feathered)
+        got = [(c, round(x / SX), round(y / PITCH)) for _, c, _, x, y, _ in dots]
+        self.assertEqual(len(got), len(set(got)))
+        self.assertEqual(set(got), {(c, round(x / SX), round(y / PITCH)) for _, c, _, x, y, _ in job_dots(plain)[2]})
+        self.assertEqual(len(records), 3)
+        xs = sorted(r['x'] for r in records)
+        by_dot = {}
+        for r, c, p, x, y, run_length in dots:
+            self.assertGreaterEqual(run_length, 2)
+            by_dot[(round(x / SX), round(y / PITCH))] = r['x']
+        # A sweep's share changes only on cell boundaries: every four columns, the same phase in every band column.
+        changes = {(y + 1) % 4 for (g, y), o in by_dot.items() if by_dot.get((g, y + 1), o) != o}
+        self.assertEqual(len(changes), 1)
+        phase = changes.pop()
+        owners = {}
+        for (g, y), o in by_dot.items():
+            owners.setdefault((g, (y - phase) // 4), set()).add(o)
+        self.assertEqual({len(v) for v in owners.values()}, {1})
+        # The band between the first two sweeps, 6 positions wide: the second's share rises across it.
+        band = sorted({g for (g, q), o in owners.items() if xs[0] in o} & {g for (g, q), o in owners.items()
+                                                                                   if xs[1] in o})
+        self.assertEqual(len(band), 6)
+        shares = [sum(xs[1] in o for (g, q), o in owners.items() if g == b)
+                  / float(sum(g == b for g, q in owners)) for b in band]
+        self.assertLess(shares[0], 0.3)
+        self.assertGreater(shares[-1], 0.7)
 
 
 @unittest.skipIf(post.np is None, "needs numpy")

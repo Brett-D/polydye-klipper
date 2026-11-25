@@ -9,9 +9,11 @@ post-processing script, this then rewrites the G-code:
 - per layer, where each coloured filament's lines are becomes cyan, magenta and yellow dots: a solid colour fires every
   dot of its inks (--ink-limit, 100 %), a partial one an ordered (Bayer) dither of them, decided per pair of columns
   (every nozzle fires at least two columns running: one fire on its own doesn't eject); printed as sweeps along Y
-  over each object's whole footprint, every colour in each, about 4.6 mm apart (positions 28-82, --overlap 1), the
-  grid shifted every layer so the seams don't stack. The add-on keeps at most 4 heaters on each fire pulse and 5 on a
-  packet's two together when it sends them, splitting a sweep that needs more into one board pass per fire line;
+  over each object's whole footprint, every colour in each, about 4.2 mm apart (positions 28-82), neighbours
+  overlapping by --feather positions (6) whose dots go to one or the other by a fixed random ramp, so the joins show no
+  line; the grid shifted every layer so the seams don't stack. The add-on keeps at most 4 heaters on each fire pulse
+  and 5 on a packet's two together when it sends them, splitting a sweep that needs more into one board pass per fire
+  line;
 - each layer's ink moves gently (POLYDYE_INK_MOTION: --ink-accel 1000, --ink-scv 1), the print's limits put back
   after it;
 - after each layer's last extrusion, POLYDYE_JOB_PASS prints those passes --gap mm above it, so the next layer seals the
@@ -409,6 +411,13 @@ def _box(a, hy, hx, every):
 GOLDEN = (5 ** 0.5 - 1) / 2
 
 
+def cell_hash(q, r):
+    """A fixed pseudo-random 0-1 per plate cell (rows q, grid columns r: integer arrays), the same for every sweep."""
+    h = (q.astype(np.int64) * 73856093) ^ (r.astype(np.int64) * 19349663)
+    h = (h ^ (h >> 13)) * 1274126177
+    return ((h ^ (h >> 16)) & 0xFFFF) / 65536.
+
+
 def swaths(lo, hi, width, overlap, phase):
     """The first grid columns of the fewest runs of `width` columns, each overlapping the next by `overlap`, that
     cover columns lo..hi: the sweeps over an object's whole footprint. Their spare columns go `phase` (0-1) of the way
@@ -530,10 +539,25 @@ def layer_passes(layer, grid, support, tools, objects, opts, pitch):
                 fires[ch] = level[ch] > bayer[np.ix_(rows, cols)]
             occupied = np.nonzero(fires.any(axis=(0, 1)))[0]
             # Sweeps over the whole footprint along Y, every colour in each, the grid shifted per layer (and coat).
+            # Neighbours overlap by --feather positions; there each cell (two rows, so four bus columns: pairs stay
+            # together; one position) goes to one of them, the right one where its fixed hash is under a ramp that
+            # rises across the band: every dot prints once, and the join has no line (polydye_picture4, 2026-11-25).
             phase = (layer.index * GOLDEN + (coat - 1) / 2.) % 1.
             padded = np.pad(fires, ((0, 0), (0, 0), (width, width)))
-            for gs in swaths(int(occupied[0]), int(occupied[-1]), width, opts.overlap, phase):
+            starts = swaths(int(occupied[0]), int(occupied[-1]), width, opts.feather, phase)
+            if opts.feather:
+                band = np.arange(opts.feather)
+                ramp = (band + .5) / opts.feather
+                cells = (np.arange(r0, r0 + shape[0]) // 2)[:, None]
+            for j, gs in enumerate(starts):
                 sub = padded[:, :, gs + width:gs + 2 * width]
+                if opts.feather and len(starts) > 1:
+                    sub = sub.copy()
+                    if j > 0:  # the band shared with the sweep before: keep the cells the ramp gives this one
+                        sub[:, :, :opts.feather] &= cell_hash(cells, g0 + gs + band[None, :]) < ramp
+                    if j < len(starts) - 1:
+                        edge = width - opts.feather
+                        sub[:, :, edge:] &= cell_hash(cells, g0 + gs + edge + band[None, :]) >= ramp
                 rows = np.nonzero(sub.any(axis=(0, 2)))[0]
                 if not len(rows):
                     continue
@@ -782,8 +806,8 @@ def options(argv=None):
     ap.add_argument("--positions", type=positions, default=DEFAULT_POSITIONS, help="nozzle positions a pass draws on, "
                     "FIRST-LAST (default 28-82: two groups of 14 on each fire line, cyan's 29-83 with its "
                     "registration, so two inks want exactly 4 heaters per fire pulse)")
-    ap.add_argument("--overlap", type=int, default=1, help="nozzle positions neighbouring sweeps share, so their seams "
-                    "don't show white (default 1)")
+    ap.add_argument("--feather", type=int, default=6, help="nozzle positions neighbouring sweeps overlap by, their "
+                    "dots shared out by a fixed random ramp so the joins show no line; 0: side by side (default 6)")
     ap.add_argument("--ink-accel", type=float, default=1000., help="mm/s^2 at most while a layer's ink prints "
                     "(POLYDYE_INK_MOTION; 0: the print's own) (default 1000)")
     ap.add_argument("--ink-scv", type=float, default=1., help="square corner velocity at most while a layer's ink "
@@ -814,8 +838,8 @@ def options(argv=None):
             ap.error("--%s must be at least %g" % (name.replace('_', '-'), lo))
     if opts.ink_limit > 100.:
         ap.error("--ink-limit is a percentage, at most 100")
-    if not 0 <= opts.overlap < opts.positions[1] - opts.positions[0]:
-        ap.error("--overlap must be 0 or more and less than a sweep's width")
+    if not 0 <= opts.feather <= (opts.positions[1] - opts.positions[0] + 1) // 2:
+        ap.error("--feather must be 0 to half a sweep's width")
     if opts.prewarm > PREWARM_MAX_S:
         ap.error("--prewarm is at most %g s (a burst is at most 65535 columns: 16.6 s at warm_period_us 254)"
                  % (PREWARM_MAX_S,))

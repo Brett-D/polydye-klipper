@@ -339,10 +339,14 @@ another way.
 **What the post-processor does:** the tool changes go; per layer, where each coloured filament's lines are becomes
 ink, one object at a time.
 - **Long sweeps:** each object's ink in a layer is printed as sweeps along Y over its whole footprint, every colour in
-  each, side by side about 4.6 mm apart (55 nozzle positions, 28–82, sharing one with the next: `--overlap 1`, so the
-  seams don't show white), in alternating directions, each trimmed to its first and last ink. The sweep grid shifts
-  every layer (by multiples of the golden ratio over the spare width), so the seams don't stack up the walls. Long
-  sweeps held the head steadier than short passes (P box #4, 2026-11-25).
+  each, about 4.2 mm apart (55 nozzle positions, 28–82), in alternating directions, each trimmed to its first and
+  last ink. The sweep grid shifts every layer (by multiples of the golden ratio over the spare width), so the seams
+  don't stack up the walls. Long sweeps held the head steadier than short passes (P box #4, 2026-11-25).
+- **Feathered joins:** neighbouring sweeps overlap by 6 positions (`--feather 6`, 0.51 mm). In that band the dots are
+  shared out in cells of one position by two column pairs (so each nozzle still fires at least two columns running):
+  each cell goes to one sweep or the other by a fixed random value, fixed on the plate, against a ramp across the
+  band, so the share passes smoothly from one sweep to the next and every dot prints exactly once. Sweeps side by
+  side left a thin line at every join; feathered, no seam was left (polydye_picture3 and 4, 2026-11-25).
 - **Gentle moves while the ink prints:** `POLYDYE_INK_MOTION ACCEL=1000 SCV=1` before the passes (acceleration and
   square corner velocity at most that), `POLYDYE_INK_MOTION RESTORE=1` after them puts the print's limits back
   (`--ink-accel`, `--ink-scv`; 0: the print's own).
@@ -375,9 +379,9 @@ ink, one object at a time.
 **Options** (all optional): `--ink-limit` %, `--wall-coats`, `--top-coats`, `--gap` mm, `--dry` s (5: the ink dries
 before the next layer), `--retract` mm (1.5), `--travel` mm/s (150), `--edge-margin` mm (0.5), `--inset` mm (0.05: the ink stops that far
 inside the model's surface, so none lands on a base or brim below it), `--positions` (28-82: two groups of positions
-on each fire line, with room for the colour registration), `--overlap` (1), `--ink-accel` mm/s² (1000), `--ink-scv`
-mm/s (1), `--one-direction`, `--prewarm` s (6; 0: none), `--prime-idle` s
-(90; 0: never), `--dpi`, `--nozzle-dpi`, `--pass-speed` (polydye.cfg's), and `--accel`, `--scv`, `--max-velocity` for
+on each fire line, with room for the colour registration), `--feather` (6; 0: side by side), `--ink-accel` mm/s²
+(1000), `--ink-scv` mm/s (1), `--one-direction`, `--prewarm` s (6; 0: none), `--prime-idle` s (90; 0: never),
+`--dpi`, `--nozzle-dpi`, `--pass-speed` (polydye.cfg's), and `--accel`, `--scv`, `--max-velocity` for
 the timing (default: the profile's). `--dry-run` runs the passes with live ink off, and without bursts or primes.
 
 It refuses G-code it can't ink safely, leaving the file unchanged: a prime tower, a Change filament G-code, differing
