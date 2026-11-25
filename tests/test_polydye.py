@@ -1057,6 +1057,28 @@ class AutoWarm(unittest.TestCase):
         self.assertEqual((moves[0], moves[-1], runs), ("SAVE_GCODE_STATE NAME=polydye_warm",
                                                        "RESTORE_GCODE_STATE NAME=polydye_warm", []))
 
+    def test_a_refused_move_back_still_puts_the_gcode_state_back(self):
+        pd, board, runs, moves = self.make()
+        board.live, pd.warm_position = True, 'sponge'
+        lookup = pd.printer.lookup_object
+        gcode = types.SimpleNamespace(run_script_from_command=lambda script: (
+            moves.append(script),
+            script.startswith("G1 X10.000") and (_ for _ in ()).throw(RuntimeError("Move out of range"))))
+        pd.printer.lookup_object = lambda name, default=None: gcode if name == 'gcode' else lookup(name, default)
+        with self.assertRaisesRegex(RuntimeError, "Move out of range"):
+            self.warm(pd)
+        self.assertEqual(moves[-1], "RESTORE_GCODE_STATE NAME=polydye_warm")
+
+    def test_a_pass_warm_up_longer_than_the_board_takes_is_refused_before_anything_moves(self):
+        pd, board, runs, moves = self.make()
+        pd.warm_max_s, pd.warm_duty_ppm = 10., None  # older board firmware: warm-ups of at most 10 s
+        pd.query_pass_cmd = types.SimpleNamespace(send=lambda args: {'present': 1, 'columns': 600, 'cart': 0})
+        with self.assertRaisesRegex(RuntimeError, "POLYDYE_PASS: a warm-up lasts at most 10 s with this board firmware; "
+                                                  "newer firmware takes up to 30 s"):
+            pd.cmd_POLYDYE_PASS(TestCleanup.gcmd(self, LAYER=0, PASS=0, X=100., Y=40., WARM=20., WARM_PULSE=2,
+                                                 WARM_PERIOD_US=508))
+        self.assertEqual((runs, moves, self.travel), ([], [], []))
+
     def test_off_switches(self):
         pd, board, runs, moves = self.make()
         board.live = True

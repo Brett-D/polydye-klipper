@@ -959,6 +959,10 @@ class PolyDye:
             if self.spit_run_cmd is None:
                 raise gcmd.error("POLYDYE_PASS: WARM needs newer PolyDye board firmware; update it from the PolyDye "
                                  "page (Board firmware: Update to bundled firmware)")
+            if warm > self.warm_max_s + 1e-9:
+                raise gcmd.error("POLYDYE_PASS: a warm-up lasts at most %g s with this board firmware%s"
+                                 % (self.warm_max_s, "; newer firmware takes up to %g s (Board firmware: Update to "
+                                    "bundled firmware)" % (WARM_MAX_S,) if self.warm_duty_ppm is None else ""))
             self._warm_plan(gcmd, "POLYDYE_PASS", warm, warm_words, warm_period)
 
         toolhead = self.printer.lookup_object('toolhead')
@@ -1165,9 +1169,12 @@ class PolyDye:
             gcmd.respond_info("PolyDye: the board may still be firing, so the cartridge stays over the warm-up spot")
         if back is not None:
             run = self.printer.lookup_object('gcode').run_script_from_command
-            if idle:
-                run("G1 X%.3f Y%.3f F%d\nG1 Z%.3f F900" % (back[0], back[1], self.travel_speed * 60, back[2]))
-            run("RESTORE_GCODE_STATE NAME=polydye_warm")
+            try:
+                if idle:
+                    run("G1 X%.3f Y%.3f F%d\nG1 Z%.3f F900" % (back[0], back[1], self.travel_speed * 60, back[2]))
+            finally:
+                if not self.printer.is_shutdown():
+                    run("RESTORE_GCODE_STATE NAME=polydye_warm")
         return idle
 
     cmd_POLYDYE_ENABLE_help = "Turn on the PolyDye boost (LIVE=1 also allows real ink; LIVE=0 is a dry run)"
