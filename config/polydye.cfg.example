@@ -33,8 +33,10 @@ offset_y: -8.7
 #pass_speed: 59.5
 #travel_speed: 150
 #extra_run_up: 1.0
-# Automatic head warm-up before a live pass when the head hasn't fired since Klipper started or not for warm_idle_time
-# s: every nozzle at warm_pulse words every warm_period_us for warm_seconds (0 turns it off). 1 word (0.35 us) puts no
+# Automatic head warm-up before a live pass when the head hasn't fired (or been warmed by a POLYDYE_PREWARM burst) since
+# Klipper started or not for warm_idle_time s (it's too cold to eject again in under 30 s): every nozzle at warm_pulse
+# words every warm_period_us for warm_seconds (0 turns it off). POLYDYE_PREWARM's bursts use warm_period_us too, with a
+# 1-word pulse whatever warm_pulse says. 1 word (0.35 us) puts no
 # ink down even on a hot head (0.70 us left a dot). No ink may land on the glass bed, so warm_position is sponge (the
 # wipe sponge at POLYDYE_WIPE's X, the default), X, Y (a bed spot for the cartridge over printed plastic, e.g. a prime
 # pad) or pass (warm_clearance mm behind the pass's run-up start: only with printed plastic there); never over the
@@ -42,7 +44,7 @@ offset_y: -8.7
 #warm_seconds: 10
 #warm_pulse: 1
 #warm_period_us: 254
-#warm_idle_time: 60
+#warm_idle_time: 5
 #warm_position: sponge
 #warm_clearance: 10
 # Seconds of stock-pattern spit at the warm spot right after a warm-up (0: none), for testing. Real ink: at the sponge

@@ -251,7 +251,7 @@ offset_y: -8.7
 #warm_seconds: 10     # s of automatic head warm-up before a live pass on a cold head; 0 turns it off
 #warm_pulse: 1        # its pulse in bus words (1 = 0.35 us: no ink even on a hot head; up to 8 = 2.80 us)
 #warm_period_us: 254  # one all-nozzle warm-up column every this many us (at most 0.58 % heater duty)
-#warm_idle_time: 60   # s without firing after which the head counts as cold again
+#warm_idle_time: 5    # s without firing (or a prewarm burst) after which the head counts as cold again
 #warm_position: sponge # where warm-ups run: sponge (POLYDYE_WIPE's X), X, Y over printed plastic, or pass
 #warm_clearance: 10   # mm behind the pass's run-up start, for warm_position: pass
 #warm_prespit: 0      # s of stock-pattern spit at the warm spot right after a warm-up (0: none; up to 5)
@@ -341,8 +341,9 @@ If anything would print a pass wrongly, Klipper stops with a readable reason, fo
 | `POLYDYE_ENABLE [LIVE=1]` | Turns the board's boost on. `LIVE=1` (default) allows real ink; `LIVE=0` is a dry run: the bus runs with the fire lines held off |
 | `POLYDYE_DISABLE` | Waits for queued moves, then turns live output and the boost off |
 | `POLYDYE_PASS LAYER= PASS= X= Y= [DIR=1] [SPEED=] [WARM=] [WARM_PULSE=] [WARM_PERIOD_US=] [PRESPIT=]` | Prints one pass (above), after an automatic head warm-up off the print if live ink is on and the head is cold; `WARM` asks for one (seconds), `WARM=0` for none, `PRESPIT` adds a stock-pattern pre-spit after it (see "Automatic head warm-up") |
+| `POLYDYE_PREWARM [SECONDS=10]` | Warms the head in the background while the moves after it run, so it's hot for the next pass (see "Prewarm bursts"): `SECONDS` (default `warm_seconds`) of every nozzle at 1 word (0.35 µs, which doesn't eject) every `warm_period_us`, from where the moves before it end, without stopping them. Turns live ink on. A pass never waits for it: one that comes first cuts it short, and needs no warm-up of its own. At most 16.6 s at 254 µs. Needs this add-on's bundled board firmware |
 | `POLYDYE_CANCEL` | Drops passes that are scheduled but not started (for a cancel macro). The add-on does this itself, and turns live ink off, within 2 s of a print being cancelled or stopping with an error: the print's own `POLYDYE_ENABLE LIVE=0` never runs then (`CANCEL_PRINT` waits for the command running, such as a pass's warm-up) |
-| `POLYDYE_STATUS` | Board status: boost, live, passes printed and queued, worst column lateness, faults, stored passes, cartridge template, fire pulse; and the offsets and direction trim in use |
+| `POLYDYE_STATUS` | Board status: boost, live, passes printed and queued, worst column lateness, faults, stored passes, cartridge template, fire pulse, the last prewarm burst; and the offsets and direction trim in use |
 | `POLYDYE_NUDGE [X=] [Y=] [TRIM=]` | Moves where the ink lands by `X`, `Y` mm on the bed, and the ink of reverse passes by `TRIM` mm along the pass axis (each at most ±5 mm), from the next pass on. Changes `offset_x`/`offset_y` (in the opposite direction: the offset is where the cartridge is) and `direction_trim` until the next restart |
 | `POLYDYE_OFFSET [X=] [Y=] [TRIM=] [CYAN_COLUMNS=] [CYAN_POSITIONS=] [YELLOW_COLUMNS=] [YELLOW_POSITIONS=] [X_TICK=] [Y_TICK=] [SAVE=]` | Sets `offset_x`, `offset_y`, `direction_trim` and the colour registration until the next restart; without arguments, shows them. `X_TICK`, `Y_TICK` are the offset print's readings: they move the ink by that many ticks and store the offsets in `polydye.cfg` (`SAVE=0`: don't). `SAVE=1` stores the others too |
 | `POLYDYE_SAVE` | Stores the offsets, direction trim and colour registration in use in `polydye.cfg` (next to `printer.cfg`; the colour registration once it isn't zero) |
@@ -464,10 +465,11 @@ On paper the stock pattern needs a hot head too (4 of 4 bold three-colour spits 
 ### Automatic head warm-up
 
 The cartridge prints only with a warm head: on 13c5d27 (2026-11-24) a cold head gave nothing, or cyan only, and the
-same stripe or spit right after a warm-up printed all three colours. The head cools again within minutes (4–13). So a
-live `POLYDYE_PASS` (a print's, the fire test's, an alignment print's) warms the head first when it won't have fired
-since Klipper started, or not for `warm_idle_time` seconds (60), by the time the pass can start (after the moves
-already queued). It waits for the moves and passes before it, moves to the warm spot, and the board runs
+same stripe or spit right after a warm-up printed all three colours. It warms in about 10 s and is too cold to eject
+again in under 30 s (2026-11-25: lines printed right after a 10 s warm-up, almost nothing 30 s later). So a live
+`POLYDYE_PASS` (a print's, the fire test's, an alignment print's) warms the head first when it won't have fired, or been
+warmed by a prewarm burst, since Klipper started or for `warm_idle_time` seconds (5), by the time the pass can start
+(after the moves already queued). It waits for the moves and passes before it, moves to the warm spot, and the board runs
 `warm_seconds` (10) of every nozzle at `warm_pulse` words (1: 0.35 µs) every `warm_period_us` (254) in one run; then
 the pass follows with live ink still on. A dry-run pass (`POLYDYE_ENABLE LIVE=0`) fires nothing, so it neither warms
 nor keeps the head warm; live passes (also with the warm-up off), spit tests and warm-ups count as firing.
@@ -506,7 +508,39 @@ and `WARM=0` for none.
 - `warm_seconds: 0` turns it off. It needs board firmware with the warm-up duty limit (this add-on's bundled firmware);
   with older firmware passes go ahead unwarmed, and the page says so.
 - `printer.polydye.auto_warm` has the settings (and `available`), `head_idle_s` the seconds since the head last fired
-  (none yet: null); the page's Board card shows the head.
+  or a burst warmed it (none yet: null), `prewarm` the last burst (`state`: none, queued, firing, done, made way,
+  skipped; `seconds` fired); the page's Board card shows the head.
+
+### Prewarm bursts
+
+A warm-up at the sponge stops the print for its 10 s and the trips there and back. A layer's ink can instead come with
+the head already hot: `POLYDYE_PREWARM` about 10 s of moves before the layer's first pass starts a burst, the
+automatic warm-up's recipe (every nozzle at 1 word, 0.35 µs, every `warm_period_us`: 254), while the plastic moves run
+on. It starts where the moves before it end (Klipper's lookahead, like `SET_PIN`), so the moves never stop for it, and
+the board runs it in the background:
+
+- **A pass is never delayed.** A pass due before the burst ends cuts it short (the board stops it in time); so do a
+  spit test or warm-up, live ink going off, a cancel, and the board's boost or power going off.
+- **The next pass needs no warm-up of its own** while the burst is queued or firing, or for `warm_idle_time` (5 s)
+  after it ended; otherwise (it ended too long before, or never ran) the pass warms at the sponge as usual.
+- **It fires wherever the cartridge is**, over the glass bed too, so its pulse is fixed in the board firmware at 1 word:
+  0.35 µs left no mark even on a hot head (60 s of it over paper stayed clean), 0.70 µs left a dot. The host can't ask
+  for more. It needs live ink on, and turns it on (without pausing the moves; the board waits for the boost itself).
+- If the board can't run it (live ink went off, a spit test, a firmware update, or a pass already queued over its
+  start) it's skipped, never a shutdown; `POLYDYE_STATUS` says what the last burst did.
+- A layer shorter than the burst: put `POLYDYE_PREWARM` at the layer's start; the pass cuts it short.
+
+Hand-written G-code, the burst about 10 s of moves before the ink:
+
+```
+POLYDYE_PREWARM SECONDS=10
+; ... the layer's last ~10 s of plastic ...
+POLYDYE_PASS LAYER=5 PASS=0 X=120 Y=100 DIR=1
+```
+
+**Proof test before relying on it (paper):** print lines (`POLYDYE_UPLOAD_TEST_PASS` passes) in groups with 30 s and
+60 s gaps after the previous group, each group led by a `POLYDYE_PREWARM` timed to end as it starts: every group should
+print in full, and the paper under the bursts stay clean.
 
 ### Calibration prints
 
@@ -562,7 +596,7 @@ with no gap (the board runs both in one go, so the head doesn't cool in between)
 does the warm-up alone. With 12 heaters on every fire pulse an all-nozzle column heats the head rather than spits at the
 PolyDye's 12.6 V: 21 s of every nozzle at 2.7 µs every 508 µs (the removed deskjet template, at our old clock) never
 ejected on its own, but straight after it the stock pattern gave a big blob in all three colours, where a cold head gave
-cyan only. The head cools back within 4–13 minutes.
+cyan only. It cools fast: too cold to eject again in under 30 s (2026-11-25).
 
 - `WARM_PULSE` is in bus words, up to the live limit of 2.9 µs (8 words). The default is the longest within 0.75 µs,
   far too short to boil ink, the way HP's printers warm the head: 2 words (0.70 µs). Older board firmware takes at most

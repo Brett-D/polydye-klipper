@@ -32,6 +32,10 @@ TEMPLATES = ('color_b_late', 'black_a', 'black_b')
 REMOVED_TEMPLATES = ('color_a', 'color_b', 'deskjet')
 STOCK_TEMPLATE = 'color_b_late'
 CLOCK = "polydye_clock oid=%c stock=%c nominal_hz=%u measured_hz=%u"
+# Prewarm bursts (POLYDYE_PREWARM, board firmware with POLYDYE_PREWARM_WORDS) and the last one's state.
+PREWARM = "polydye_prewarm oid=%c clock=%u columns=%hu period_us=%hu"
+PREWARM_STATE = "polydye_prewarm_state oid=%c state=%c start=%u end=%u columns=%u"
+PREWARM_STATES = ('none', 'queued', 'firing', 'done', 'made way', 'skipped')
 # The board's last column run (board firmware with polydye_query_run, also answered after a shutdown): why it stopped
 # (a shutdown reason, or "none"), columns sent, warm-up columns not sent, column times missed with no column ready
 # (underruns) or the bus still busy (overruns), and its worst lateness and slowest column preparation in clock ticks.
@@ -87,7 +91,9 @@ TEMPLATE_WORDS, BASE_PULSE_WORDS, PACKETS, IDLE_WORDS, PERIOD_MARGIN_US = 27, 6,
 # and 2 sparse (REMOVED_PATTERNS).
 SPIT_PATTERNS = {'all': 0, 'stock': 3}
 # Automatic head warm-up before a live pass ([polydye] warm_seconds, warm_pulse, warm_period_us, warm_idle_time), when
-# the head hasn't fired since Klipper started or not for a minute (it was cold again within 4 minutes): every nozzle at
+# the head hasn't fired (or been warmed by a POLYDYE_PREWARM burst) since Klipper started or not for 5 s: it warms in
+# about 10 s and is too cold to eject again in under 30 s (2026-11-25: 10 s of warm-up then 30 s idle printed almost
+# nothing; 60 s at a quarter of the rate printed worse than 10 s at the full rate right before). Every nozzle at
 # 1 word (0.35 us) every 254 us for 10 s. Brett's ladder on 48483ab (2026-11-25), each warm-up on a hot head 17 mm
 # before a cyan text pass: 0.35 us every 508 us lost the word's first 10 mm; 0.35 us every 254 us printed it complete
 # with no dot where it warmed (2 of 39,370 column times missed); 0.70 us every 508 us was complete but left a dot, and
@@ -95,7 +101,7 @@ SPIT_PATTERNS = {'all': 0, 'stock': 3}
 # bed (Brett, 2026-11-25), and the warm-up's spot (with any pre-spit) is often beyond the print: so it runs over the
 # wipe sponge at the X gantry's right end by default (warm_position: sponge); `pass` (AUTO_WARM_CLEARANCE mm behind the
 # pass's run-up start, warm_clearance) only suits a print with plastic there, such as a base under the part.
-AUTO_WARM_S, AUTO_WARM_WORDS, AUTO_WARM_PERIOD_US, AUTO_WARM_IDLE_S = 10., 1, 254, 60.
+AUTO_WARM_S, AUTO_WARM_WORDS, AUTO_WARM_PERIOD_US, AUTO_WARM_IDLE_S = 10., 1, 254, 5.
 AUTO_WARM_CLEARANCE = 10.
 # An optional pre-spit right after a pass's warm-up, at the warm spot (the sponge by default), in the same board run
 # ([polydye] warm_prespit,
@@ -373,6 +379,13 @@ def auto_warm_error(seconds, words, period_us):
     if seconds * 1e6 / period_us > WARM_MAX_COLUMNS:
         return "warm_seconds %g is too long at %d us" % (seconds, period_us)
     return None
+
+
+def warm_columns(seconds, period_us, max_s):
+    """Columns of a warm-up of `seconds` every `period_us`, rounded, but never more than the board takes: its rule is
+    columns x period_us at most its longest warm-up (POLYDYE_WARM_MAX_MS, `max_s`) in whole us. Rounding 30 s at
+    1016 us up to 29528 columns made 30.000448 s, which the board refused with a shutdown (2026-11-25)."""
+    return max(1, min(int(round(seconds * 1e6 / period_us)), int(round(max_s * 1e6)) // period_us))
 
 
 def pass_warm_settings(words, period, cfg_words, cfg_period):
@@ -1118,6 +1131,9 @@ class PolyDye:
                                    "of the cartridge over printed plastic, off the print) or pass, not %r"
                                    % (position,))
         self.last_fire = None  # print time the head last fired (a live pass, spit test or warm-up); None: not yet
+        self.prewarm_cmd = self.query_prewarm_cmd = None  # board firmware with prewarm bursts (POLYDYE_PREWARM)
+        self.prewarm_sent = None  # the last burst sent: {'start', 'end'} print times, 'seconds'; None: none yet
+        self.prewarm_state = None  # the board's account of it, as last asked (_query_prewarm())
         self.print_live = False  # a print turned live ink on and hasn't been seen to end yet (_check_print_end())
         self.live_off_pending = False  # a test's cleanup failed: live ink may be on (_check_print_end() retries)
         self.dpi = config.getfloat('dpi', 847., above=0.)
@@ -1169,6 +1185,7 @@ class PolyDye:
         gcode.register_command('POLYDYE_FIRE_TEST', self.cmd_POLYDYE_FIRE_TEST, desc=self.cmd_POLYDYE_FIRE_TEST_help)
         gcode.register_command('POLYDYE_SPIT', self.cmd_POLYDYE_SPIT, desc=self.cmd_POLYDYE_SPIT_help)
         gcode.register_command('POLYDYE_WARM', self.cmd_POLYDYE_WARM, desc=self.cmd_POLYDYE_WARM_help)
+        gcode.register_command('POLYDYE_PREWARM', self.cmd_POLYDYE_PREWARM, desc=self.cmd_POLYDYE_PREWARM_help)
         gcode.register_command('POLYDYE_CLOCK_TEST', self.cmd_POLYDYE_CLOCK_TEST,
                                desc=self.cmd_POLYDYE_CLOCK_TEST_help)
         gcode.register_command('POLYDYE_ALIGN_PRINT', self.cmd_POLYDYE_ALIGN_PRINT,
@@ -1226,6 +1243,11 @@ class PolyDye:
             fmt = "polydye_set_spit_random oid=%c density=%hu repeat=%c colors=%c first=%c last=%c per_pulse=%c"
             if self.mcu.try_lookup_command(fmt) is not None:
                 self.spit_random_cmd = self.mcu.lookup_command(fmt, cq=cq)
+        # Prewarm bursts came with POLYDYE_PREWARM_WORDS (their pulse, fixed in the board firmware at 1 word).
+        if 'POLYDYE_PREWARM_WORDS' in constants:
+            self.prewarm_cmd = self.mcu.lookup_command(PREWARM, cq=cq)
+            self.query_prewarm_cmd = self.mcu.lookup_query_command("polydye_query_prewarm oid=%c", PREWARM_STATE,
+                                                                   oid=self.oid, cq=cq)
         # color_b_late and the stock bus clock came with the stock-firmware comparison.
         if self.mcu.try_lookup_command("polydye_query_clock oid=%c") is not None:
             self.set_clock_cmd = self.mcu.lookup_command("polydye_set_clock oid=%c stock=%c", cq=cq)
@@ -1383,6 +1405,8 @@ class PolyDye:
                              'remaining': lv['remaining']}
             if self.query_clock_cmd is not None:
                 clock = self.query_clock_cmd.send([self.oid])
+            if self.query_prewarm_cmd is not None and self.prewarm_sent is not None:
+                self._query_prewarm()
         finally:
             self.querying = False
         flags = params['flags']
@@ -1540,12 +1564,80 @@ class PolyDye:
             return True
         now = max(self.printer.lookup_object('toolhead').get_last_move_time(),
                   self.mcu.estimated_print_time(self.printer.get_reactor().monotonic()))
-        if head_cold(self.last_fire, now, self.warm_idle_time):
-            why = ("the head hasn't fired since Klipper started" if self.last_fire is None else
-                   "the head won't have fired for %.0f s when the pass starts" % (now - self.last_fire,))
+        warmed = self._warmed_until(now)
+        if head_cold(warmed, now, self.warm_idle_time):
+            why = ("the head hasn't fired since Klipper started" if warmed is None else
+                   "the head won't have fired for %.0f s when the pass starts" % (now - warmed,))
             self._warm_head(gcmd, cmd, why, self.warm_seconds, self.warm_pulse, self.warm_period_us, start, direction,
                             prespit)
         return True
+
+    def _warmed_until(self, now):
+        """The print time the head last fired or was warmed until: the last fire, or the end of the last prewarm burst
+        if later. A burst still queued or firing warms until `now`, when the pass cuts it short; one skipped doesn't
+        count."""
+        last = self.last_fire
+        if self.prewarm_sent is None or self.query_prewarm_cmd is None:
+            return last
+        st = self._query_prewarm()
+        if st['state'] in ('queued', 'firing'):
+            end = now
+        elif st['state'] in ('done', 'made way') and st['columns']:
+            end = st['end']
+        else:
+            return last
+        return end if last is None else max(last, end)
+
+    def _warmed_cached(self, now):
+        """_warmed_until() from the board's last answer, without asking it again (for get_status())."""
+        st = self.prewarm_state
+        if st is None or st['state'] not in ('queued', 'firing', 'done', 'made way'):
+            return self.last_fire
+        if st['state'] in ('done', 'made way') and not st['columns']:
+            return self.last_fire
+        end = now if st['state'] in ('queued', 'firing') else st['end']
+        return end if self.last_fire is None else max(self.last_fire, end)
+
+    def _query_prewarm(self):
+        """The board's account of the last prewarm burst: state, its start and end as print times, columns fired."""
+        params = self.query_prewarm_cmd.send([self.oid])
+        n = params['state']
+        to_time = lambda clock: self.mcu.clock_to_print_time(self.mcu.clock32_to_clock64(clock))
+        self.prewarm_state = {'state': PREWARM_STATES[n] if n < len(PREWARM_STATES) else str(n),
+                              'start': to_time(params['start']), 'end': to_time(params['end']),
+                              'columns': params['columns']}
+        return self.prewarm_state
+
+    cmd_POLYDYE_PREWARM_help = ("Warm the head in the background during the moves that follow, so it's hot for the "
+                                "next pass: SECONDS (warm_seconds, 10) of every nozzle at 1 word (0.35 us, which doesn't "
+                                "eject) every warm_period_us, from where the moves before it end; turns live ink on. "
+                                "Passes never wait for it: one that comes first cuts it short, and needs no warm-up")
+
+    def cmd_POLYDYE_PREWARM(self, gcmd):
+        cmd = "POLYDYE_PREWARM"
+        if self.prewarm_cmd is None:
+            raise gcmd.error("%s: needs newer PolyDye board firmware; update it from the PolyDye page (Board firmware: "
+                             "Update to bundled firmware)" % (cmd,))
+        seconds = gcmd.get_float('SECONDS', self.warm_seconds or AUTO_WARM_S, above=0., maxval=self.warm_max_s)
+        period = self.warm_period_us
+        columns = warm_columns(seconds, period, self.warm_max_s)
+        if columns > WARM_MAX_COLUMNS:
+            raise gcmd.error("%s: SECONDS=%g is too long: a burst is at most %d columns, %.1f s at warm_period_us %d"
+                             % (cmd, seconds, WARM_MAX_COLUMNS, WARM_MAX_COLUMNS * period / 1e6, period))
+        # Live ink on, without POLYDYE_ENABLE's pause for the boost to settle: the moves go on, and the board starts
+        # the burst only once the boost has settled.
+        self._enable(gcmd, cmd, True, settle=False)
+        self.printer.lookup_object('toolhead').register_lookahead_callback(
+            lambda print_time: self._send_prewarm(print_time, columns, period))
+
+    def _send_prewarm(self, print_time, columns, period):
+        """Schedules a burst to start at `print_time` (the moves before POLYDYE_PREWARM done)."""
+        clock = self.mcu.print_time_to_clock(print_time)
+        self.prewarm_cmd.send([self.oid, clock & 0xffffffff, columns, period], reqclock=clock)
+        self.prewarm_sent = {'start': print_time, 'end': print_time + columns * period / 1e6,
+                             'seconds': columns * period / 1e6}
+        logging.info("polydye: prewarm burst at print_time %.3f: %d columns every %d us (%.1f s)", print_time,
+                     columns, period, columns * period / 1e6)
 
     def _warm_head(self, gcmd, cmd, why, seconds, words, period, start, direction, prespit=0.):
         """A warm-up right before a pass: once the moves and passes before it are done, `seconds` of every nozzle at
@@ -1706,6 +1798,12 @@ class PolyDye:
 
     def cmd_POLYDYE_ENABLE(self, gcmd):
         live = gcmd.get_int('LIVE', 1, minval=0, maxval=1)
+        self._enable(gcmd, "POLYDYE_ENABLE", live)
+        gcmd.respond_info("PolyDye boost on, %s" % ("live ink" if live else "dry run (no firing)",))
+
+    def _enable(self, gcmd, cmd, live, settle=True):
+        """Boost on, live ink on or off. With `settle`, the moves after it wait for the boost to settle if it was
+        off."""
         printing = self._printing(self.printer.get_reactor().monotonic())
         # A print that turned live ink on has ended, or a test's cleanup failed, but the status poll hasn't turned live
         # ink off yet: do it now, so it can't come later and turn off what's enabled here (a fire test, say).
@@ -1713,13 +1811,13 @@ class PolyDye:
         boost_was_on = True
         if live:
             st = self._fresh_status()
-            self._check_current_pulse(gcmd, "POLYDYE_ENABLE", st)
+            self._check_current_pulse(gcmd, cmd, st)
             boost_was_on = st['boost']
         self.mode_cmd.send([self.oid, 1, live])
         # Live ink turned on by a print: turned off again however the print ends (_check_print_end()). Turned off, or
         # on outside a print: not the print's.
         self.print_live = bool(live and printing)
-        if not boost_was_on:
+        if not boost_was_on and settle:
             # The rails need a moment after the boost turns on, and the board refuses live ink that comes sooner:
             # keep the next moves (and so the next pass) far enough out.
             toolhead = self.printer.lookup_object('toolhead')
@@ -1727,7 +1825,6 @@ class PolyDye:
             wait = ready - toolhead.get_last_move_time()
             if wait > 0.:
                 toolhead.dwell(wait)
-        gcmd.respond_info("PolyDye boost on, %s" % ("live ink" if live else "dry run (no firing)",))
 
     cmd_POLYDYE_DISABLE_help = "Wait for queued moves, then turn off PolyDye live output and the boost"
 
@@ -1753,12 +1850,27 @@ class PolyDye:
         level = st.get('level')
         gcmd.respond_info(
             "PolyDye: boost=%d live=%d running=%d queued=%d passes=%d late_max=%.1fus faults=%d"
-            " stored_passes=%d store_free=%dkB\n%s\npass_axis=%s %s dpi=%.0f pass_speed=%.1f%s"
+            " stored_passes=%d store_free=%dkB\n%s\n%s\npass_axis=%s %s dpi=%.0f pass_speed=%.1f%s"
             % (st['boost'], st['live'], st['running'], st['queued'], st['passes'], st['late_max_us'],
-               st['faults'], st['store_count'], st['store_free'] // 1024, cartridge_text(st), self.pass_axis,
-               self._offsets_text(), self.dpi, self.pass_speed,
+               st['faults'], st['store_count'], st['store_free'] // 1024, cartridge_text(st), self._prewarm_text(),
+               self.pass_axis, self._offsets_text(), self.dpi, self.pass_speed,
                "\nsignal check: %s held %s, %d s left" % (level['line'], level['state'], level['remaining'])
                if level else ""))
+
+    def _prewarm_text(self):
+        """The last prewarm burst, for POLYDYE_STATUS."""
+        if self.prewarm_cmd is None:
+            return "prewarm bursts: need newer board firmware"
+        if self.prewarm_sent is None:
+            return "prewarm burst: none since Klipper started"
+        st = self._query_prewarm()
+        now = self.mcu.estimated_print_time(self.printer.get_reactor().monotonic())
+        fired = st['columns'] * self.warm_period_us / 1e6
+        if st['state'] in ('queued', 'firing'):
+            return "prewarm burst: %s (%.1f s asked for)" % (st['state'], self.prewarm_sent['seconds'])
+        if st['state'] == 'skipped':
+            return "prewarm burst: skipped (live ink off, a spit test, or a pass already there)"
+        return "prewarm burst: %s after %.1f s, %.0f s ago" % (st['state'], fired, max(0., now - st['end']))
 
     def _offsets_text(self):
         return "offset_x=%.3f offset_y=%.3f direction_trim=%.3f %s" % (
@@ -2748,7 +2860,7 @@ class PolyDye:
             raise gcmd.error("%s: WARM_PERIOD_US=%d is too short for a %.2f us warm-up pulse: a warm-up's heater duty is "
                              "at most %.2f %%, so its period must be at least %d us"
                              % (cmd, period, us, self.warm_duty_ppm / 1e4, duty_min))
-        columns = max(1, int(round(warm * 1e6 / period)))
+        columns = warm_columns(warm, period, self.warm_max_s)
         if columns > WARM_MAX_COLUMNS:
             raise gcmd.error("%s: at a %d us warm-up period the warm-up lasts at most %.2f s (%d columns)"
                              % (cmd, period, WARM_MAX_COLUMNS * period / 1e6, WARM_MAX_COLUMNS))
@@ -2769,6 +2881,19 @@ class PolyDye:
             self.live_off_pending = True
             logging.exception("polydye: test cleanup failed; live ink goes off at the next status poll")
 
+    def _head_idle_s(self, eventtime):
+        """Seconds since the head last fired or a prewarm burst warmed it, as last known; None: not since Klipper
+        started."""
+        now = self.mcu.estimated_print_time(eventtime)
+        warmed = self._warmed_cached(now)
+        return None if warmed is None else round(max(0., now - warmed), 1)
+
+    def _prewarm_status(self):
+        st = self.prewarm_state
+        return {'available': self.prewarm_cmd is not None,
+                'state': 'none' if st is None else st['state'],
+                'seconds': None if st is None else round(st['columns'] * self.warm_period_us / 1e6, 1)}
+
     def get_status(self, eventtime):
         status = dict(self.last_status, last_pass=self.last_pass, pass_axis=self.pass_axis, offset_x=self.offset_x,
                     offset_y=self.offset_y, direction_trim=self.direction_trim, spit_patterns=list(self.spit_patterns),
@@ -2781,8 +2906,8 @@ class PolyDye:
                                'position': self.warm_position if isinstance(self.warm_position, str)
                                else list(self.warm_position), 'clearance': self.warm_clearance,
                                'prespit': self.warm_prespit},
-                    head_idle_s=None if self.last_fire is None else
-                    round(max(0., self.mcu.estimated_print_time(eventtime) - self.last_fire), 1),
+                    head_idle_s=self._head_idle_s(eventtime),
+                    prewarm=self._prewarm_status(),
                     nozzle_dpi=self.nozzle_dpi, cfg_saves=self.cfg_saves)
         status.update(zip(REG_KEYS, self.registration))
         return status
