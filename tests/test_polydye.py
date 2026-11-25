@@ -483,6 +483,31 @@ class TestCleanup(unittest.TestCase):
         self.assertEqual((board.gap, board.live, pd.restore_pending, board.violations), (0, False, None, []))
         self.assertEqual(said[-1], "PolyDye: the cartridge settings are back as before the last test")
 
+    def test_a_second_failed_cleanup_keeps_the_first_ones_settings(self):
+        pd, board = self.make(fail_on="NOTHING")
+        pd.mode_cmd = types.SimpleNamespace(send=lambda args: (_ for _ in ()).throw(RuntimeError("timeout")))
+        with self.assertLogs(level='ERROR'):
+            pd._restore_after_test(('color_b_late', 6, 0))
+            pd._restore_after_test(('color_b_late', 7))
+        self.assertEqual(pd.restore_pending, ('color_b_late', 6, 0))
+
+    def test_a_test_puts_a_failed_cleanups_settings_back_first_or_refuses(self):
+        pd, board = self.make(fail_on="NOTHING")
+        self.with_gap(pd, board, 20)
+        pd.restore_pending, board.live = ('color_b_late', 6, 0), True
+        pd._fresh_status = lambda: setattr(pd, 'last_status', board.status()) or pd.last_status
+        pd.printer.lookup_object('gcode').respond_info = lambda msg: None
+        for run in (lambda: self.spit(pd, board, SECONDS=1., PATTERN='all'),
+                    lambda: pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(**self.FIRE)),
+                    lambda: pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(PULSE=7))):
+            with self.assertRaisesRegex(RuntimeError, "the last test couldn't put the cartridge settings back yet"):
+                run()
+        self.assertEqual((board.gap, board.pulse, board.sent), (20, 6, []))
+        # Idle with live ink off: put back first, then the command's own change.
+        board.live = False
+        pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(PULSE=7))
+        self.assertEqual((board.gap, board.pulse, pd.restore_pending), (0, 7, None))
+
     def test_cartridge_sets_the_fire_gap(self):
         pd, board = self.make(fail_on="NOTHING")
         self.with_gap(pd, board)
@@ -2658,6 +2683,7 @@ class CalibrationPrints(unittest.TestCase):
                 (lambda pd, board: setattr(pd, 'pass_speed', 75.), dict(GAPS="16.8"),
                  "more than the 400 us pass column period"),
                 (lambda pd, board: setattr(pd, 'pass_axis', 'x'), {}, "needs pass_axis: y"),
+                (lambda pd, board: setattr(pd, 'job', {}), {}, "an ink job is loaded"),
                 (lambda pd, board: setattr(board, 'template', 'black_a'), {}, "for the colour cartridge"),
                 (None, dict(Y=222.), r"would take the toolhead to X=1\d\d.\d Y=2\d\d.\d, beyond the axis")):
             pd, board = self.make()

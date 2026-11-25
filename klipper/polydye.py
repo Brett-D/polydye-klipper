@@ -2116,6 +2116,19 @@ class PolyDye:
         logging.info("polydye: %s", msg)
         self.printer.lookup_object('gcode').respond_info(msg)
 
+    def _finish_restore(self, gcmd, cmd):
+        """Before a command that takes the board's settings as they are (a test that puts them back afterwards, an ink
+        job, a settings change): puts back what a failed test cleanup left (restore_pending) now, live ink off first,
+        or refuses while the board isn't idle."""
+        if self.restore_pending is None:
+            return
+        self._check_print_end(self.printer.get_reactor().monotonic())
+        self._fresh_status()
+        self._retry_restore()
+        if self.restore_pending is not None:
+            raise gcmd.error("%s: the last test couldn't put the cartridge settings back yet (the board isn't idle "
+                             "with live ink off); try again in a moment" % (cmd,))
+
     def _printing(self, eventtime):
         """Whether a print is running or paused (virtual_sdcard, print_stats)."""
         sdcard = self.printer.lookup_object('virtual_sdcard', None)
@@ -3003,6 +3016,7 @@ class PolyDye:
         if missing:
             raise gcmd.error("%s: home %s first (G28)" % (cmd, "".join(missing).upper()))
         toolhead.wait_moves()
+        self._finish_restore(gcmd, cmd)
         st = self._fresh_status()
         if st['running'] or st['queued']:
             raise gcmd.error("%s: wait for queued passes to finish" % (cmd,))
@@ -3306,6 +3320,9 @@ class PolyDye:
         if self.set_fire_gap_cmd is None:
             raise gcmd.error("%s: needs PolyDye board firmware with the fire gap; update it from the PolyDye page "
                              "(Board firmware: Update to bundled firmware)" % (cmd,))
+        if self.job is not None:
+            raise gcmd.error("%s: an ink job is loaded, its passes capped for the fire gap it was loaded with; run the "
+                             "test once it has ended (POLYDYE_JOB_END)" % (cmd,))
         text = gcmd.get('GAPS', ",".join("%g" % (g,) for g in GAP_TEST_US))
         try:
             gaps = [fire_gap_words(float(v)) for v in text.split(',')]
@@ -3495,12 +3512,7 @@ class PolyDye:
         self._check_job(gcmd, cmd, header, records)
         # A test's settings not put back yet: now, if the board is idle with live ink off. The job's heater cap follows
         # the fire gap.
-        if self.restore_pending is not None:
-            self._fresh_status()
-            self._retry_restore()
-            if self.restore_pending is not None:
-                raise gcmd.error("%s: the last test couldn't put the cartridge settings back yet (the board isn't "
-                                 "idle with live ink off); try again in a moment" % (cmd,))
+        self._finish_restore(gcmd, cmd)
         # The G-code's bursts and primes: refused now rather than in the middle of the print.
         if header['prewarms'] and self.prewarm_cmd is None:
             raise gcmd.error("%s: the job's prewarm bursts (POLYDYE_PREWARM) need newer PolyDye board firmware; update "
@@ -3775,6 +3787,7 @@ class PolyDye:
         if name is not None or pulse is not None or gap is not None:
             # The board refuses a change while powered or busy by shutting down; check first for a plain error.
             self.printer.lookup_object('toolhead').wait_moves()
+            self._finish_restore(gcmd, cmd)  # then this change, not the other way round
             st = self._fresh_status()
             self._check_board_clock(gcmd, cmd, st)
             change = (name is not None and name != st['cartridge_template']) or (
@@ -4017,6 +4030,7 @@ class PolyDye:
         self._check_not_printing(gcmd, cmd)
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.wait_moves()
+        self._finish_restore(gcmd, cmd)
         st = self._fresh_status()
         if st['running'] or st['queued']:
             raise gcmd.error("%s: wait for queued passes to finish" % (cmd,))
@@ -4166,6 +4180,7 @@ class PolyDye:
         self._check_not_printing(gcmd, cmd)
         reactor = self.printer.get_reactor()
         self.printer.lookup_object('toolhead').wait_moves()
+        self._finish_restore(gcmd, cmd)
         st = self._fresh_status()
         if st['running'] or st['queued']:
             raise gcmd.error("%s: wait for queued passes to finish" % (cmd,))
@@ -4328,7 +4343,8 @@ class PolyDye:
             # Live ink may still be on: the status poll keeps trying to turn it off (_check_print_end()), then puts
             # the settings back (_retry_restore()).
             self.live_off_pending = True
-            self.restore_pending = before
+            if self.restore_pending is None:  # an earlier failure's are the settings from before any test
+                self.restore_pending = before
             logging.exception("polydye: test cleanup failed; live ink goes off at the next status poll")
 
     def _head_idle_s(self, eventtime):
