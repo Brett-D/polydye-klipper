@@ -327,10 +327,12 @@ after the layer's last extrusion, `--gap` mm (1) above it, so the next layer sea
    post-processor refuses differing ones). **A filament's colour is the ink**: white (`#FFFFFF`) prints none; any other
    colour becomes cyan, magenta and yellow (`1 − R`, `1 − G`, `1 − B`).
 4. Process: **Prime tower off**; **Arc fitting off** (Quality > Precision); Print sequence **By layer**; no spiral vase;
-   Multimaterial > *Maximum width of a segmented region* **2.5 mm**, so painted colours are a shell that deep: through
-   translucent PLA a deeper shell reads stronger (on the first full-colour box, 2–2.5 mm deep walls came out solid and
-   crisp, 1.6 mm streaky, 1.2 mm light and streaked; 2.5 mm at 100 % bonded fine). A **brim** is recommended: ink is
-   only put where a drop that lands up to `--edge-margin` (0.5 mm) off still lands on plastic, so without one the
+   Multimaterial > *Maximum width of a segmented region* **2.5 mm**, so painted colours are a shell that deep (2.5 mm
+   at 100 % bonded fine); `--depth` then keeps the ink to the part of it near the surface (see below). How deep the ink
+   should go is being measured: on the first full-colour box (natural PLA) 2–2.5 mm deep walls looked stronger than
+   1.2–1.6 mm, but on the first 3D wall, also natural PLA, ink 0.05–2.3 mm in from the face read blurred and darker
+   (orange came out red: yellow and magenta stacked through 2.3 mm of clear plastic). A **brim** is recommended: ink
+   is only put where a drop that lands up to `--edge-margin` (0.5 mm) off still lands on plastic, so without one the
    first layers' colours stop short of the model's edge.
 5. Others > Post-processing Scripts: `"C:\path\to\python.exe" "C:\path\to\polydye_post.py";` (add options before
    the `;`, e.g. `--prime-idle 60`).
@@ -342,6 +344,13 @@ another way.
 
 **What the post-processor does:** the tool changes go; per layer, where each coloured filament's lines are becomes
 ink, one object at a time.
+- **Ink near the surface** (`--depth`, mm; 0, the default: off): a dot is inked only where it lies at most that
+  far under the model's surface: beside it, or under a top face or over a bottom face, so the colour sits at the
+  surface however deep Orca's coloured shell goes. The depth is measured from the dot's cell, half-way up its layer,
+  to the nearest place outside the object, in its own layer or the ones above and below. Each layer counts as solid
+  where its lines are, with the gaps in its sparse infill filled in, but holes in the model (enclosed by walls alone)
+  are surfaces too. A wall's ink then all lies within `--depth` of its face, so it needs plastic beyond the face (a
+  brim, or the base it stands on): otherwise `--edge-margin` keeps the outer 0.5 mm clear and the wall gets none.
 - **Long sweeps:** each object's ink in a layer is printed as sweeps along Y over its whole footprint, every colour in
   each, about 4.2 mm apart (55 nozzle positions, 28–82), in alternating directions, each trimmed to its first and
   last ink. The sweep grid shifts every layer (by multiples of the golden ratio over the spare width), so the seams
@@ -383,7 +392,8 @@ ink, one object at a time.
 
 **Options** (all optional): `--ink-limit` %, `--wall-coats`, `--top-coats`, `--gap` mm, `--dry` s (5: the ink dries
 before the next layer), `--retract` mm (1.5), `--travel` mm/s (150), `--edge-margin` mm (0.5), `--inset` mm (0.05: the ink stops that far
-inside the model's surface, so none lands on a base or brim below it), `--positions` (28-82: two groups of positions
+inside the model's surface, so none lands on a base or brim below it; 0: right to it), `--depth` mm (0: off; see
+above), `--positions` (28-82: two groups of positions
 on each fire line, with room for the colour registration), `--feather` (6; 0: side by side), `--ink-accel` mm/s²
 (1000), `--ink-scv` mm/s (1), `--one-direction`, `--prewarm` s (6; 0: none), `--prime-idle` s (90; 0: never),
 `--dpi`, `--nozzle-dpi`, `--pass-speed` (polydye.cfg's), and `--accel`, `--scv`, `--max-velocity` for
