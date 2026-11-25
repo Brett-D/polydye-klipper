@@ -2107,8 +2107,9 @@ class PolyDye:
         """Puts back the cartridge settings a test's cleanup couldn't (restore_pending), once the board is seen idle
         with live ink off (the last status), and says so."""
         st = self.last_status
-        if (not st or self.live_off_pending or st.get('live') or st.get('running') or st.get('queued')
-                or (st.get('boost') and self.boost_idle_s is None)):
+        # Nothing left: the status poll may have finished it while a command waited for its query.
+        if (self.restore_pending is None or not st or self.live_off_pending or st.get('live') or st.get('running')
+                or st.get('queued') or (st.get('boost') and self.boost_idle_s is None)):
             return
         self._send_cartridge(st, *self.restore_pending)
         self.restore_pending = None
@@ -4343,8 +4344,11 @@ class PolyDye:
             # Live ink may still be on: the status poll keeps trying to turn it off (_check_print_end()), then puts
             # the settings back (_retry_restore()).
             self.live_off_pending = True
-            if self.restore_pending is None:  # an earlier failure's are the settings from before any test
-                self.restore_pending = before
+            # An earlier failure's settings are the ones from before any test (a nested test's own "before" is what
+            # was left); this one fills in only what that didn't have (a spit inside the fire gap test: the gap).
+            old = list(self.restore_pending or ())
+            self.restore_pending = tuple([old[i] if i < len(old) and old[i] is not None else v
+                                          for i, v in enumerate(before)] + old[len(before):])
             logging.exception("polydye: test cleanup failed; live ink goes off at the next status poll")
 
     def _head_idle_s(self, eventtime):

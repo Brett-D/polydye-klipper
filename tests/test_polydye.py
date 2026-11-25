@@ -490,6 +490,16 @@ class TestCleanup(unittest.TestCase):
             pd._restore_after_test(('color_b_late', 6, 0))
             pd._restore_after_test(('color_b_late', 7))
         self.assertEqual(pd.restore_pending, ('color_b_late', 6, 0))
+        # A spit inside the fire gap test fails first, without the gap; the test's own cleanup adds it.
+        pd.restore_pending = None
+        with self.assertLogs(level='ERROR'):
+            pd._restore_after_test(('color_b_late', 7))
+            pd._restore_after_test(('black_b', 6, 20))
+        self.assertEqual(pd.restore_pending, ('color_b_late', 7, 20))
+        # Put back by the status poll while a command waited for its query: the command's retry does nothing.
+        pd.restore_pending, pd.live_off_pending, pd.last_status = None, False, board.status()
+        pd._retry_restore()
+        self.assertEqual(board.sent, [])
 
     def test_a_test_puts_a_failed_cleanups_settings_back_first_or_refuses(self):
         pd, board = self.make(fail_on="NOTHING")
