@@ -21,7 +21,7 @@ import polydye  # noqa: E402
 def bare_polydye():
     """A PolyDye without its __init__ (no Klipper), with the state every command needs."""
     pd = object.__new__(polydye.PolyDye)
-    pd.prewarm_cmd = pd.query_prewarm_cmd = pd.prewarm_sent = pd.prewarm_state = None
+    pd.prewarm_cmd = pd.query_prewarm_cmd = pd.prewarm_sent = pd.prewarm_state = pd.boost_ready = None
     return pd
 
 
@@ -1310,6 +1310,16 @@ class Prewarm(unittest.TestCase):
         pd.cmd_POLYDYE_PREWARM(self.gcmd(SECONDS=3.))
         self.callbacks[1](500.)  # the clock wraps at 32 bits
         self.assertEqual(self.sent[-1], ([0, 5000000000 & 0xffffffff, 11811, 254], 5000000000))
+        # The boost was off: the moves went on, but the next pass waits for it to settle (0.15 s after it came on).
+        self.assertEqual(pd.boost_ready, 100.15)
+        dwells = []
+        self.objects['toolhead'].dwell = dwells.append
+        board.queued_until = 100.05
+        pd._wait_for_boost()
+        self.assertEqual([round(d, 6) for d in dwells], [0.1])
+        board.queued_until = 101.
+        pd._wait_for_boost()
+        self.assertEqual(len(dwells), 1)
         with self.assertRaisesRegex(RuntimeError, "SECONDS=20 is too long: a burst is at most 65535 columns, 16.6 s"):
             pd.cmd_POLYDYE_PREWARM(self.gcmd(SECONDS=20.))
         self.assertEqual(len(self.callbacks), 2)

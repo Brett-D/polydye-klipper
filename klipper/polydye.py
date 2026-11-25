@@ -1134,6 +1134,7 @@ class PolyDye:
         self.prewarm_cmd = self.query_prewarm_cmd = None  # board firmware with prewarm bursts (POLYDYE_PREWARM)
         self.prewarm_sent = None  # the last burst sent: {'start', 'end'} print times, 'seconds'; None: none yet
         self.prewarm_state = None  # the board's account of it, as last asked (_query_prewarm())
+        self.boost_ready = None  # print time the boost has settled after the add-on last turned it on
         self.print_live = False  # a print turned live ink on and hasn't been seen to end yet (_check_print_end())
         self.live_off_pending = False  # a test's cleanup failed: live ink may be on (_check_print_end() retries)
         self.dpi = config.getfloat('dpi', 847., above=0.)
@@ -1493,6 +1494,8 @@ class PolyDye:
                                           self.direction_trim)
         axis = 0 if self.pass_axis == 'x' else 1
         live = self._auto_warm(gcmd, "POLYDYE_PASS", start, direction, warm, warm_words, warm_period, prespit)
+        if live:
+            self._wait_for_boost()  # a POLYDYE_PREWARM may have turned the boost on just before
 
         # Position (through any bed mesh transform), then stop, so the pass starts from rest at a known time.
         pos = list(gcode_move.last_position)
@@ -1817,14 +1820,22 @@ class PolyDye:
         # Live ink turned on by a print: turned off again however the print ends (_check_print_end()). Turned off, or
         # on outside a print: not the print's.
         self.print_live = bool(live and printing)
-        if not boost_was_on and settle:
+        if not boost_was_on:
             # The rails need a moment after the boost turns on, and the board refuses live ink that comes sooner:
-            # keep the next moves (and so the next pass) far enough out.
-            toolhead = self.printer.lookup_object('toolhead')
-            ready = self.mcu.estimated_print_time(self.printer.get_reactor().monotonic()) + BOOST_SETTLE
-            wait = ready - toolhead.get_last_move_time()
-            if wait > 0.:
-                toolhead.dwell(wait)
+            # keep the next moves (and so the next pass) far enough out, or (not `settle`: the moves go on) just the
+            # next pass (boost_ready).
+            self.boost_ready = self.mcu.estimated_print_time(self.printer.get_reactor().monotonic()) + BOOST_SETTLE
+            if settle:
+                self._wait_for_boost()
+
+    def _wait_for_boost(self):
+        """Keeps the moves after this from starting before the boost has settled (boost_ready)."""
+        if self.boost_ready is None:
+            return
+        toolhead = self.printer.lookup_object('toolhead')
+        wait = self.boost_ready - toolhead.get_last_move_time()
+        if wait > 0.:
+            toolhead.dwell(wait)
 
     cmd_POLYDYE_DISABLE_help = "Wait for queued moves, then turn off PolyDye live output and the boost"
 
