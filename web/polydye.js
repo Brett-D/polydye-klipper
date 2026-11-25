@@ -320,8 +320,8 @@ $('fw-file').addEventListener('change', async (ev) => {
 
 // ---- settings: edit the [polydye] section of polydye.cfg ------------------------------------------------------
 
-const FIELDS = ['pass_axis', 'offset_x', 'offset_y', 'direction_trim', 'cartridge_template', 'pulse_words',
-  'bus_clock', 'dpi', 'pass_speed'];
+const FIELDS = ['pass_axis', 'offset_x', 'offset_y', 'direction_trim', 'cartridge_template', 'pulse_words', 'dpi',
+  'pass_speed'];
 const NUDGED = ['offset_x', 'offset_y', 'direction_trim'];
 let cfgText = '';
 
@@ -373,39 +373,17 @@ async function loadSettings() {
   for (const key of FIELDS) {
     let value = cfgValue(cfgText, key);
     // Klipper lowercases the template; the dropdown's values are lowercase, so match them or it shows nothing and
-    // the next save would comment the setting out.
-    if (value !== null && (key === 'cartridge_template' || key === 'bus_clock')) value = value.toLowerCase();
+    // the next save would comment the setting out (as it does a template that was removed).
+    if (value !== null && key === 'cartridge_template') value = value.toLowerCase();
     form.elements[key].value = value === null ? '' : value;
   }
-  syncPulseMax();
   render();
 }
 
-// Longest pulse within the live-ink limit at a clock: 9 words with ours, 8 with stock, 4 at half.
-function maxPulseWords(clock) {
-  return Math.min(12, Math.floor((PULSE_MAX_US * CLOCK_HZ[clock || 'ours']) / 1e6 + 1e-9));
-}
-
-// Shortest pulse of at least Sprite_tm's 1.8 µs at a clock: 6 words with ours and stock, 3 at half.
-function minPulseWords(clock) {
-  return Math.max(3, Math.ceil((PULSE_MIN_US * CLOCK_HZ[clock || 'ours']) / 1e6 - 1e-6));
-}
-
-// The pulse field's range follows the clock chosen next to it.
-function syncPulseMax() {
-  const form = $('settings');
-  const clock = form.elements.bus_clock.value || 'ours';
-  form.elements.pulse_words.min = String(minPulseWords(clock));
-  form.elements.pulse_words.max = String(maxPulseWords(clock));
-  form.elements.pulse_words.placeholder = clock === 'half' ? '3 (1.8 µs)' : '6 (board default)';
-}
-
-// Bus clocks the board offers (the add-on's bus_clocks): board firmware before the half clock has ours and stock.
-const halfClockOk = () => ((state.printer.polydye || {}).bus_clocks || []).includes('half');
-const HALF_OLD = 'The half clock needs newer board firmware: Update to bundled firmware under Board firmware.';
-// Templates the board offers (the add-on's templates): board firmware before deskjet has the first five.
-const deskjetOk = () => ((state.printer.polydye || {}).templates || []).includes('deskjet');
-const DESKJET_OLD = 'The deskjet template needs newer board firmware: Update to bundled firmware under Board firmware.';
+// Templates the board offers (the add-on's templates): board firmware without the stock clock has no color_b_late.
+const templateOk = (name) => ((state.printer.polydye || {}).templates || []).includes(name);
+const templateOldText = (name) => `The ${name} template needs newer board firmware: Update to bundled firmware under `
+  + 'Board firmware.';
 
 // values: key -> string to set ('' leaves the line alone) or null to comment the setting out.
 function applySettings(textIn, values) {
@@ -468,15 +446,14 @@ $('settings').addEventListener('submit', async (ev) => {
       for (const key of FIELDS) values[key] = form.elements[key].value.trim();
       values.cartridge_template = values.cartridge_template || null;
       values.pulse_words = values.pulse_words || null;
-      values.bus_clock = values.bus_clock || null;
-      // Klipper refuses to start with a pulse outside 1.8-2.9 µs at the saved clock, so don't save one.
-      const clock = values.bus_clock || 'ours';
+      // The bus runs only at the stock clock now, and Klipper refuses any other bus_clock: comment it out.
+      values.bus_clock = null;
+      // Klipper refuses to start with a pulse outside 6-8 words, so don't save one.
       const words = Number(values.pulse_words);
-      if (values.pulse_words && !pulseOk(words, clock)) throw new Error(pulseRangeText(words, clock));
-      // ... or with a clock the board doesn't have.
-      if (clock === 'half' && state.board && !halfClockOk()) throw new Error(HALF_OLD);
-      // ... or a template it doesn't have.
-      if (values.cartridge_template === 'deskjet' && state.board && !deskjetOk()) throw new Error(DESKJET_OLD);
+      if (values.pulse_words && !pulseOk(words)) throw new Error(pulseRangeText(words));
+      // ... or with a template the board doesn't have.
+      const tpl = values.cartridge_template;
+      if (tpl && state.board && !templateOk(tpl)) throw new Error(templateOldText(tpl));
       // Re-read first: the file may have been edited elsewhere since the page loaded.
       await uploadCfg(applySettings(await fetchCfg(), values));
     });
@@ -486,8 +463,6 @@ $('settings').addEventListener('submit', async (ev) => {
     log(`! save failed: ${e.message}`);
   }
 });
-
-$('settings').elements.bus_clock.addEventListener('change', () => syncPulseMax());
 
 $('restart-btn').addEventListener('click', async () => {
   $('restart-btn').classList.add('hidden');
@@ -624,21 +599,19 @@ const CHIP_LEGS = {
   D1: 'U1 4', D2: 'U1 6', CSYNC: 'U1 10', D3: 'U1 12',
 };
 const SPIT_HZ = 1000;
-// Bus rates (one word of fire pulse = 1 / rate). The stock setup measures 2.82-2.83 MHz on the board: 2.857 MHz.
-// Half is half ours, for slow level shifters.
-const CLOCK_HZ = { ours: 3333333, stock: 2857142, half: 1666666 };
-const PULSE_MAX_US = 2.9;  // live-ink limit, whatever the clock (polydye.py PULSE_MAX_US)
-const PULSE_MIN_US = 1.8;  // shortest pulse to ask for, whatever the clock: Sprite_tm's (polydye.py REF_US)
-const pulseUs = (words, clock) => (words * 1e6) / CLOCK_HZ[clock];
-const pulseOk = (words, clock) => words >= minPulseWords(clock) && words <= maxPulseWords(clock);
-const pulseRangeText = (words, clock) => `fire pulse ${words} words is ${pulseUs(words, clock).toFixed(2)} µs with `
-  + `the ${clock} clock; use ${minPulseWords(clock)}-${maxPulseWords(clock)} words there `
-  + `(${PULSE_MIN_US}-${PULSE_MAX_US} µs)`;
-// Fire test defaults, like POLYDYE_FIRE_TEST's: one stripe of the stock firmware's settings, or, for board firmware
-// without the stock options, five template/pulse pairs. Used until the stripes are edited.
-const FIRE_STRIPES = 'color_b_late:6:stock';
-const FIRE_STRIPES_BASIC = 'color_b:6,color_b:8,color_b:9,color_a:6,color_a:9';
-let fireStripesEdited = false;
+// The bus runs only at the stock firmware's clock, 2.857 MHz (one word of fire pulse = 1 / BUS_HZ).
+const BUS_HZ = 2857142;
+const PULSE_MAX_US = 2.9;  // live-ink limit (polydye.py PULSE_MAX_US)
+// Fire pulses to ask for (polydye.py PULSE_MIN, PULSE_MAX): 6 words is Sprite_tm's 1.8 µs rounded up, 8 the longest
+// within the limit.
+const PULSE_MIN_WORDS = 6;
+const PULSE_MAX_WORDS = 8;
+const pulseUs = (words) => (words * 1e6) / BUS_HZ;
+const pulseOk = (words) => words >= PULSE_MIN_WORDS && words <= PULSE_MAX_WORDS;
+const pulseRangeText = (words) => `fire pulse ${words} words is ${pulseUs(words).toFixed(2)} µs; use `
+  + `${PULSE_MIN_WORDS}-${PULSE_MAX_WORDS} words (${pulseUs(PULSE_MIN_WORDS).toFixed(2)}-`
+  + `${pulseUs(PULSE_MAX_WORDS).toFixed(2)} µs, at most ${PULSE_MAX_US} µs)`;
+const TEMPLATES = ['color_b_late', 'black_a', 'black_b'];
 // The random pattern's knobs (PATTERN=stock): form field, G-code parameter, range, whole numbers only.
 const KNOBS = [
   ['density', 'DENSITY', 0, 100, false], ['repeat', 'REPEAT', 1, 16, true], ['first', 'FIRST', 0, 111, true],
@@ -688,10 +661,11 @@ const knobsGiven = (f) => KNOBS.some(([name]) => f[name].value.trim() !== '') ||
 // error.
 function warmParams(f) {
   const warm = numField(f.warm, 0, 30, false);
-  const pulse = numField(f.warm_pulse, 1, 12, true);
+  const pulse = numField(f.warm_pulse, 1, PULSE_MAX_WORDS, true);
   const period = numField(f.warm_period, 1, 65535, true);
   if (warm.bad || pulse.bad || period.bad) {
-    return { error: 'the warm-up is 0-30 s, its pulse 1-12 words and its period 1-65535 µs (or leave them empty)' };
+    return { error: `the warm-up is 0-30 s, its pulse 1-${PULSE_MAX_WORDS} words and its period 1-65535 µs (or leave `
+      + 'them empty)' };
   }
   const seconds = warm.empty ? 0 : warm.v;
   if (!seconds) return { text: '', seconds: 0, error: '' };
@@ -906,18 +880,16 @@ function fireValues() {
     return Number.isFinite(v) ? v : fallback;
   };
   const stripes = f.stripes.value.replace(/\s+/g, '').split(',').filter((s) => s);
-  const current = (state.printer.polydye || {}).bus_clock || 'ours';
+  // TEMPLATE:PULSE; a :stock clock (from before the stock-only cleanup) is still taken.
+  const parsed = stripes.map((s) => s.match(/^([a-z_]+):(\d+)(:stock)?$/i));
+  const oldTemplates = [...new Set(parsed.map((m) => m && m[1].toLowerCase())
+    .filter((t) => TEMPLATES.includes(t) && state.board && !templateOk(t)))];
   return {
     x: num('x', 70), y: num('y', 60), z: num('z', 0.5), spacing: num('spacing', 18), stripes,
     pattern: f.pattern.value,
-    valid: stripes.length > 0 && stripes.every((s) => {
-      const m = s.match(/^(color_a|color_b|black_a|black_b|color_b_late|deskjet):(\d+)(:(ours|stock|half))?$/i);
-      const clock = m && (m[4] || current).toLowerCase();
-      return m && pulseOk(Number(m[2]), clock) && (clock !== 'half' || halfClockOk())
-        && (m[1].toLowerCase() !== 'deskjet' || deskjetOk());
-    }),
-    half: stripes.some((s) => /:half$/i.test(s)),
-    deskjet: stripes.some((s) => /^deskjet:/i.test(s)),
+    valid: stripes.length > 0 && !oldTemplates.length
+      && parsed.every((m) => m && TEMPLATES.includes(m[1].toLowerCase()) && pulseOk(Number(m[2]))),
+    oldTemplates,
   };
 }
 
@@ -927,32 +899,25 @@ function renderFireLegend(axis) {
   table.textContent = '';
   if (!v.valid) {
     const tr = document.createElement('tr');
-    tr.append(cell('Each stripe is template:pulse or template:pulse:clock, e.g. color_b:8, color_b_late:8:stock, '
-      + `deskjet:6 or color_b:4:half, with a clock of ours, stock or half and a pulse of ${PULSE_MIN_US} to `
-      + `${PULSE_MAX_US} µs: 6-9 words with our clock, 6-8 with the stock one, 3-4 at half.`
-      + `${v.half && state.board && !halfClockOk() ? ` ${HALF_OLD}` : ''}`
-      + `${v.deskjet && state.board && !deskjetOk() ? ` ${DESKJET_OLD}` : ''}`));
+    tr.append(cell(`Each stripe is template:pulse, e.g. color_b_late:8 or black_a:6, with a template of `
+      + `${TEMPLATES.join(', ')} and a pulse of ${PULSE_MIN_WORDS}-${PULSE_MAX_WORDS} words `
+      + `(${pulseUs(PULSE_MIN_WORDS).toFixed(2)}-${pulseUs(PULSE_MAX_WORDS).toFixed(2)} µs).`
+      + `${v.oldTemplates.map((t) => ` ${templateOldText(t)}`).join('')}`));
     table.append(tr);
     return;
   }
-  const current = (state.printer.polydye || {}).bus_clock || 'ours';
   v.stripes.forEach((s, i) => {
-    const [tpl, words, stripeClock] = s.toLowerCase().split(':');
-    const clock = stripeClock || current;
+    const [tpl, words] = s.toLowerCase().split(':');
     const x = axis === 'x' ? v.x : v.x + i * v.spacing;
     const y = axis === 'x' ? v.y + i * v.spacing : v.y;
     const tr = document.createElement('tr');
     tr.append(cell(`${i + 1}`), cell(`X ${fmtMm(x)}  Y ${fmtMm(y)}`), cell(tpl),
-      cell(`pulse ${words} words (${pulseUs(Number(words), clock).toFixed(2)} µs)`),
-      cell(`${clock} clock`));
+      cell(`pulse ${words} words (${pulseUs(Number(words)).toFixed(2)} µs)`));
     table.append(tr);
   });
 }
 
-$('fire-form').addEventListener('input', (ev) => {
-  if (ev.target.name === 'stripes') fireStripesEdited = true;
-  renderFireLegend((state.printer.polydye || {}).pass_axis);
-});
+$('fire-form').addEventListener('input', () => renderFireLegend((state.printer.polydye || {}).pass_axis));
 $('fire-form').addEventListener('change', () => render());
 $('fire-form').addEventListener('submit', (ev) => ev.preventDefault());
 $('spit-form').addEventListener('submit', (ev) => ev.preventDefault());
@@ -982,9 +947,8 @@ $('spit-btn').addEventListener('click', () => {
   const pulse = parseInt(f.pulse.value, 10);
   const pd = state.printer.polydye || {};
   const stock = f.pattern.value === 'stock';
-  // PATTERN=stock fires at the stock clock and 1.8 µs there unless another clock or pulse is picked.
-  const clock = f.clock.value || (stock ? 'stock' : pd.bus_clock || 'ours');
-  const words = pulse >= 3 ? pulse : (stock ? minPulseWords(clock) : pd.pulse_words);
+  // PATTERN=stock fires 6 words (2.10 µs, stock's) unless another pulse is picked.
+  const words = pulse >= 1 ? pulse : (stock ? PULSE_MIN_WORDS : pd.pulse_words);
   const periodText = f.period.value.trim();
   const period = periodText ? Number(periodText) : 0;
   // A number field reports text it can't parse as an empty value; badInput tells that apart from an empty field.
@@ -995,8 +959,8 @@ $('spit-btn').addEventListener('click', () => {
       + `${periodText ? `, not "${periodText}"` : ''}`);
     return;
   }
-  if (words && !pulseOk(words, clock)) {
-    log(`! spit test: ${pulseRangeText(words, clock)}${pulse >= 3 ? '' : ': enter a fire pulse'}`);
+  if (words && !pulseOk(words)) {
+    log(`! spit test: ${pulseRangeText(words)}${pulse >= 1 ? '' : ': enter a fire pulse'}`);
     return;
   }
   const knobs = stock ? knobParams(f) : { text: '' };
@@ -1011,22 +975,20 @@ $('spit-btn').addEventListener('click', () => {
   const every = period > 0 ? period : (stock ? 508 : 0);
   const each = every > 0 ? `a column every ${every} µs` : `${SPIT_HZ} columns a second`;
   const rate = every > 0 ? `every ${every} µs for ${seconds} s` : `${SPIT_HZ} times a second for ${seconds} s`;
-  const which = {
-    mid: `Nozzle positions 14-90 fire ${rate}.`,
-    sparse: `${each} for ${seconds} s, each firing one nozzle per fire pulse, a different one `
-      + 'each column, so every nozzle fires in turn.',
-    stock: knobs.text ? `The stock firmware's random pattern with${knobs.text} fires ${each} for ${seconds} s.`
+  let which = `Every nozzle fires ${rate}.`;
+  if (stock) {
+    which = knobs.text ? `The stock firmware's random pattern with${knobs.text} fires ${each} for ${seconds} s.`
       : `A random quarter of positions 14-85 fires in each column, each column twice, like the stock firmware, `
-      + `${each} for ${seconds} s.`,
-  }[f.pattern.value] || `Every nozzle fires ${rate}.`;
+      + `${each} for ${seconds} s.`;
+  }
   const first = warmS > 0 ? `First a ${warmS} s warm-up fires every nozzle with `
     + `${warm.pulse ? `${warm.pulse}-word pulses` : 'short pulses'}, then, in the same run: ` : '';
   const ok = window.confirm(`Spit test: LIVE INK, no motion.\n\nHold a folded paper towel under the cartridge, `
     + `against the nozzles. ${first}${which}`);
   if (!ok) return;
   gcode(`POLYDYE_SPIT SECONDS=${seconds}${f.template.value ? ` TEMPLATE=${f.template.value}` : ''}`
-    + `${pulse >= 3 && pulse <= 12 ? ` PULSE=${pulse}` : ''}${f.clock.value ? ` CLOCK=${f.clock.value}` : ''}`
-    + ` PATTERN=${f.pattern.value}${knobs.text}${period > 0 ? ` PERIOD_US=${period}` : ''}${warmParamText} CONFIRM=1`);
+    + `${pulse >= 1 ? ` PULSE=${pulse}` : ''} PATTERN=${f.pattern.value}${knobs.text}`
+    + `${period > 0 ? ` PERIOD_US=${period}` : ''}${warmParamText} CONFIRM=1`);
 });
 
 function renderDiagnostics(pd, printing) {
@@ -1034,37 +996,25 @@ function renderDiagnostics(pd, printing) {
   const diag = known && 'level' in pd;  // board firmware with the signal check and the spit test
   const busy = printing || state.fw.updating || !!pd.running || !!pd.queued;
   $('diag-old').classList.toggle('hidden', !known || diag);
-  // Stripes the board can print, until the user types their own.
-  if (known && !fireStripesEdited) {
-    $('fire-form').elements.stripes.value = 'bus_clock' in pd ? FIRE_STRIPES : FIRE_STRIPES_BASIC;
-  }
   $('fire-btn').disabled = !known || !pd.cartridge_template || busy || !fireValues().valid
     // A warm-up per stripe came with the spit test's stock pattern and column period.
     || (parseFloat($('fire-form').elements.warm.value) > 0 && !(pd.spit_patterns || []).includes('stock'));
-  // Board firmware before the sparse pattern can't spit it (the fire test sends its columns itself), and board
-  // firmware before the half clock can't run it.
+  // Board firmware without the stock clock has no color_b_late (the stock pattern's default template).
   const spit = $('spit-form').elements;
-  const sparseOld = diag && spit.pattern.value === 'sparse' && !(pd.spit_patterns || []).includes('sparse');
-  const halfOld = diag && spit.clock.value === 'half' && !halfClockOk();
-  const deskjetOld = diag && spit.template.value === 'deskjet' && !deskjetOk();
+  const spitTemplate = spit.template.value || (spit.pattern.value === 'stock' ? 'color_b_late' : '');
+  const templateOld = diag && !!spitTemplate && !templateOk(spitTemplate);
   // The stock pattern and the column period came together.
   const stockOld = diag && (spit.pattern.value === 'stock' || spit.period.value.trim() !== '')
     && !(pd.spit_patterns || []).includes('stock');
   // Then the warm-up's longer pulses and the stock pattern's knobs (the fire test takes the knobs on any firmware).
   const randomOld = diag && !stockOld && spit.pattern.value === 'stock' && knobsGiven(spit) && !pd.spit_random;
   const warmWords = parseInt(spit.warm_pulse.value, 10);
-  const warmClock = spit.clock.value || (spit.pattern.value === 'stock' ? 'stock' : pd.bus_clock || 'ours');
   const warmOld = diag && !stockOld && parseFloat(spit.warm.value) > 0 && !pd.warm_duty_ppm
-    && ((warmWords > 0 && pulseUs(warmWords, warmClock) > WARM_OLD_US + 1e-9)
+    && ((warmWords > 0 && pulseUs(warmWords) > WARM_OLD_US + 1e-9)
       || parseFloat(spit.warm.value) > (pd.warm_max_s || WARM_OLD_S) + 1e-9);
   showKnobs();
   const oldText = [];
-  if (sparseOld) {
-    oldText.push('The sparse spit test needs newer board firmware: Update to bundled firmware under Board firmware. '
-      + "The fire test's sparse stripes work with this one.");
-  }
-  if (halfOld) oldText.push(HALF_OLD);
-  if (deskjetOld) oldText.push(DESKJET_OLD);
+  if (templateOld) oldText.push(templateOldText(spitTemplate));
   if (stockOld) {
     oldText.push('The stock-emulation spit test and the column period need newer board firmware: Update to bundled '
       + 'firmware under Board firmware.');
@@ -1079,7 +1029,7 @@ function renderDiagnostics(pd, printing) {
   }
   $('spit-fw-old').textContent = oldText.join(' ');
   $('spit-fw-old').classList.toggle('hidden', !oldText.length);
-  $('spit-btn').disabled = !diag || busy || sparseOld || halfOld || deskjetOld || stockOld || randomOld || warmOld;
+  $('spit-btn').disabled = !diag || busy || templateOld || stockOld || randomOld || warmOld;
   const cartOut = $('sig-cart-out').checked;
   const level = pd.level || null;
   $('sig-start').disabled = !diag || busy || !cartOut || !!pd.live;

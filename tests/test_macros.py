@@ -115,12 +115,11 @@ class FireTest(unittest.TestCase):
         self.macros = load_macros()
 
     def test_homes_only_when_needed_then_sets_z_and_passes_the_stripes(self):
-        lines = run(self.macros, "PD_FIRE_TEST", "X=90 STRIPES=color_a:6,color_b_late:10:stock PATTERN=MID",
-                    homed="")
+        lines = run(self.macros, "PD_FIRE_TEST", "X=90 STRIPES=black_a:6,color_b_late:8 PATTERN=ALL", homed="")
         # The Z move and the G-code state are POLYDYE_FIRE_TEST's, so they're restored even if it fails.
-        self.assertEqual(lines, ["G28", "POLYDYE_FIRE_TEST X=90.0 Y=60.0 Z=0.5 SPACING=18.0 PATTERN=mid "
-                                        "STRIPES=color_a:6,color_b_late:10:stock"])
-        # Without STRIPES, POLYDYE_FIRE_TEST picks its default for the board's firmware; the pattern is stock's.
+        self.assertEqual(lines, ["G28", "POLYDYE_FIRE_TEST X=90.0 Y=60.0 Z=0.5 SPACING=18.0 PATTERN=all "
+                                        "STRIPES=black_a:6,color_b_late:8"])
+        # Without STRIPES, POLYDYE_FIRE_TEST prints its default (the stock firmware's settings); the pattern is stock's.
         lines = run(self.macros, "PD_FIRE_TEST", homed="xyz")
         self.assertEqual(lines, ["POLYDYE_FIRE_TEST X=70.0 Y=60.0 Z=0.5 SPACING=18.0 PATTERN=stock"])
 
