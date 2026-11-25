@@ -521,8 +521,9 @@ X, whatever `warm_position` says: up by its `z_hop`, across, warm, back over the
 The passes follow without warming again; each strip's priming block fires real ink right before its marks.
 Afterwards, also after an error, live ink goes off and the G-code state is put back.
 
-**Alignment page** (`PD_ALIGN_PRINT`, **on paper only**: tape at least 70 × 130 mm of paper over the glass where the
-cartridge reaches; 7 rows 8 mm apart, 113 mm long, plus the priming blocks). Every row has blocks −16 to 16,
+**Alignment page** (`PD_ALIGN_PRINT`, **on paper only**: tape at least 70 × 140 mm of paper over the glass where the
+page goes; the command says where its ink can land; 7 rows 8 mm apart, 113 mm long, 125 mm with the priming blocks at
+both ends. Settings that would need more paper, a bigger `SPACING` or another `dpi`, are refused). Every row has blocks −16 to 16,
 2.9 mm apart, numbered on the first and last rows; find the block where the row's marks line up best:
 
 | Row | Marks | Reading |

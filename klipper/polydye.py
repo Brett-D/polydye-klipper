@@ -673,6 +673,10 @@ PRIME = STOCK_RANDOM
 ALIGN_BLOCK, ALIGN_K = 96, 16
 ALIGN_COLUMNS = ALIGN_BLOCK * (2 * ALIGN_K + 3)
 ALIGN_SPACING = 8.
+# The paper the page needs: ALIGN_PAPER (across, along the pass, mm) with ALIGN_PAPER_MARGIN all round its ink (the
+# rows, the nozzle row's width at 10 % more than nozzle_dpi, the priming blocks at both ends). Settings that need more
+# are refused, so the size the page asks for is always enough.
+ALIGN_PAPER, ALIGN_PAPER_MARGIN = (70., 140.), 5.
 ALIGN_ROWS = ('labels', 'C', 'Y', 'D', 'CX', 'YX', 'labels')
 # No ink on the glass bed, ever (Brett, 2026-11-25): calibration ink and its priming blocks go on paper (the alignment
 # page) or printed plastic (the offset print), and the warm-up before them (which fires every nozzle) over the wipe
@@ -1115,6 +1119,7 @@ class PolyDye:
                                    % (position,))
         self.last_fire = None  # print time the head last fired (a live pass, spit test or warm-up); None: not yet
         self.print_live = False  # a print turned live ink on and hasn't been seen to end yet (_check_print_end())
+        self.live_off_pending = False  # a test's cleanup failed: live ink may be on (_check_print_end() retries)
         self.dpi = config.getfloat('dpi', 847., above=0.)
         self.pass_speed = config.getfloat('pass_speed', 59.5, above=0.)
         self.travel_speed = config.getfloat('travel_speed', 150., above=0.)
@@ -1339,19 +1344,22 @@ class PolyDye:
         never runs its own POLYDYE_ENABLE LIVE=0, and live ink stayed on (2026-11-25). So once a print that turned live
         ink on (print_live, set by POLYDYE_ENABLE) is no longer running or paused, however it ended and however soon,
         the board drops its queued passes and stops any run (a warm-up's, a pass's), and live ink goes off; the boost
-        too unless the board keeps it on (boost_idle_s)."""
-        if not self.print_live or self.cancel_cmd is None or self._printing(eventtime):
+        too unless the board keeps it on (boost_idle_s). The same after a test whose cleanup failed (live_off_pending,
+        _restore_after_test()). Run by the status poll and before POLYDYE_ENABLE; until it works, it's tried again."""
+        ended = self.print_live and not self._printing(eventtime)
+        if not (ended or self.live_off_pending) or self.cancel_cmd is None:
             return
         print_stats = self.printer.lookup_object('print_stats', None)
         state = print_stats.get_status(eventtime).get('state') if print_stats is not None else None
         self.cancel_cmd.send([self.oid])
         self.mode_cmd.send([self.oid, 0 if self.boost_idle_s is None else 1, 0])
         # Done only once both went out: if one fails, the next poll tries again.
-        self.print_live = False
+        self.print_live = self.live_off_pending = False
         self.last_fire = None  # the dropped passes never fired
         msg = "PolyDye: the print %s, so its queued passes were dropped and live ink is off" % (
             {'cancelled': "was cancelled", 'error': "stopped with an error",
-             'complete': "finished with live ink still on"}.get(state, "ended"),)
+             'complete': "finished with live ink still on"}.get(state, "ended"),) if ended else (
+            "PolyDye: live ink is off now (turning it off after the last test failed)")
         logging.info("polydye: %s", msg)
         self.printer.lookup_object('gcode').respond_info(msg)
 
@@ -1699,10 +1707,9 @@ class PolyDye:
     def cmd_POLYDYE_ENABLE(self, gcmd):
         live = gcmd.get_int('LIVE', 1, minval=0, maxval=1)
         printing = self._printing(self.printer.get_reactor().monotonic())
-        if not printing:
-            # A print that turned live ink on has ended but the status poll hasn't cleaned up after it yet: do it now,
-            # so it can't come later and turn off what's enabled here (a fire test, say).
-            self._check_print_end(self.printer.get_reactor().monotonic())
+        # A print that turned live ink on has ended, or a test's cleanup failed, but the status poll hasn't turned live
+        # ink off yet: do it now, so it can't come later and turn off what's enabled here (a fire test, say).
+        self._check_print_end(self.printer.get_reactor().monotonic())
         boost_was_on = True
         if live:
             st = self._fresh_status()
@@ -2053,11 +2060,14 @@ class PolyDye:
                 first = start + built[n][2] * pitch
                 cross = side + r * spacing
                 prints.append((n, cross, first, drawings[n][2]) if a == 1 else (n, first, cross, drawings[n][2]))
+        paper = self._align_paper(gcmd, cmd, drawings, built, start, side, spacing)
         sponge = self._cal_sponge(gcmd, cmd)
         self._check_reach(gcmd, cmd, prints, [b[1] for b in built])
         self._upload_cal(gcmd, cmd, [(b[0], b[1]) for b in built])
-        gcmd.respond_info("PolyDye alignment page, live ink on paper: %d rows %.0f mm apart from X=%.1f Y=%.1f, %.0f mm "
-                          "long" % (len(ALIGN_ROWS), spacing, x, y, ALIGN_COLUMNS * pitch))
+        gcmd.respond_info("PolyDye alignment page, live ink on paper: %d rows %.0f mm apart from X=%.1f Y=%.1f. Its "
+                          "ink spans %s: the paper must cover that with %g mm to spare, at least %.0f x %.0f mm"
+                          % (len(ALIGN_ROWS), spacing, x, y, paper, ALIGN_PAPER_MARGIN, ALIGN_PAPER[0],
+                             ALIGN_PAPER[1]))
         self._run_cal(gcmd, cmd, st, prints, sponge, z=z)
         gcmd.respond_info(
             "PolyDye alignment page done. In each row find the block where its marks line up best (C, Y: the colour "
@@ -2065,6 +2075,27 @@ class PolyDye:
             "off the label rows; halfway between two blocks reads as e.g. -11.5. Then\n"
             "  POLYDYE_ALIGN CYAN=<C> YELLOW=<Y> DIRECTION=<D> CYAN_X=<CX> YELLOW_X=<YX>\n"
             "corrects and stores them; print the page again to check that every row reads 0.")
+
+    def _align_paper(self, gcmd, cmd, drawings, built, start, side, spacing):
+        """The bed area the alignment page's ink can cover (all rows, the nozzle row at 10 % more than nozzle_dpi, the
+        priming blocks), as text; refuses, before anything moves, settings that need more paper than ALIGN_PAPER with
+        ALIGN_PAPER_MARGIN all round."""
+        pitch, wide = 25.4 / self.dpi, 25.4 / self.nozzle_dpi * 1.1
+        ends = [(b[2], b[2] + b[1] - 1) if d[2] > 0 else (b[2] - b[1] + 1, b[2]) for b, d in zip(built, drawings)]
+        along = (start + min(e[0] for e in ends) * pitch, start + max(e[1] for e in ends) * pitch)
+        extents = [drawing_extent(d) for _, d, _ in drawings]
+        half = max(max(e[3] for e in extents) - OFFSET_REF_POSITION,
+                   OFFSET_REF_POSITION - min(e[2] for e in extents)) * wide
+        across = (side - half, side + (len(ALIGN_ROWS) - 1) * spacing + half)
+        need = (across[1] - across[0] + 2 * ALIGN_PAPER_MARGIN, along[1] - along[0] + 2 * ALIGN_PAPER_MARGIN)
+        if need[0] > ALIGN_PAPER[0] or need[1] > ALIGN_PAPER[1]:
+            raise gcmd.error("%s: at SPACING %g and dpi %g the page would need %.0f x %.0f mm of paper (with %g mm "
+                             "margins), more than the %.0f x %.0f mm it asks for: use a smaller SPACING, or the "
+                             "default dpi" % (cmd, spacing, self.dpi, need[0], need[1], ALIGN_PAPER_MARGIN,
+                                              ALIGN_PAPER[0], ALIGN_PAPER[1]))
+        if self.pass_axis == 'y':
+            return "X %.0f-%.0f, Y %.0f-%.0f" % (across[0], across[1], along[0], along[1])
+        return "X %.0f-%.0f, Y %.0f-%.0f" % (along[0], along[1], across[0], across[1])
 
     cmd_POLYDYE_OFFSET_PRINT_help = ("PLA and LIVE INK: a PLA plaque with a cross-shaped groove centred on X, Y "
                                      "(LAYERS of LAYER_HEIGHT, the groove in the top 3; heats to EXTRUDER_TEMP and "
@@ -2155,7 +2186,9 @@ class PolyDye:
             lines.append("M104 S%.0f" % (e_temp,))
         if b_temp is not None:
             lines.append("M190 S%.0f" % (b_temp,))
-        lines += ["M109 S%.0f" % (temp,), "G90", "M83"]
+        # The plaque's extrusion and speeds assume 100 %: an earlier M221/M220 would thin it out or leave no plaque
+        # under the ink. RESTORE_GCODE_STATE puts the factors back afterwards.
+        lines += ["M109 S%.0f" % (temp,), "G90", "M83", "M220 S100", "M221 S100"]
         lines += plaque_gcode(plaque, height, nozzle * 1.125, filament_area, nozzle * 1.25)
         lines += ["G1 Z%.3f F600" % (z,), "M104 S0"]
         return "\n".join(lines)
@@ -2729,7 +2762,9 @@ class PolyDye:
             self._send_cartridge(self._live_off(), before[0], before[1])
             self._query_status()
         except Exception:
-            logging.exception("polydye: fire test cleanup failed")
+            # Live ink may still be on: the status poll keeps trying to turn it off (_check_print_end()).
+            self.live_off_pending = True
+            logging.exception("polydye: test cleanup failed; live ink goes off at the next status poll")
 
     def get_status(self, eventtime):
         status = dict(self.last_status, last_pass=self.last_pass, pass_axis=self.pass_axis, offset_x=self.offset_x,

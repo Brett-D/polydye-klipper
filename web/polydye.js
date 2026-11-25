@@ -1098,8 +1098,9 @@ $('align-btn').addEventListener('click', () => {
     return;
   }
   const ok = window.confirm('Print the alignment page with LIVE INK, on paper only?\n\nPaper taped over the glass '
-    + 'where the cartridge reaches, at least 70 x 130 mm, so no ink lands on the glass; cartridge fitted. It homes if '
-    + 'needed, warms the head over the wipe sponge and prints 8 strips along the pass axis.');
+    + 'where the page goes, at least 70 x 140 mm, so no ink lands on the glass (the console says exactly where); '
+    + 'cartridge fitted. It homes if needed, warms the head over the wipe sponge and prints 8 strips along the pass '
+    + 'axis.');
   if (ok) gcode(`PD_ALIGN_PRINT${p.text}`);
 });
 

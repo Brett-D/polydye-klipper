@@ -115,7 +115,7 @@ class StatusPoll(unittest.TestCase):
         state = {'shutdown': False}
         pd.printer = types.SimpleNamespace(is_shutdown=lambda: state['shutdown'], get_reactor=lambda: reactor,
                                            lookup_object=lambda name, default=None: default)
-        pd.querying = pd.query_failing = pd.print_live = False
+        pd.querying = pd.query_failing = pd.print_live = pd.live_off_pending = False
         pd._query_status = lambda: query(state)
         return pd, state, reactor
 
@@ -154,7 +154,7 @@ class StatusPoll(unittest.TestCase):
 class PrintEnd(unittest.TestCase):
     def test_a_cancelled_or_failed_print_turns_live_ink_off(self):
         pd = object.__new__(polydye.PolyDye)
-        pd.oid, pd.boost_idle_s, pd.print_live, pd.last_fire = 0, 1800, False, 50.
+        pd.oid, pd.boost_idle_s, pd.print_live, pd.last_fire, pd.live_off_pending = 0, 1800, False, 50., False
         sent, said = [], []
         pd.cancel_cmd = types.SimpleNamespace(send=lambda args: sent.append('cancel'))
         pd.mode_cmd = types.SimpleNamespace(send=lambda args: sent.append(('mode', args[1], args[2])))
@@ -218,10 +218,32 @@ class PrintEnd(unittest.TestCase):
             pd._check_print_end(0.)
         self.assertTrue(pd.print_live)
         run((('cancelled', False, off), ('cancelled', False, [])))
+        # A test whose cleanup failed: live ink goes off at the next poll (tried again until it works), or before
+        # live ink is enabled again, also by a print.
+        pd.mode_cmd = types.SimpleNamespace(send=lambda args: sent.append(('mode', args[1], args[2])))
+        del said[:]
+        pd.live_off_pending = True
+        run((('standby', False, off), ('standby', False, [])))
+        self.assertEqual(said, ["PolyDye: live ink is off now (turning it off after the last test failed)"])
+        pd.live_off_pending, state[0], sent[:] = True, 'printing', []
+        pd.cmd_POLYDYE_ENABLE(gcmd)
+        self.assertEqual(sent, off + [('mode', 1, 1)])
+        self.assertEqual((pd.live_off_pending, pd.print_live), (False, True))
+        run((('complete', False, off),))
         # Older board firmware: the boost goes off too.
         pd.boost_idle_s, state[0] = None, 'printing'
         pd.cmd_POLYDYE_ENABLE(gcmd)
         run((('cancelled', False, ['cancel', ('mode', 0, 0)]),))
+
+    def test_a_failed_test_cleanup_leaves_live_ink_off_pending(self):
+        pd, board = TestCleanup.make(TestCleanup(), fail_on="NOTHING")
+
+        def lost(args):
+            raise RuntimeError("Lost communication with MCU 'polydye'")
+        pd.mode_cmd = types.SimpleNamespace(send=lost)
+        with self.assertLogs(level='ERROR'):
+            pd._restore_after_test(('color_b_late', 6))
+        self.assertTrue(pd.live_off_pending)
 
 
 class StatusCommand(unittest.TestCase):
@@ -343,7 +365,7 @@ class TestCleanup(unittest.TestCase):
         pd.boost_idle_s = None  # board firmware that turns PolyDye off after a test
         pd.warm_seconds, pd.warm_pulse, pd.warm_period_us, pd.warm_idle_time = 10., 1, 254, 60.
         pd.warm_position, pd.warm_clearance, pd.warm_prespit = 'pass', 10., 0.
-        pd.last_fire, pd.auto_warm_off, pd.print_live = None, False, False
+        pd.last_fire, pd.auto_warm_off, pd.print_live, pd.live_off_pending = None, False, False, False
         pd.mcu = types.SimpleNamespace(estimated_print_time=lambda eventtime: board.print_time)
         board.print_time = 100.
 
@@ -1800,6 +1822,10 @@ class CalibrationPrints(unittest.TestCase):
         self.assertIn(board.sent.index(passes[4]), self.waits)
         self.assertEqual((board.boost, board.live), (False, False))
         self.assertIn("POLYDYE_ALIGN CYAN=<C> YELLOW=<Y> DIRECTION=<D> CYAN_X=<CX> YELLOW_X=<YX>", self.said[-1])
+        # Where the paper goes: the rows across X (the nozzle row's half width at 10 % more than nozzle_dpi either
+        # side), the page with its priming blocks along Y.
+        self.assertIn("Its ink spans X 57-111, Y 38-163: the paper must cover that with 5 mm to spare, at least 70 x "
+                      "140 mm", [s for s in self.said if s.startswith("PolyDye alignment page, live ink")][0])
 
     def test_refused_before_anything_is_sent(self):
         for homed, params, setup, error in (
@@ -1808,7 +1834,9 @@ class CalibrationPrints(unittest.TestCase):
                 ('xyz', {}, lambda pd, board: setattr(board, 'template', 'black_a'), "for the colour cartridge"),
                 ('xyz', {}, lambda pd, board: setattr(pd, 'data_port', None), "set data_port"),
                 ('xyz', dict(X=60., Y=150.), None, r"would take the toolhead to X=60.0 Y=2\d\d.\d, beyond the axis"),
-                ('xyz', {}, lambda pd, board: setattr(board, 'print_state', 'paused'), "not during a print")):
+                ('xyz', {}, lambda pd, board: setattr(board, 'print_state', 'paused'), "not during a print"),
+                ('xyz', dict(SPACING=12.), None, r"at SPACING 12 and dpi 847 the page would need 89 x 135 mm of paper"),
+                ('xyz', {}, lambda pd, board: setattr(pd, 'dpi', 600.), r"dpi 600 the page would need 65 x 186 mm")):
             pd, board = self.make(homed)
             if setup:
                 setup(pd, board)
@@ -1871,7 +1899,7 @@ class CalibrationPrints(unittest.TestCase):
         setup = script[1].split("\n")
         # Heated (the hotend to its current target), the plaque at relative extrusion, then up to the plaque's top
         # plus the gap with the hotend off; the ink scales after that.
-        self.assertEqual(setup[:5], ["M140 S60", "M190 S60", "M109 S210", "G90", "M83"])
+        self.assertEqual(setup[:7], ["M140 S60", "M190 S60", "M109 S210", "G90", "M83", "M220 S100", "M221 S100"])
         self.assertEqual(setup[-2:], ["G1 Z2.000 F600", "M104 S0"])
         # Two solid layers (one rectangle: a travel down to it for the perimeter and one for the fill; the first layer
         # also comes down for the prime line), then three with the groove (six rectangles).
