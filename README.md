@@ -361,9 +361,10 @@ ink, one object at a time.
   streaked even at 3, while 3 + 2 printed solid (ladder 904). So where a sweep would need more (two or three inks
   solid), the add-on sends it to the board as **two passes, one per fire line**, over the same ground: data positions
   0–55 (F3), then 56–111 (F5) as pass number + 32768. Each then fires at full density up to 4 per pulse. Positions
-  28–82 put two groups of 14 positions on each line, so two inks want exactly 4 per line; one ink stays one pass
-  (2 + 2). Where more than 4 still want a pulse (three inks), they share by an even rotation, the same for both columns
-  of a pair; a fire left on its own is dropped. The add-on does this when it sends a job's passes, after the colour
+  28–82 put two groups of 14 positions on each line, so two inks want exactly 4 per line. One ink always stays one
+  pass (2 + 2 at 28–82; at wider positions it's capped instead, 3 + 3 at 14–84 becoming 3 + 2). Where more than
+  allowed still want a pulse (three inks), they share by an even rotation, the same for both columns of a pair; a fire
+  left on its own is dropped. The add-on does this when it sends a job's passes, after the colour
   registration (which moves cyan one position).
 - **Prewarm and prime:** `POLYDYE_PREWARM SECONDS=6` goes in about 6 s of moves before each ink layer's end (the moves
   timed as Klipper plans them; within 3 % of Orca's estimate), so the burst ends as the ink starts; a layer shorter

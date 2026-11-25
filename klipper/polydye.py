@@ -1255,14 +1255,16 @@ def job_pass_data(data, colours, columns, direction, registration=(0, 0, 0, 0), 
 
 def job_pass_parts(data, colours, columns, direction, registration=(0, 0, 0, 0), skew=None):
     """A job pass as the board passes that print it: [(pass number offset, data, columns, first)], like
-    job_pass_data(). One, unless a packet would want more than HEATERS_PER_SLOT heaters on its two fire lines together
-    (each line counted up to HEATERS_PER_PULSE): then two, the dots on fire line F3 (data positions 0-55) at offset 0
-    and those on F5 (56-111) at SPLIT_PASS, each trimmed to its own columns and capped. Empty if no dot is left."""
+    job_pass_data(). One, unless the pass has two or more inks and a packet would want more than HEATERS_PER_SLOT
+    heaters on its two fire lines together (each line counted up to HEATERS_PER_PULSE): then two, the dots on fire
+    line F3 (data positions 0-55) at offset 0 and those on F5 (56-111) at SPLIT_PASS, each trimmed to its own columns
+    and capped. A single ink stays one pass, capped (3 + 3 at positions 14-84 becomes 3 + 2): splitting it would double
+    its time for a dot or two. Empty if no dot is left."""
     raw = _job_columns(data, colours, columns, registration, skew)
     if raw is None:
         return []
     out, lo = raw
-    if not needs_split(out):
+    if len(colours) < 2 or not needs_split(out):
         return [(0,) + _job_part(out, lo, direction)]
     parts = []
     for offset, mask in ((0, 0x0f), (SPLIT_PASS, 0xf0)):

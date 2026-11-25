@@ -2403,13 +2403,15 @@ class HeaterCap(unittest.TestCase):
     def test_a_pass_is_split_by_fire_line_only_where_it_must_be(self):
         # One ink at positions 28-82 (cyan 29-83): 2 + 2 per packet, one board pass, nothing dropped. At 14-84 the
         # densest packet has 3 + 2 (or 3 + 3 where position 84 shares it): still one pass, 3 + 3 capped to 3 + 2.
-        for c, (p0, p1), registration in ((polydye.MAGENTA, (28, 82), (0, 0, 0, 0)), (polydye.CYAN, (28, 82),
-                                                                                     (-34, 1, 27, 0))):
+        for c, (p0, p1), registration, kept in ((polydye.MAGENTA, (28, 82), (0, 0, 0, 0), 55),
+                                                 (polydye.CYAN, (28, 82), (-34, 1, 27, 0), 55),
+                                                 (polydye.MAGENTA, (14, 84), (0, 0, 0, 0), 70)):
             colours, data = job_planes(bar(c, 60, p0, p1), 60)
             parts = polydye.job_pass_parts(data, colours, 60, 1, registration)
             self.assertEqual(len(parts), 1)
             self.assertEqual(parts[0][1:], polydye.job_pass_data(data, colours, 60, 1, registration))
-            self.assertEqual(sum(bin(b).count('1') for b in parts[0][1]), 60 * 55)
+            self.assertEqual(sum(bin(b).count('1') for b in parts[0][1]), 60 * kept)
+            self.assertLessEqual(max(slot_load(parts[0][1])), 5)
         # Two inks there, where the registration lays them over each other: 4 + 4, so two board passes, each with
         # every dot of its fire line (data positions 28-55 and 56-83), in both directions; the second stored as
         # pass | SPLIT_PASS. Where they don't meet (60 columns, 61 apart), one pass.
