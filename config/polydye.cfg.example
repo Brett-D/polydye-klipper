@@ -27,6 +27,10 @@ offset_y: -8.7
 #cartridge_template: color_b_late
 # Fire pulse in bus words (0.35 us each): 6-8, at most 2.9 us. Default: 6 (2.10 us, stock's).
 #pulse_words: 6
+# Fire gap in us (0-16.8): F5 fires that much later after F3 than stock's timing, so each fire line may fire 4 heaters
+# in a packet and two-ink passes aren't split by fire line (README, "Fire gap"; PD_FIRE_GAP_TEST finds the gap).
+# Default: the board's own (0, stock's).
+#fire_gap_us: 0
 # Bus columns per inch along the pass and the pass speed: stock's 3,333 columns per 100 mm (each 423 dpi image column
 # twice) at 59.5 mm/s, a column every 504 us.
 #dpi: 847

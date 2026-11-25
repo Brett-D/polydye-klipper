@@ -37,6 +37,8 @@ CLOCK = "polydye_clock oid=%c stock=%c nominal_hz=%u measured_hz=%u"
 PREWARM = "polydye_prewarm oid=%c clock=%u columns=%hu period_us=%hu"
 PREWARM_STATE = "polydye_prewarm_state oid=%c state=%c start=%u end=%u columns=%u"
 PREWARM_STATES = ('none', 'queued', 'firing', 'done', 'made way', 'skipped')
+# The fire gap (fire_gap_us; board firmware with POLYDYE_FIRE_GAP_MAX), in bus words.
+FIRE_GAP = "polydye_fire_gap oid=%c words=%c"
 # The board's last column run (board firmware with polydye_query_run, also answered after a shutdown): why it stopped
 # (a shutdown reason, or "none"), columns sent, warm-up columns not sent, column times missed with no column ready
 # (underruns) or the bus still busy (overruns), and its worst lateness and slowest column preparation in clock ticks.
@@ -162,6 +164,11 @@ HEATERS_PER_PULSE = 4
 # together; a job pass that would need more (two or three inks, solid) goes to the board as two passes, one per fire
 # line.
 HEATERS_PER_SLOT = 5
+# A fire gap (fire_gap_us, board firmware with POLYDYE_FIRE_GAP_MAX) makes F5 fire that much later after F3 than the
+# stock timing's 0.7 us, so each line may have its own HEATERS_PER_PULSE (heater_slot()) and nothing is split by fire
+# line: POLYDYE_FIRE_GAP_TEST shows which gap that takes. At most FIRE_GAP_MAX words (16.8 us), so a column with the
+# longest pulse still fits the stock pass period.
+FIRE_GAP_MAX = 48
 # The second of those passes (fire line F5) is stored as pass number | SPLIT_PASS; job passes are numbered below it.
 SPLIT_PASS = 0x8000
 _NIBBLES = tuple(bin(v & 15).count('1') for v in range(256))
@@ -285,6 +292,8 @@ def cartridge_text(st):
         return "cartridge template and fire pulse: unknown (board firmware too old)"
     text = "cartridge template %s, fire pulse %d words = %.2f us (%.0f %% energy)" % (
         st['cartridge_template'], st['pulse_words'], st['pulse_us'], pulse_energy_pct(st['pulse_us']))
+    if st.get('fire_gap_words'):
+        text += ", fire gap %d words = %.2f us" % (st['fire_gap_words'], st['fire_gap_us'])
     if st.get('bus_clock'):
         measured = st.get('bus_hz_measured')
         text += ", bus clock %s (%.3f MHz%s)" % (st['bus_clock'], st['bus_hz'] / 1e6,
@@ -431,16 +440,45 @@ def head_cold(last_fire, now, idle_time):
     return last_fire is None or now - last_fire > idle_time
 
 
-def column_us(words):
-    """Time a column with a `words`-word pulse takes on the bus, in us, rounded up (printcart_column_us())."""
-    length = TEMPLATE_WORDS + 2 * max(0, words - BASE_PULSE_WORDS)
+def column_us(words, gap=0):
+    """Time a column with a `words`-word pulse and a `gap`-word fire gap takes on the bus, in us, rounded up
+    (printcart_column_us())."""
+    length = TEMPLATE_WORDS + 2 * max(0, words - BASE_PULSE_WORDS) + gap
     hz = int(BUS_HZ)
     return (PACKETS * (length + IDLE_WORDS) * 1000000 + hz - 1) // hz
 
 
-def min_spit_period_us(words):
-    """Shortest spit column period the board accepts for that column, in us (printcart_min_period_us())."""
-    return column_us(words) + PERIOD_MARGIN_US
+def min_spit_period_us(words, gap=0):
+    """Shortest spit (or pass) column period the board accepts for that column, in us (printcart_min_period_us())."""
+    return column_us(words, gap) + PERIOD_MARGIN_US
+
+
+def fire_gap_words(us):
+    """A fire gap in us as whole bus words at the stock clock (0.35 us each), to the nearest."""
+    return int(math.floor(us * BUS_HZ / 1e6 + 0.5))
+
+
+def fire_gap_us(words):
+    """A fire gap in bus words, in us at the stock clock."""
+    return round(words * 1e6 / BUS_HZ, 2)
+
+
+def heater_slot(gap_words):
+    """cap_heaters()'s `slot` at the board's fire gap: HEATERS_PER_SLOT at the stock timing, with a gap each line's own
+    HEATERS_PER_PULSE (so no pass needs splitting by fire line)."""
+    return 2 * HEATERS_PER_PULSE if gap_words else HEATERS_PER_SLOT
+
+
+def fire_gap_fit_error(gap, pulse, dpi, pass_speed):
+    """None, or why a `gap`-word fire gap with a `pulse`-word pulse makes a column too long for the pass column period
+    (dpi, pass_speed)."""
+    period = 25.4e6 / (dpi * pass_speed)
+    need = min_spit_period_us(pulse, gap)
+    if need <= period:
+        return None
+    return ("a %.2f us fire gap with a pulse of %d words makes the column %d us on the bus, more than the %.0f us "
+            "pass column period (dpi %g, %g mm/s) less the board's %d us margin"
+            % (fire_gap_us(gap), pulse, column_us(pulse, gap), period, dpi, pass_speed, PERIOD_MARGIN_US))
 
 
 def spit_rate_text(period_us):
@@ -874,10 +912,12 @@ def _drawing_cols(drawing, registration, skew):
     return cols
 
 
-def drawing_parts(drawing, direction, registration=(0, 0, 0, 0), skew=None):
+def drawing_parts(drawing, direction, registration=(0, 0, 0, 0), skew=None, cap=HEATERS_PER_PULSE,
+                  slot=HEATERS_PER_SLOT):
     """The board passes that print `drawing`'s dots (not its priming blocks) the way a colour print's pass is printed
-    (job_pass_parts()): with the colour registration and skew like pass_data(), the heater cap, and split by fire line
-    where two or more inks need it. [(data, columns, first)] like pass_data()'s; empty if no dot is left."""
+    (job_pass_parts()): with the colour registration and skew like pass_data(), the heater cap (cap_heaters()'s `cap`
+    and `slot`), and split by fire line where two or more inks need it. [(data, columns, first)] like pass_data()'s;
+    empty if no dot is left."""
     cols = _drawing_cols(drawing, registration, skew)
     if not cols:
         return []
@@ -885,7 +925,7 @@ def drawing_parts(drawing, direction, registration=(0, 0, 0, 0), skew=None):
     empty = bytes(NOZDATA_SIZE)
     out = bytearray(b"".join(bytes(cols[i]) if i in cols else empty for i in range(lo, hi + 1)))
     inks = len(set(c for _, c, _ in drawing.dots))
-    return [part[1:] for part in _pass_parts(out, lo, inks, direction)]
+    return [part[1:] for part in _pass_parts(out, lo, inks, direction, cap, slot)]
 
 
 def align_centre(k):
@@ -1127,6 +1167,35 @@ def test_page_drawings(dpi, nozzle_dpi, registration=(0, 0, 0, 0)):
     return [(d, 1 if n % 2 == 0 else -1, x) for n, (d, x) in enumerate(out)]
 
 
+# POLYDYE_FIRE_GAP_TEST: on paper, which fire gap (fire_gap_us) lets both fire lines fire HEATERS_PER_PULSE heaters.
+# Rows of red, green and blue squares (two inks at TEST_POSITIONS: 4 heaters on each fire line of every packet, one
+# pass each, never split by fire line), front to back: the stock timing at 4 + 4 (F5 streaked on ladder 904), the stock
+# timing with F5 capped to GAP_TEST_CONTROL_F5 (4 + 2, the control: solid, lighter), then 4 + 4 at each gap asked for
+# (GAP_TEST_US by default, 20 and 43 bus words; at most GAP_TEST_MAX_GAPS of them).
+GAP_TEST_US = (7., 15.)
+GAP_TEST_CONTROL_F5 = 2
+GAP_TEST_MAX_GAPS = 4
+
+
+def gap_test_drawings(dpi, nozzle_dpi, rows):
+    """POLYDYE_FIRE_GAP_TEST's passes in printing order, as (row, drawing, direction, x): `rows` rows of a red, a green
+    and a blue square TEST_COLUMN_MM apart (x the pass's X, from the first's), directions alternating. Row r's squares
+    start r (square + TEST_GAP_MM) from the first's front edge, drawing column 0."""
+    pitch, nozzle = 25.4 / dpi, 25.4 / nozzle_dpi
+    lo, hi = TEST_POSITIONS
+    square = 2 * max(1, int(round((hi - lo + 1) * nozzle / pitch / 2.)))
+    gap = 2 * max(1, int(round(TEST_GAP_MM / pitch / 2.)))
+    out = []
+    for r in range(rows):
+        i = r * (square + gap)
+        for k, inks in enumerate(((MAGENTA, YELLOW), (CYAN, YELLOW), (CYAN, MAGENTA))):  # red, green, blue
+            d = PassDrawing()
+            for c in inks:
+                d.bar(i, i + square - 1, c, lo, hi)
+            out.append((r, d, k * TEST_COLUMN_MM))
+    return [(r, d, 1 if n % 2 == 0 else -1, x) for n, (r, d, x) in enumerate(out)]
+
+
 def cfg_number(v):
     """A value as polydye.cfg gets it: at most 4 decimals, no trailing zeros (like the page's)."""
     s = ("%.4f" % (v,)).rstrip('0').rstrip('.')
@@ -1342,32 +1411,34 @@ def _mask_table(mask):
     return _MASK_TABLES[mask]
 
 
-def job_pass_data(data, colours, columns, direction, registration=(0, 0, 0, 0), skew=None):
+def job_pass_data(data, colours, columns, direction, registration=(0, 0, 0, 0), skew=None, slot=HEATERS_PER_SLOT):
     """Nozzle data to print a job pass (its colour planes `data`, `columns` long, for `colours`) in `direction` with
-    colour registration and skew, like pass_data() for a drawing of the same dots, then the heater cap (cap_heaters()):
-    (data, columns, first), first the drawing column of the pass's first column (its X, Y name column 0). None if no
-    dot is left. As one board pass: job_pass_parts() splits it by fire line where it needs to."""
+    colour registration and skew, like pass_data() for a drawing of the same dots, then the heater cap (cap_heaters(),
+    with `slot`: heater_slot()): (data, columns, first), first the drawing column of the pass's first column (its X, Y
+    name column 0). None if no dot is left. As one board pass: job_pass_parts() splits it by fire line where it needs
+    to."""
     raw = _job_columns(data, colours, columns, registration, skew)
-    built = None if raw is None else _job_part(raw[0], raw[1], direction)
+    built = None if raw is None else _job_part(raw[0], raw[1], direction, slot=slot)
     return built if built and built[1] else None
 
 
-def job_pass_parts(data, colours, columns, direction, registration=(0, 0, 0, 0), skew=None):
+def job_pass_parts(data, colours, columns, direction, registration=(0, 0, 0, 0), skew=None, slot=HEATERS_PER_SLOT):
     """A job pass as the board passes that print it: [(pass number offset, data, columns, first)], like
-    job_pass_data(). One, unless the pass has two or more inks and a packet would want more than HEATERS_PER_SLOT
-    heaters on its two fire lines together (each line counted up to HEATERS_PER_PULSE): then two, the dots on fire
-    line F3 (data positions 0-55) at offset 0 and those on F5 (56-111) at SPLIT_PASS, each trimmed to its own columns
-    and capped. A single ink stays one pass, capped (3 + 3 at positions 14-84 becomes 3 + 2): splitting it would double
-    its time for a dot or two. Empty if no dot is left."""
+    job_pass_data(). One, unless the pass has two or more inks and a packet would want more than `slot`
+    (HEATERS_PER_SLOT; heater_slot()) heaters on its two fire lines together (each line counted up to
+    HEATERS_PER_PULSE): then two, the dots on fire line F3 (data positions 0-55) at offset 0 and those on F5 (56-111)
+    at SPLIT_PASS, each trimmed to its own columns and capped. A single ink stays one pass, capped (3 + 3 at positions
+    14-84 becomes 3 + 2): splitting it would double its time for a dot or two. With a fire gap's slot nothing is split.
+    Empty if no dot is left."""
     raw = _job_columns(data, colours, columns, registration, skew)
-    return [] if raw is None else _pass_parts(raw[0], raw[1], len(colours), direction)
+    return [] if raw is None else _pass_parts(raw[0], raw[1], len(colours), direction, slot=slot)
 
 
-def _pass_parts(out, lo, inks, direction):
+def _pass_parts(out, lo, inks, direction, cap=HEATERS_PER_PULSE, slot=HEATERS_PER_SLOT):
     """job_pass_parts() for nozzle data `out` (bytearray, columns from drawing column `lo` on in DIR=1's order, with
-    the registration and skew, uncapped) of `inks` inks."""
-    if inks < 2 or not needs_split(out):
-        built = _job_part(out, lo, direction)
+    the registration and skew, uncapped) of `inks` inks, at cap_heaters()'s `cap` and `slot`."""
+    if inks < 2 or not needs_split(out, cap, slot):
+        built = _job_part(out, lo, direction, cap, slot)
         return [(0,) + built] if built[1] else []  # the cap can drop every fire: a lone dot, say
     parts = []
     for offset, mask in ((0, 0x0f), (SPLIT_PASS, 0xf0)):
@@ -1377,29 +1448,34 @@ def _pass_parts(out, lo, inks, direction):
             continue
         a = (len(half) - len(half.lstrip(b"\0"))) // NOZDATA_SIZE
         b = (len(half.rstrip(b"\0")) + NOZDATA_SIZE - 1) // NOZDATA_SIZE
-        built = _job_part(bytearray(half[a * NOZDATA_SIZE:b * NOZDATA_SIZE]), lo + a, direction)
+        built = _job_part(bytearray(half[a * NOZDATA_SIZE:b * NOZDATA_SIZE]), lo + a, direction, cap, slot)
         if built[1]:
             parts.append((offset,) + built)
     return parts
 
 
-def needs_split(out):
-    """Whether some packet of the nozzle data `out` wants more than HEATERS_PER_SLOT heaters on its two fire lines,
-    each counted up to HEATERS_PER_PULSE."""
+def needs_split(out, cap=HEATERS_PER_PULSE, slot=HEATERS_PER_SLOT):
+    """Whether some packet of the nozzle data `out` wants more than `slot` heaters on its two fire lines, each counted
+    up to its `cap` (cap_heaters())."""
+    cap3, cap5 = line_caps(cap)
     for base in range(0, len(out), NOZDATA_SIZE):
         for k in range(base, base + 14):
             a, b, c = out[k], out[k + 14], out[k + 28]
-            if a | b | c and (min(_NIBBLES[a] + _NIBBLES[b] + _NIBBLES[c], HEATERS_PER_PULSE) +
-                              min(_HIGH_NIBBLES[a] + _HIGH_NIBBLES[b] + _HIGH_NIBBLES[c], HEATERS_PER_PULSE)
-                              > HEATERS_PER_SLOT):
+            if a | b | c and (min(_NIBBLES[a] + _NIBBLES[b] + _NIBBLES[c], cap3) +
+                              min(_HIGH_NIBBLES[a] + _HIGH_NIBBLES[b] + _HIGH_NIBBLES[c], cap5) > slot):
                 return True
     return False
 
 
-def _job_part(out, lo, direction):
-    """`out` (columns from drawing column `lo` on, DIR=1's order) capped (cap_heaters()), trimmed of columns the cap
-    emptied at its ends, and in `direction`'s order: (data, columns, first)."""
-    cap_heaters(out, lo)
+def line_caps(cap):
+    """(F3's, F5's) of cap_heaters()'s `cap`: one number for both lines, or a pair."""
+    return tuple(cap) if isinstance(cap, (tuple, list)) else (cap, cap)
+
+
+def _job_part(out, lo, direction, cap=HEATERS_PER_PULSE, slot=HEATERS_PER_SLOT):
+    """`out` (columns from drawing column `lo` on, DIR=1's order) capped (cap_heaters() at `cap` and `slot`), trimmed
+    of columns the cap emptied at its ends, and in `direction`'s order: (data, columns, first)."""
+    cap_heaters(out, lo, cap, slot)
     a = (len(out) - len(out.lstrip(b"\0"))) // NOZDATA_SIZE
     b = (len(out.rstrip(b"\0")) + NOZDATA_SIZE - 1) // NOZDATA_SIZE
     if b <= a:
@@ -1458,12 +1534,14 @@ def cap_heaters(out, first, cap=HEATERS_PER_PULSE, slot=HEATERS_PER_SLOT):
     """Keeps at most `cap` heaters firing on each fire pulse of the nozzle data `out` (a bytearray of columns,
     changed in place; `first` the drawing column of its first), and at most `slot` on a packet's two pulses together: a
     fire pulse is one packet (board byte % 14) on one fire line (F3: bits 0-3, F5: bits 4-7), across the colours.
+    `cap` may be a pair, (F3's, F5's).
     Where both lines are over `slot` together, F5 gives way first (3 + 2 printed solid). Where more want to fire than
     a line keeps (m), they share by an even rotation, the same for both columns of a pair (drawing columns 2k, 2k + 1):
     the wanted heaters in (bit, colour) order, keeping want[(s + t) % n] for t < m with s = (pair * m) % n. A fire
     left on its own in a column (none in the columns either side), which doesn't eject, is dropped. Returns the fires
     dropped."""
     n = len(out) // NOZDATA_SIZE
+    cap3, cap5 = line_caps(cap)
     dropped = 0
     for i in range(n):
         base = i * NOZDATA_SIZE
@@ -1472,9 +1550,9 @@ def cap_heaters(out, first, cap=HEATERS_PER_PULSE, slot=HEATERS_PER_SLOT):
             v = (out[base + k], out[base + 14 + k], out[base + 28 + k])
             n3 = _NIBBLES[v[0]] + _NIBBLES[v[1]] + _NIBBLES[v[2]]
             n5 = _HIGH_NIBBLES[v[0]] + _HIGH_NIBBLES[v[1]] + _HIGH_NIBBLES[v[2]]
-            if n3 <= cap and n5 <= cap and n3 + n5 <= slot:
+            if n3 <= cap3 and n5 <= cap5 and n3 + n5 <= slot:
                 continue
-            m3, m5 = min(n3, cap), min(n5, cap)
+            m3, m5 = min(n3, cap3), min(n5, cap5)
             while m3 + m5 > slot:
                 if m5 >= m3:
                     m5 -= 1
@@ -1505,11 +1583,12 @@ def cap_heaters(out, first, cap=HEATERS_PER_PULSE, slot=HEATERS_PER_SLOT):
 class JobStreamer:
     """Uploads a job's passes to the board in order, in a thread, ahead of printing: at most `ahead_bytes` and
     `ahead_passes` of them stored and not yet printed (consume()), but always the next one. `put(payload)` stores one
-    (a data port PUT), `delete(layer, pass)` drops one never printed (skipped)."""
+    (a data port PUT), `delete(layer, pass)` drops one never printed (skipped). `slot`: the heater cap's at the
+    board's fire gap (heater_slot())."""
 
     def __init__(self, path, records, registration, put, delete, ahead_bytes, ahead_passes, skew=None,
-                 stopping=None):
-        self.path, self.records, self.registration, self.skew = path, records, registration, skew
+                 stopping=None, slot=HEATERS_PER_SLOT):
+        self.path, self.records, self.registration, self.skew, self.slot = path, records, registration, skew, slot
         self.put, self.delete = put, delete
         self.ahead_bytes, self.ahead_passes = ahead_bytes, ahead_passes
         self.lock = threading.Lock()
@@ -1606,7 +1685,7 @@ class JobStreamer:
     def _upload(self, f, n):
         rec = self.records[n]
         parts = job_pass_parts(job_record_data(f, rec), rec['colours'], rec['columns'], rec['dir'],
-                               self.registration, self.skew)
+                               self.registration, self.skew, self.slot)
         if not parts:
             raise JobError("pass %d has no dots left after the colour registration and the heater cap" % (n,))
         ready = []
@@ -1747,12 +1826,29 @@ class PolyDye:
         self.prewarm_gen = 0
         self.print_live = False  # a print turned live ink on and hasn't been seen to end yet (_check_print_end())
         self.live_off_pending = False  # a test's cleanup failed: live ink may be on (_check_print_end() retries)
+        # ...and its template, pulse and fire gap to put back (_send_cartridge()'s), once the board is idle with live
+        # ink off (_retry_restore()); a job won't load before (its heater cap follows the fire gap).
+        self.restore_pending = None
         self.dpi = config.getfloat('dpi', 847., above=0.)
         self.pass_speed = config.getfloat('pass_speed', 59.5, above=0.)
         self.travel_speed = config.getfloat('travel_speed', 150., above=0.)
         self.extra_run_up = config.getfloat('extra_run_up', 1., minval=0.)
         self.settle_time = config.getfloat('settle_time', None, minval=0.)
         self.min_lead_time = config.getfloat('min_lead_time', 0.025, minval=0.005)
+        # Fire gap in us (board firmware with POLYDYE_FIRE_GAP_MAX): F5 fires this much later after F3 than the stock
+        # timing, in passes and spits, so a packet may fire HEATERS_PER_PULSE on each line and no pass is split by fire
+        # line (heater_slot()). Unset leaves the board's own (0, the stock timing); POLYDYE_FIRE_GAP_TEST shows the gap
+        # the head needs.
+        self.fire_gap = config.getfloat('fire_gap_us', None, minval=0.)
+        if self.fire_gap is not None:
+            words = fire_gap_words(self.fire_gap)
+            if words > FIRE_GAP_MAX:
+                raise config.error("[polydye] fire_gap_us: %g us is more than the longest fire gap, %.2f us (%d bus "
+                                   "words)" % (self.fire_gap, fire_gap_us(FIRE_GAP_MAX), FIRE_GAP_MAX))
+            # Unset, the board keeps its own pulse (maybe a longer one set before a RESTART): the longest, to be safe.
+            error = words and fire_gap_fit_error(words, self.pulse_words or PULSE_MAX, self.dpi, self.pass_speed)
+            if error:
+                raise config.error("[polydye] fire_gap_us: %s" % (error,))
         self.query_pass_cmd = self.query_cmd = None
         self.schedule_cmd = self.mode_cmd = self.cancel_cmd = None
         self.set_template_cmd = self.set_pulse_cmd = self.query_cartridge_cmd = None
@@ -1764,6 +1860,8 @@ class PolyDye:
         self.warm_max_words, self.warm_max_us, self.warm_max_s = WARM_OLD_WORDS, WARM_OLD_US, WARM_OLD_S
         self.warm_duty_ppm = None
         self.set_clock_cmd = self.query_clock_cmd = None
+        self.set_fire_gap_cmd = self.query_fire_gap_cmd = None  # board firmware with the fire gap
+        self.fire_gap_max = None  # its longest, in bus words (POLYDYE_FIRE_GAP_MAX)
         self.bus_hz_check = None  # (% fast, % slow) the board refuses to fire at; None: it doesn't check the clock
         # Seconds the board keeps an unused boost on (POLYDYE_BOOST_IDLE_S): board firmware with it takes template and
         # pulse changes with the boost on, so tests leave the boost on (live ink off) afterwards, as the stock firmware
@@ -1808,6 +1906,8 @@ class PolyDye:
         gcode.register_command('POLYDYE_ALIGN', self.cmd_POLYDYE_ALIGN, desc=self.cmd_POLYDYE_ALIGN_help)
         gcode.register_command('POLYDYE_TEST_PAGE', self.cmd_POLYDYE_TEST_PAGE,
                                desc=self.cmd_POLYDYE_TEST_PAGE_help)
+        gcode.register_command('POLYDYE_FIRE_GAP_TEST', self.cmd_POLYDYE_FIRE_GAP_TEST,
+                               desc=self.cmd_POLYDYE_FIRE_GAP_TEST_help)
         gcode.register_command('POLYDYE_OFFSET_PRINT', self.cmd_POLYDYE_OFFSET_PRINT,
                                desc=self.cmd_POLYDYE_OFFSET_PRINT_help)
         gcode.register_command('POLYDYE_SAVE', self.cmd_POLYDYE_SAVE, desc=self.cmd_POLYDYE_SAVE_help)
@@ -1878,6 +1978,25 @@ class PolyDye:
                 self.bus_hz_check = (constants['POLYDYE_BUS_HZ_FAST_PCT'], constants['POLYDYE_BUS_HZ_SLOW_PCT'])
             if 'POLYDYE_BOOST_IDLE_S' in constants:
                 self.boost_idle_s = int(constants['POLYDYE_BOOST_IDLE_S'])
+        # The fire gap came with POLYDYE_FIRE_GAP_MAX; sent on every connect, like the template and pulse.
+        if 'POLYDYE_FIRE_GAP_MAX' in constants:
+            self.fire_gap_max = int(constants['POLYDYE_FIRE_GAP_MAX'])
+            self.set_fire_gap_cmd = self.mcu.lookup_command("polydye_set_fire_gap oid=%c words=%c", cq=cq)
+            self.query_fire_gap_cmd = self.mcu.lookup_query_command("polydye_query_fire_gap oid=%c", FIRE_GAP,
+                                                                    oid=self.oid, cq=cq)
+        if self.fire_gap is not None:
+            words = fire_gap_words(self.fire_gap)
+            if self.set_fire_gap_cmd is None:
+                if words:  # 0 is what older board firmware does anyway
+                    raise self.printer.config_error(
+                        "[polydye] fire_gap_us needs newer PolyDye board firmware. Update it from the PolyDye page "
+                        "(Board firmware: Update to bundled firmware), or remove fire_gap_us from polydye.cfg.")
+            elif words > self.fire_gap_max:
+                raise self.printer.config_error(
+                    "[polydye] fire_gap_us: this PolyDye board firmware takes at most %.2f us"
+                    % (fire_gap_us(self.fire_gap_max),))
+            else:
+                self.mcu.add_config_cmd("polydye_set_fire_gap oid=%d words=%d" % (self.oid, words), is_init=True)
         # Board firmware before the cartridge commands still works, just without a template or pulse choice.
         if self.mcu.try_lookup_command("polydye_query_cartridge oid=%c") is None:
             for option, value in (('cartridge_template', self.cartridge_template), ('pulse_words', self.pulse_words)):
@@ -1975,9 +2094,47 @@ class PolyDye:
                 if not self.printer.is_shutdown() and not self.query_failing:
                     logging.exception("polydye: status query failed (not logged again until one succeeds)")
                 self.query_failing = True
+            if self.restore_pending is not None and not self.query_failing:
+                try:
+                    self._retry_restore()
+                except Exception:
+                    logging.warning("polydye: putting the cartridge settings back failed again; retrying")
         if self.printer.is_shutdown():
             return self.printer.get_reactor().NEVER
         return eventtime + STATUS_INTERVAL
+
+    def _retry_restore(self):
+        """Puts back the cartridge settings a test's cleanup couldn't (restore_pending), once the board is seen idle
+        with live ink off (the last status), then reads them back: done once the board reports them, which also
+        brings the status POLYDYE_PASS checks against up to date. Says so."""
+        st = self.last_status
+        # Nothing left: the status poll may have finished it while a command waited for its query.
+        if (self.restore_pending is None or not st or self.live_off_pending or st.get('live') or st.get('running')
+                or st.get('queued') or (st.get('boost') and self.boost_idle_s is None)):
+            return
+        want = self.restore_pending
+        self._send_cartridge(st, *want)
+        st = self._fresh_status()  # after the settings: the same command queue
+        if any(v is not None and st.get(key) != v
+               for key, v in zip(('cartridge_template', 'pulse_words', 'fire_gap_words'), want)):
+            return  # not taken (yet): tried again
+        self.restore_pending = None
+        msg = "PolyDye: the cartridge settings are back as before the last test"
+        logging.info("polydye: %s", msg)
+        self.printer.lookup_object('gcode').respond_info(msg)
+
+    def _finish_restore(self, gcmd, cmd):
+        """Before a command that takes the board's settings as they are (a test that puts them back afterwards, an ink
+        job, a settings change, live ink on): puts back what a failed test cleanup left (restore_pending) now, live ink
+        off first, or refuses while the board isn't idle."""
+        if self.restore_pending is None:
+            return
+        self._check_print_end(self.printer.get_reactor().monotonic())
+        self._fresh_status()
+        self._retry_restore()
+        if self.restore_pending is not None:
+            raise gcmd.error("%s: the last test couldn't put the cartridge settings back yet (the board isn't idle "
+                             "with live ink off); try again in a moment" % (cmd,))
 
     def _printing(self, eventtime):
         """Whether a print is running or paused (virtual_sdcard, print_stats)."""
@@ -2017,12 +2174,14 @@ class PolyDye:
         self.querying = True
         try:
             params = self.query_cmd.send([self.oid])
-            template = pulse = level = clock = None
+            template = pulse = level = clock = gap = None
             if self.query_cartridge_cmd is not None:
                 cart = self.query_cartridge_cmd.send([self.oid])
                 n = cart['template']
                 template = BOARD_TEMPLATES[n] if n < len(BOARD_TEMPLATES) else str(n)
                 pulse = cart['pulse']
+            if self.query_fire_gap_cmd is not None:
+                gap = self.query_fire_gap_cmd.send([self.oid])['words']
             # Only while a line is held, so the usual poll stays at two queries.
             if self.query_level_cmd is not None and params['flags'] & FLAG_LEVEL:
                 lv = self.query_level_cmd.send([self.oid])
@@ -2054,6 +2213,8 @@ class PolyDye:
         }
         if clock is not None:
             self.last_status.update(bus_clock=bus_clock, bus_hz=bus_hz, bus_hz_measured=clock['measured_hz'] or None)
+        if gap is not None:  # absent: board firmware without the fire gap
+            self.last_status.update(fire_gap_words=gap, fire_gap_us=round(gap * 1e6 / bus_hz, 2))
         if self.query_level_cmd is not None:
             self.last_status['level'] = level  # None: no line held. Absent: the board can't do the signal check
         return self.last_status
@@ -2077,6 +2238,11 @@ class PolyDye:
         direction = gcmd.get_int('DIR', 1)
         if direction not in (1, -1):
             raise gcmd.error("POLYDYE_PASS: DIR must be 1 or -1")
+        # The board still has a failed test's settings (live ink may be on): nothing prints with them.
+        if self.restore_pending is not None:
+            raise gcmd.error("POLYDYE_PASS: the last test couldn't put the cartridge settings back yet; PolyDye puts "
+                             "them back once the board is idle with live ink off (POLYDYE_ENABLE does it at once), so "
+                             "try again in a moment")
         info = self.query_pass_cmd.send([self.oid, layer, pass_num])
         if not info['present']:
             raise gcmd.error("POLYDYE_PASS: layer %d pass %d has not been uploaded to the PolyDye board"
@@ -2101,12 +2267,24 @@ class PolyDye:
             self._warm_plan(gcmd, "POLYDYE_PASS", warm,
                             *pass_warm_settings(warm_words, warm_period, self.warm_pulse, self.warm_period_us))
 
+        speed = gcmd.get_float('SPEED', self.pass_speed, above=0.)
+        # With a fire gap the column is longer: a faster pass than pass_speed may not fit it (the board would shut
+        # down). Every gap the add-on sets fits pass_speed, so only another SPEED needs the board's own gap and pulse,
+        # read now; the status as last seen otherwise.
+        st = self.last_status
+        if speed != self.pass_speed and self.query_fire_gap_cmd is not None:
+            st = self._fresh_status()
+        gap = st.get('fire_gap_words')
+        if gap:
+            error = fire_gap_fit_error(gap, st.get('pulse_words') or PULSE_MAX, self.dpi, speed)
+            if error:
+                raise gcmd.error("POLYDYE_PASS: SPEED %g: %s" % (speed, error))
+
         toolhead = self.printer.lookup_object('toolhead')
         gcode_move = self.printer.lookup_object('gcode_move')
         eventtime = self.printer.get_reactor().monotonic()
         th_status = toolhead.get_status(eventtime)
         accel = th_status['max_accel']
-        speed = gcmd.get_float('SPEED', self.pass_speed, above=0.)
         if speed > th_status['max_velocity']:
             raise gcmd.error("POLYDYE_PASS: SPEED %.1f exceeds max_velocity %.1f"
                              % (speed, th_status['max_velocity']))
@@ -2578,6 +2756,8 @@ class PolyDye:
         if not live:
             self.prewarm_gen += 1  # live ink off drops the board's bursts, and one not sent yet
         if live:
+            # Not with a failed test's settings still on the board: put back first, or refused.
+            self._finish_restore(gcmd, cmd)
             st = self._fresh_status()
             self._check_current_pulse(gcmd, cmd, st)
             boost_was_on = st['boost']
@@ -2854,6 +3034,7 @@ class PolyDye:
         if missing:
             raise gcmd.error("%s: home %s first (G28)" % (cmd, "".join(missing).upper()))
         toolhead.wait_moves()
+        self._finish_restore(gcmd, cmd)
         st = self._fresh_status()
         if st['running'] or st['queued']:
             raise gcmd.error("%s: wait for queued passes to finish" % (cmd,))
@@ -2917,7 +3098,8 @@ class PolyDye:
                     raise gcmd.error("%s: the pass at X=%.1f Y=%.1f would take the toolhead to X=%.1f Y=%.1f, beyond "
                                      "the axis limits; choose another X, Y" % (cmd, x, y, px, py))
 
-    def _run_cal(self, gcmd, cmd, st, prints, sponge, setup=None, z=None, warm=None, ink_motion=False):
+    def _run_cal(self, gcmd, cmd, st, prints, sponge, setup=None, z=None, warm=None, ink_motion=False,
+                 before_pass=None):
         """Prints `prints` ((pass, X, Y, direction) of layer CAL_LAYER) with live ink, after the G-code `setup` (the
         plaque), a move to `z` and, with `sponge` ((X, Z hop) of the wipe sponge), a head warm-up over the sponge: up by
         its Z hop (within the Z axis), across, warm, back over the first pass at that height and down. The warm-up has
@@ -2925,11 +3107,12 @@ class PolyDye:
         and period, then that long of the stock pattern at the template and pulse the passes print with, in the same
         board run (POLYDYE_SPIT WARM=). The passes don't warm again; with `ink_motion` they move gently
         (POLYDYE_INK_MOTION, its own: one lowered from the console before carries on afterwards, from the limits it
-        set). Afterwards, also after an error, the motion limits are put back, live ink goes off
-        (_restore_after_test()) and the G-code state back, and after a plaque the hotend and the part fan are off."""
+        set). `before_pass(i)` runs before each print i is queued. Afterwards, also after an error, the motion limits
+        are put back, live ink goes off and the template, pulse and fire gap back as in `st` (_restore_after_test()),
+        the G-code state back, and after a plaque the hotend and the part fan are off."""
         toolhead = self.printer.lookup_object('toolhead')
         run = self.printer.lookup_object('gcode').run_script_from_command
-        before = (st['cartridge_template'], st['pulse_words'])
+        before = (st['cartridge_template'], st['pulse_words'], st.get('fire_gap_words'))
         lowered, outer = False, self.ink_motion
         run("SAVE_GCODE_STATE NAME=polydye_cal")
         try:
@@ -2948,7 +3131,7 @@ class PolyDye:
                 if spit:
                     run("POLYDYE_SPIT SECONDS=%g WARM=%g WARM_PULSE=%d WARM_PERIOD_US=%d%s CONFIRM=1"
                         % (spit, seconds, self.warm_pulse, self.warm_period_us,
-                           "" if None in before else " TEMPLATE=%s PULSE=%d" % before))
+                           "" if None in before[:2] else " TEMPLATE=%s PULSE=%d" % before[:2]))
                 else:
                     run("POLYDYE_WARM SECONDS=%g WARM_PULSE=%d WARM_PERIOD_US=%d CONFIRM=1"
                         % (seconds, self.warm_pulse, self.warm_period_us))
@@ -2960,6 +3143,8 @@ class PolyDye:
                 lowered, self.ink_motion = True, None
                 run("POLYDYE_INK_MOTION")
             for i, (n, x, y, direction) in enumerate(prints):
+                if before_pass is not None:
+                    before_pass(i)
                 if i and i % 4 == 0:
                     toolhead.wait_moves()  # the board queues at most 8 passes
                 run("POLYDYE_PASS LAYER=%d PASS=%d X=%.3f Y=%.3f DIR=%d WARM=0" % (CAL_LAYER, n, x, y, direction))
@@ -3056,6 +3241,31 @@ class PolyDye:
 
     def cmd_POLYDYE_TEST_PAGE(self, gcmd):
         cmd = "POLYDYE_TEST_PAGE"
+        st, x, y, z, warm, prime, sponge = self._paper_test_start(gcmd, cmd)
+        reg, skew = self.registration, self._skew()
+        slot = heater_slot(st.get('fire_gap_words'))
+        pages = [(d, direction, px, drawing_parts(d, direction, reg, skew, slot=slot))
+                 for d, direction, px in test_page_drawings(self.dpi, self.nozzle_dpi, reg)]
+        built, prints, _, paper = self._paper_layout(gcmd, cmd, pages, x, y)
+        self._upload_cal(gcmd, cmd, built)
+        gcmd.respond_info("PolyDye test page, live ink on paper: %d passes (%d on the board) centred on X=%.1f Y=%.1f, "
+                          "Z=%.2f. Its ink spans X %.0f-%.0f, Y %.0f-%.0f: the paper must cover that with %g mm to "
+                          "spare" % (len(pages), len(built), x, y, z, paper[0], paper[1], paper[2], paper[3],
+                                     ALIGN_PAPER_MARGIN))
+        self._run_cal(gcmd, cmd, st, prints, sponge, z=z, warm=(warm, prime), ink_motion=True)
+        gcmd.respond_info(
+            "PolyDye test page done. Seen from the front, left to right: cyan, magenta and yellow, each with its "
+            "nozzle check at the front (9 staircases of 8 dashes, one per nozzle 14-85: a missing or faint dash is a "
+            "nozzle that didn't fire; every staircase should look alike) and a solid square behind it; red, green "
+            "and blue squares at the back (%s); on the right two sweeps of blue whose join should show no line. Pale "
+            "or streaky squares: a cold head or a weak fire line; a line at the join: check direction_trim (alignment "
+            "page, row D)." % ("two inks, each one pass at the fire gap" if st.get('fire_gap_words') else
+                               "two inks, each printed as two passes, one per fire line",))
+
+    def _paper_test_start(self, gcmd, cmd):
+        """A paper test's (the test page's, the fire gap test's) checks and settings, before anything moves: X, Y
+        (default: centred where the cartridge reaches), Z (TEST_Z), WARM (prewarm_seconds) and PRIME (prime_seconds)
+        over the wipe sponge. Returns (status, x, y, z, warm, prime, sponge: (X, Z hop) or None)."""
         if self.pass_axis != 'y':
             raise gcmd.error("%s: needs pass_axis: y, like the colour prints it checks" % (cmd,))
         z = gcmd.get_float('Z', TEST_Z, minval=0.2)
@@ -3084,16 +3294,23 @@ class PolyDye:
         y = self._ink_centre(1) if y is None else y
         sponge = self._sponge_spot(gcmd, cmd, "the head warms and primes over the wipe sponge") if warm or prime \
             else None
+        return st, x, y, z, warm, prime, sponge
+
+    def _paper_layout(self, gcmd, cmd, pages, x, y):
+        """Lays a paper test's passes out centred on X, Y: `pages` [(drawing, direction, x, parts)], x the pass's X
+        from the first's and parts the board passes that print it (drawing_parts()). Refuses passes the toolhead can't
+        reach. Returns (built [(data, columns)] to upload, prints [(pass, X, Y, direction)] in order, the page each
+        print is of, the paper its ink spans on the bed: (X0, X1, Y0, Y1))."""
         pitch, nozzle, wide = 25.4 / self.dpi, 25.4 / self.nozzle_dpi, 25.4 / self.nozzle_dpi * 1.1
-        skew = self._skew()
-        built, layout, across = [], [], []
-        for d, direction, px in test_page_drawings(self.dpi, self.nozzle_dpi, reg):
+        built, layout, across, owner = [], [], [], []
+        for k, (d, direction, px, parts) in enumerate(pages):
             p0, p1 = min(p for _, _, p in d.dots), max(p for _, _, p in d.dots)
             across.append((px, p0, p1))
-            for data, columns, first in drawing_parts(d, direction, reg, skew):
+            for data, columns, first in parts:
                 ends = (first, first + columns - 1) if direction > 0 else (first - columns + 1, first)
                 layout.append((len(built), px, first, direction, ends))
                 built.append((data, columns))
+                owner.append(k)
         # Centred on X, Y; the paper it needs with the nozzle row up to 10 % wider than nozzle_dpi, and the reverse
         # passes' ink moved by direction_trim.
         x0 = min(px - (p1 - SKEW_PIVOT) * nozzle for px, p0, p1 in across)
@@ -3108,19 +3325,80 @@ class PolyDye:
                  max(px + (SKEW_PIVOT - p0) * wide for px, p0, p1 in across) + dx + base[0],
                  min(dy + e[0] * pitch + t for (*_, e), t in zip(layout, trim)) + base[1],
                  max(dy + e[1] * pitch + t for (*_, e), t in zip(layout, trim)) + base[1])
+        return built, prints, owner, paper
+
+    cmd_POLYDYE_FIRE_GAP_TEST_help = ("LIVE INK, on paper only: which fire gap lets both fire lines fire 4 heaters: "
+                                      "rows of red, green and blue squares (4 + 4 heaters) centred on X, Y at Z (1), "
+                                      "front to back the stock timing, the stock timing with F5 capped to 2 (the "
+                                      "control) and each fire gap in GAPS (us, default 7,15), after a WARM s warm-up "
+                                      "and a PRIME s prime over the wipe sponge; the fire gap is put back afterwards")
+
+    def cmd_POLYDYE_FIRE_GAP_TEST(self, gcmd):
+        cmd = "POLYDYE_FIRE_GAP_TEST"
+        if self.set_fire_gap_cmd is None:
+            raise gcmd.error("%s: needs PolyDye board firmware with the fire gap; update it from the PolyDye page "
+                             "(Board firmware: Update to bundled firmware)" % (cmd,))
+        if self.job is not None:
+            raise gcmd.error("%s: an ink job is loaded, its passes capped for the fire gap it was loaded with; run the "
+                             "test once it has ended (POLYDYE_JOB_END)" % (cmd,))
+        text = gcmd.get('GAPS', ",".join("%g" % (g,) for g in GAP_TEST_US))
+        try:
+            gaps = [fire_gap_words(float(v)) for v in text.split(',')]
+        except (ValueError, OverflowError):
+            gaps = []
+        if not 1 <= len(gaps) <= GAP_TEST_MAX_GAPS or min(gaps) < 1 or max(gaps) > self.fire_gap_max:
+            raise gcmd.error("%s: GAPS must be 1-%d fire gaps in us, separated by commas, each %.2f-%.2f us (e.g. "
+                             "7,15), not %r" % (cmd, GAP_TEST_MAX_GAPS, fire_gap_us(1), fire_gap_us(self.fire_gap_max),
+                                                text))
+        st, x, y, z, warm, prime, sponge = self._paper_test_start(gcmd, cmd)
+        for g in gaps:
+            if fire_gap_fit_error(g, st['pulse_words'], self.dpi, self.pass_speed):
+                raise gcmd.error("%s: %s" % (cmd, fire_gap_fit_error(g, st['pulse_words'], self.dpi, self.pass_speed)))
+        # (fire gap, cap): the stock timing at 4 + 4, the control at 4 + 2, then 4 + 4 at each gap; never split.
+        full = (HEATERS_PER_PULSE, HEATERS_PER_PULSE)
+        rows = [(0, full), (0, (HEATERS_PER_PULSE, GAP_TEST_CONTROL_F5))] + [(g, full) for g in gaps]
+        reg, skew = self.registration, self._skew()
+        pages = []
+        for r, d, direction, px in gap_test_drawings(self.dpi, self.nozzle_dpi, len(rows)):
+            cap = rows[r][1]
+            pages.append((d, direction, px, drawing_parts(d, direction, reg, skew, cap, sum(cap))))
+        built, prints, owner, paper = self._paper_layout(gcmd, cmd, pages, x, y)
+        names = ["stock timing", "stock timing, F5 at %d (control)" % (GAP_TEST_CONTROL_F5,)] + [
+            "gap %.2f us" % (fire_gap_us(g),) for g in gaps]
         self._upload_cal(gcmd, cmd, built)
-        gcmd.respond_info("PolyDye test page, live ink on paper: %d passes (%d on the board) centred on X=%.1f Y=%.1f, "
-                          "Z=%.2f. Its ink spans X %.0f-%.0f, Y %.0f-%.0f: the paper must cover that with %g mm to "
-                          "spare" % (len(across), len(built), x, y, z, paper[0], paper[1], paper[2], paper[3],
-                                     ALIGN_PAPER_MARGIN))
-        self._run_cal(gcmd, cmd, st, prints, sponge, z=z, warm=(warm, prime), ink_motion=True)
+        gcmd.respond_info("PolyDye fire gap test, live ink on paper: %d rows of red, green and blue squares (%d "
+                          "passes) centred on X=%.1f Y=%.1f, Z=%.2f, front to back: %s. Its ink spans X %.0f-%.0f, "
+                          "Y %.0f-%.0f: the paper must cover that with %g mm to spare"
+                          % (len(rows), len(built), x, y, z, "; ".join(names), paper[0], paper[1], paper[2], paper[3],
+                             ALIGN_PAPER_MARGIN))
+        toolhead = self.printer.lookup_object('toolhead')
+        run = self.printer.lookup_object('gcode').run_script_from_command
+        # Each row's first print (pages come three to a row): the gap changes there, with live ink off.
+        starts = {}
+        for i, k in enumerate(owner):
+            starts.setdefault(k // 3, (i, rows[k // 3][0]))
+        starts = dict(starts.values())
+        board = {'gap': st.get('fire_gap_words')}
+
+        def row_gap(i):
+            if i in starts and starts[i] != board['gap']:
+                toolhead.wait_moves()
+                self._live_off()
+                self.set_fire_gap_cmd.send([self.oid, starts[i]])
+                board['gap'] = starts[i]
+                self.last_status = dict(self.last_status, fire_gap_words=starts[i])  # for POLYDYE_PASS's check
+                run("POLYDYE_ENABLE LIVE=1")
+        self._run_cal(gcmd, cmd, st, prints, sponge, z=z, warm=(warm, prime), ink_motion=True, before_pass=row_gap)
+        if self.restore_pending is not None:
+            raise gcmd.error("%s: printed, but the fire gap couldn't be put back yet (%s): PolyDye puts it back once "
+                             "the board is idle with live ink off, and no ink job loads before"
+                             % (cmd, cartridge_text(self.last_status)))
         gcmd.respond_info(
-            "PolyDye test page done. Seen from the front, left to right: cyan, magenta and yellow, each with its "
-            "nozzle check at the front (9 staircases of 8 dashes, one per nozzle 14-85: a missing or faint dash is a "
-            "nozzle that didn't fire; every staircase should look alike) and a solid square behind it; red, green "
-            "and blue squares at the back (two inks, each printed as two passes, one per fire line); on the right two "
-            "sweeps of blue whose join should show no line. Pale or streaky squares: a cold head or a weak fire line; "
-            "a line at the join: check direction_trim (alignment page, row D).")
+            "PolyDye fire gap test done; %s. Front to back: %s. In each square the left half (towards -X) is fire "
+            "line F5, the right half F3. The stock timing's F5 half streaky where the control's is solid but lighter: "
+            "F5 is short of the rail after F3. The smallest gap whose squares are solid in both halves is the one to "
+            "use: fire_gap_us in polydye.cfg (POLYDYE_CARTRIDGE GAP= until a restart). The gap rows come last, with "
+            "the head coolest." % (cartridge_text(self._fresh_status()), "; ".join(names)))
 
     cmd_POLYDYE_OFFSET_PRINT_help = ("PLA and LIVE INK: a PLA plaque with a cross-shaped groove centred on X, Y "
                                      "(LAYERS of LAYER_HEIGHT, the groove in the top 3; heats to EXTRUDER_TEMP and "
@@ -3250,6 +3528,9 @@ class PolyDye:
         except (JobError, OSError) as e:
             raise gcmd.error("%s: %s" % (cmd, e))
         self._check_job(gcmd, cmd, header, records)
+        # A test's settings not put back yet: now, if the board is idle with live ink off. The job's heater cap follows
+        # the fire gap.
+        self._finish_restore(gcmd, cmd)
         # The G-code's bursts and primes: refused now rather than in the middle of the print.
         if header['prewarms'] and self.prewarm_cmd is None:
             raise gcmd.error("%s: the job's prewarm bursts (POLYDYE_PREWARM) need newer PolyDye board firmware; update "
@@ -3282,18 +3563,21 @@ class PolyDye:
         except (DataPortError, OSError, ValueError) as e:
             raise gcmd.error("%s: %s" % (cmd, e))
         ahead = max(min(JOB_AHEAD_BYTES, free // 2) if free else JOB_AHEAD_BYTES, largest['size'])
+        # The passes are capped as they go up, at the fire gap the board has now: it can't change while the job is
+        # loaded (POLYDYE_CARTRIDGE).
+        gap = 0 if self.query_fire_gap_cmd is None else self.query_fire_gap_cmd.send([self.oid])['words']
         stopping = threading.Event()
         streamer = JobStreamer(path, records, self.registration,
                                lambda payload: self._data_sync(DATA_PUT, payload, JOB_UPLOAD_RATE, stopping),
                                lambda layer, n: self._data_sync(DATA_DELETE, struct.pack("<HH", layer, n), None,
                                                                 stopping),
-                               ahead, JOB_AHEAD_PASSES, self._skew(), stopping)
+                               ahead, JOB_AHEAD_PASSES, self._skew(), stopping, heater_slot(gap))
         self.job = {'streamer': streamer, 'header': header, 'records': records, 'from_print': from_print,
                     'path': path, 'since_wait': 0}
         streamer.start()
         size = sum(rec['size'] for rec in records)
-        logging.info("polydye: ink job %s: %d passes on %d layers, up to %d kB; %d kB ahead", path, len(records),
-                     header['layers'], size // 1024, ahead // 1024)
+        logging.info("polydye: ink job %s: %d passes on %d layers, up to %d kB; %d kB ahead; fire gap %d words", path,
+                     len(records), header['layers'], size // 1024, ahead // 1024, gap)
         gcmd.respond_info("PolyDye ink job: %d passes on %d layers (%.1f MB), going to the board as the print runs"
                           % (len(records), header['layers'], size / 1e6))
 
@@ -3491,9 +3775,10 @@ class PolyDye:
             self.offset_x, self.offset_y, self.direction_trim, dx, dy, dtrim)
         self._respond_offsets(gcmd)
 
-    cmd_POLYDYE_CARTRIDGE_help = ("Set the cartridge waveform template (TEMPLATE=color_b_late|black_a|black_b) and "
-                                  "fire pulse (PULSE=6..8 bus words, 2.10-2.80 us at the stock clock) until the next "
-                                  "restart; live ink must be off and the board idle")
+    cmd_POLYDYE_CARTRIDGE_help = ("Set the cartridge waveform template (TEMPLATE=color_b_late|black_a|black_b), "
+                                  "fire pulse (PULSE=6..8 bus words, 2.10-2.80 us at the stock clock) and fire gap "
+                                  "(GAP=0..16.8 us: F5 that much later after F3; 0 is the stock timing) until the "
+                                  "next restart; live ink must be off and the board idle")
 
     def cmd_POLYDYE_CARTRIDGE(self, gcmd):
         cmd = "POLYDYE_CARTRIDGE"
@@ -3507,24 +3792,44 @@ class PolyDye:
         pulse = gcmd.get_int('PULSE', None)
         if pulse is not None and pulse_range_error(pulse):
             raise gcmd.error("%s: %s" % (cmd, pulse_range_error(pulse)))
+        gap = gcmd.get_float('GAP', None, minval=0.)
+        if gap is not None:
+            if self.set_fire_gap_cmd is None:
+                raise gcmd.error("%s: GAP needs newer PolyDye board firmware; update it from the PolyDye page (Board "
+                                 "firmware: Update to bundled firmware)" % (cmd,))
+            gap = fire_gap_words(gap)
+            if gap > self.fire_gap_max:
+                raise gcmd.error("%s: GAP is at most %.2f us (%d bus words)"
+                                 % (cmd, fire_gap_us(self.fire_gap_max), self.fire_gap_max))
         self._refuse_clock(gcmd, cmd)
-        if name is not None or pulse is not None:
+        if name is not None or pulse is not None or gap is not None:
             # The board refuses a change while powered or busy by shutting down; check first for a plain error.
             self.printer.lookup_object('toolhead').wait_moves()
+            self._finish_restore(gcmd, cmd)  # then this change, not the other way round
             st = self._fresh_status()
             self._check_board_clock(gcmd, cmd, st)
             change = (name is not None and name != st['cartridge_template']) or (
-                pulse is not None and pulse != st['pulse_words'])
+                pulse is not None and pulse != st['pulse_words']) or (
+                gap is not None and gap != st.get('fire_gap_words'))
+            # A job's passes were capped for the fire gap when it was loaded (heater_slot()).
+            if gap is not None and gap != st.get('fire_gap_words') and self.job is not None:
+                raise gcmd.error("%s: an ink job is loaded, its passes capped for the fire gap it was loaded with; "
+                                 "change the gap once it has ended (POLYDYE_JOB_END)" % (cmd,))
+            new_gap = st.get('fire_gap_words') if gap is None else gap
+            fit = new_gap and fire_gap_fit_error(new_gap, st['pulse_words'] if pulse is None else pulse, self.dpi,
+                                                 self.pass_speed)
+            if fit:
+                raise gcmd.error("%s: %s" % (cmd, fit))
             # Also when nothing changes: the result must be within the limit, not just different.
             if pulse is None and pulse_limit_error(st['pulse_words']):
                 raise gcmd.error("%s: %s" % (cmd, pulse_limit_error(st['pulse_words'])))
             if change and ((st['boost'] and self.boost_idle_s is None) or st['live'] or st['running'] or st['queued']):
                 raise gcmd.error("%s: turn PolyDye off (POLYDYE_DISABLE) and let queued passes finish before changing "
-                                 "the template or the pulse" % (cmd,))
-            self._send_cartridge(st, name, pulse)
+                                 "the template, the pulse or the fire gap" % (cmd,))
+            self._send_cartridge(st, name, pulse, gap)
         st = self._fresh_status()
-        gcmd.respond_info("PolyDye %s (set cartridge_template and pulse_words in polydye.cfg to keep them after a "
-                          "restart)" % (cartridge_text(st),))
+        gcmd.respond_info("PolyDye %s (set cartridge_template, pulse_words%s in polydye.cfg to keep them after a "
+                          "restart)" % (cartridge_text(st), " and fire_gap_us" if self.set_fire_gap_cmd else ""))
 
     def _check_template(self, gcmd, cmd, template):
         """Refuses a template the add-on doesn't offer (one removed in the stock-only cleanup, say) or the board
@@ -3541,12 +3846,15 @@ class PolyDye:
         if clock is not None and clock_error(clock.lower()):
             raise gcmd.error("%s: %s" % (cmd, clock_error(clock.lower())))
 
-    def _send_cartridge(self, st, name, pulse):
-        """Sends the template and pulse where they differ from the board's (`st`); None leaves one as it is."""
+    def _send_cartridge(self, st, name, pulse, gap=None):
+        """Sends the template, pulse and fire gap (bus words) where they differ from the board's (`st`); None leaves
+        one as it is."""
         if name is not None and name != st['cartridge_template']:
             self.set_template_cmd.send([self.oid, BOARD_TEMPLATES.index(name)])
         if pulse is not None and pulse != st['pulse_words']:
             self.set_pulse_cmd.send([self.oid, pulse])
+        if gap is not None and gap != st.get('fire_gap_words') and self.set_fire_gap_cmd is not None:
+            self.set_fire_gap_cmd.send([self.oid, gap])
 
     cmd_POLYDYE_UPLOAD_TEST_PASS_help = ("Upload a test pattern pass (PATTERN=alternate|all|none|stock, each column "
                                          "REPEAT times; stock takes DENSITY, COLORS, FIRST, LAST and PER_PULSE too) to "
@@ -3740,6 +4048,7 @@ class PolyDye:
         self._check_not_printing(gcmd, cmd)
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.wait_moves()
+        self._finish_restore(gcmd, cmd)
         st = self._fresh_status()
         if st['running'] or st['queued']:
             raise gcmd.error("%s: wait for queued passes to finish" % (cmd,))
@@ -3889,6 +4198,7 @@ class PolyDye:
         self._check_not_printing(gcmd, cmd)
         reactor = self.printer.get_reactor()
         self.printer.lookup_object('toolhead').wait_moves()
+        self._finish_restore(gcmd, cmd)
         st = self._fresh_status()
         if st['running'] or st['queued']:
             raise gcmd.error("%s: wait for queued passes to finish" % (cmd,))
@@ -3896,10 +4206,12 @@ class PolyDye:
         before = (st['cartridge_template'], st['pulse_words'])
         # The columns have to fit their period: a longer pulse makes a longer column.
         fire_words = pulse if pulse is not None else before[1]
-        if period is not None and period < min_spit_period_us(fire_words):
-            raise gcmd.error("%s: PERIOD_US=%d is too short for a pulse of %d words: the column takes %d us on the "
+        gap = st.get('fire_gap_words') or 0
+        if period is not None and period < min_spit_period_us(fire_words, gap):
+            raise gcmd.error("%s: PERIOD_US=%d is too short for a pulse of %d words%s: the column takes %d us on the "
                              "bus, so the period must be at least %d us"
-                             % (cmd, period, fire_words, column_us(fire_words), min_spit_period_us(fire_words)))
+                             % (cmd, period, fire_words, " and a %.2f us fire gap" % (fire_gap_us(gap),) if gap else "",
+                                column_us(fire_words, gap), min_spit_period_us(fire_words, gap)))
         warm_columns = 0
         if warm:
             warm_words, warm_period, warm_columns = self._warm_plan(gcmd, cmd, warm, warm_words, warm_period)
@@ -4037,17 +4349,23 @@ class PolyDye:
 
     def _restore_after_test(self, before):
         """Always turn live ink off (and the boost, unless the board keeps it on between tests) and put the template
-        and pulse (`before`) back, even after an error (which is re-raised by the caller); problems here are logged so
-        they don't hide that error."""
+        and pulse, and the fire gap if given (`before`: _send_cartridge()'s), back, even after an error (which is
+        re-raised by the caller); problems here are logged so they don't hide that error."""
         if self.printer.is_shutdown():
             return
         try:
             self.printer.lookup_object('toolhead').wait_moves()
-            self._send_cartridge(self._live_off(), before[0], before[1])
+            self._send_cartridge(self._live_off(), *before)
             self._query_status()
         except Exception:
-            # Live ink may still be on: the status poll keeps trying to turn it off (_check_print_end()).
+            # Live ink may still be on: the status poll keeps trying to turn it off (_check_print_end()), then puts
+            # the settings back (_retry_restore()).
             self.live_off_pending = True
+            # An earlier failure's settings are the ones from before any test (a nested test's own "before" is what
+            # was left); this one fills in only what that didn't have (a spit inside the fire gap test: the gap).
+            old = list(self.restore_pending or ())
+            self.restore_pending = tuple([old[i] if i < len(old) and old[i] is not None else v
+                                          for i, v in enumerate(before)] + old[len(before):])
             logging.exception("polydye: test cleanup failed; live ink goes off at the next status poll")
 
     def _head_idle_s(self, eventtime):
@@ -4068,7 +4386,7 @@ class PolyDye:
                     offset_y=self.offset_y, direction_trim=self.direction_trim, spit_patterns=list(self.spit_patterns),
                     spit_random=self.spit_random_cmd is not None, warm_max_us=self.warm_max_us,
                     warm_max_s=self.warm_max_s, warm_duty_ppm=self.warm_duty_ppm, templates=list(self.templates),
-                    board_soft_reset=self.board_soft_reset,
+                    board_soft_reset=self.board_soft_reset, fire_gap_max=self.fire_gap_max,
                     auto_warm={'available': self.spit_run_cmd is not None and self.warm_duty_ppm is not None,
                                'seconds': self.warm_seconds, 'pulse_words': self.warm_pulse,
                                'period_us': self.warm_period_us, 'idle_time': self.warm_idle_time,

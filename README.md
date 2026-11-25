@@ -245,6 +245,7 @@ offset_y: -8.7
 #direction_trim: 0    # mm: moves the ink of reverse (DIR=-1) passes along the pass axis to meet forward passes
 #cartridge_template:  # color_b_late, black_a or black_b; default: the board's own (color_b_late)
 #pulse_words:         # fire pulse in bus words (0.35 us each): 6-8 (2.10-2.80 us); default: the board's own (6)
+#fire_gap_us:         # us F5 fires later after F3 than stock, 0-16.8 (see "Fire gap"); default: the board's own (0)
 #dpi: 847             # bus columns per inch along the pass (stock: 3,333 per 100 mm, each image column twice)
 #pass_speed: 59.5     # mm/s (stock's F3570: a column every 504 us at 847)
 #travel_speed: 150    # mm/s, moves to the start of each pass
@@ -293,6 +294,12 @@ the stock firmware's pulse and the board's default (Sprite_tm's 1.8 µs, rounded
 more energy into each drop, for when the board's boost rails are below the cartridge's nominal voltage. Klipper sends
 it on every connect, and the board's safety check limits every pulse to it. It needs the same board firmware as
 `cartridge_template`.
+
+`fire_gap_us` (opt-in, 0 to 16.8 µs) makes fire line F5 fire that much later after F3 than the stock timing, so each
+line may fire 4 heaters in a packet (see "Fire gap"). Klipper sends it, in whole bus words of 0.35 µs, on every connect.
+Unset leaves the board's own, 0: the stock timing. It needs this add-on's bundled board firmware; with older firmware
+Klipper refuses to start for anything over 0. It's refused if the longer column wouldn't fit the pass's column period
+(`dpi`, `pass_speed`) with the board's 20 µs margin, which only a faster `pass_speed` than stock's can cause.
 
 **Live ink is limited to 2.9 µs per pulse:** 100 % of the heater energy of Sprite_tm's 1.8 µs at the cartridge's 16 V,
 at the 12.6 V the PolyDye high rail measures (energy goes with V² × t). That is 8 words at the stock clock. The add-on
@@ -378,7 +385,9 @@ ink, one object at a time.
   pass (2 + 2 at 28–82; at wider positions it's capped instead, 3 + 3 at 14–84 becoming 3 + 2). Where more than
   allowed still want a pulse (three inks), they share by an even rotation, the same for both columns of a pair; a fire
   left on its own is dropped. The add-on does this when it sends a job's passes, after the colour
-  registration (which moves cyan one position).
+  registration (which moves cyan one position). With a fire gap (`fire_gap_us`, see "Fire gap") each line keeps its
+  own 4, so a packet takes 4 + 4 and nothing is split: the gap the board has when the job loads holds for the whole
+  job.
 - **Prewarm and prime:** `POLYDYE_PREWARM SECONDS=6` goes in about 6 s of moves before each ink layer's end (the moves
   timed as Klipper plans them; within 3 % of Orca's estimate), so the burst ends as the ink starts; a layer shorter
   than that warms through. `POLYDYE_PRIME` comes before the first ink layer's passes, and before any layer using a
@@ -447,15 +456,16 @@ If anything would print a pass wrongly, Klipper stops with a readable reason, fo
 | `POLYDYE_INK_MOTION [ACCEL=1000] [SCV=1] [RESTORE=1]` | Gentler moves for an ink block: acceleration and square corner velocity at most `ACCEL`, `SCV` (never raised), until `RESTORE=1` puts back the limits from before; a print that ends inside an ink block gets them back too. `polydye_post.py` puts it around each layer's ink |
 | `POLYDYE_JOB_END` | Stops the job's uploads and says what was printed (also done when the print ends, however it ends) |
 | `POLYDYE_CANCEL` | Drops passes that are scheduled but not started (for a cancel macro). The add-on does this itself, and turns live ink off, within 2 s of a print being cancelled or stopping with an error: the print's own `POLYDYE_ENABLE LIVE=0` never runs then (`CANCEL_PRINT` waits for the command running, such as a pass's warm-up) |
-| `POLYDYE_STATUS` | Board status: boost, live, passes printed and queued, worst column lateness, faults, stored passes, cartridge template, fire pulse, the last prewarm burst; and the offsets and direction trim in use |
+| `POLYDYE_STATUS` | Board status: boost, live, passes printed and queued, worst column lateness, faults, stored passes, cartridge template, fire pulse, fire gap (when not 0), the last prewarm burst; and the offsets and direction trim in use |
 | `POLYDYE_NUDGE [X=] [Y=] [TRIM=]` | Moves where the ink lands by `X`, `Y` mm on the bed, and the ink of reverse passes by `TRIM` mm along the pass axis (each at most ±5 mm), from the next pass on. Changes `offset_x`/`offset_y` (in the opposite direction: the offset is where the cartridge is) and `direction_trim` until the next restart |
 | `POLYDYE_OFFSET [X=] [Y=] [TRIM=] [CYAN_COLUMNS=] [CYAN_POSITIONS=] [YELLOW_COLUMNS=] [YELLOW_POSITIONS=] [SKEW=] [X_TICK=] [Y_TICK=] [SAVE=]` | Sets `offset_x`, `offset_y`, `direction_trim`, the colour registration and `nozzle_skew` (`SKEW`, ±0.2) until the next restart; without arguments, shows them. `X_TICK`, `Y_TICK` are the offset print's readings: they move the ink by that many ticks and store the offsets in `polydye.cfg` (`SAVE=0`: don't). `SAVE=1` stores the others too |
 | `POLYDYE_SAVE` | Stores the offsets, direction trim, colour registration and nozzle skew in use in `polydye.cfg` (next to `printer.cfg`; the colour registration and skew once they aren't zero) |
 | `POLYDYE_TEST_PAGE [X=] [Y=] [Z=1] [WARM=6] [PRIME=0.3]` | **Live ink, on paper only** (`pass_axis: y`). The test page (see "Test page"), centred on `X`, `Y` (default: centred where the cartridge reaches), at `Z`, after a `WARM` s warm-up (default `prewarm_seconds`) and a `PRIME` s prime (default `prime_seconds`) over the wipe sponge; 0 leaves either out. Refused during a print, or if the colour registration would move its squares off nozzle positions 14–85, before anything moves. Needs `data_port`, the `POLYDYE_WIPE` macro and this add-on's bundled board firmware. Doesn't home (`PD_TEST_PAGE` does) |
+| `POLYDYE_FIRE_GAP_TEST [X=] [Y=] [Z=1] [WARM=6] [PRIME=0.3] [GAPS=7,15]` | **Live ink, on paper only** (`pass_axis: y`). Which fire gap the head needs (see "Fire gap"): rows of red, green and blue squares, front to back the stock timing, its control and one row per gap in `GAPS` (1–4 gaps of 0.35–16.8 µs), like the test page's start and layout. Afterwards, also after an error, the board's fire gap goes back to what it was. Same refusals and needs as `POLYDYE_TEST_PAGE`, and board firmware with the fire gap. Doesn't home (`PD_FIRE_GAP_TEST` does) |
 | `POLYDYE_ALIGN_PRINT [X=] [Y=] [Z=] [SPACING=8]` | **Live ink, on paper only.** The alignment page (see "Calibration prints"), its rows `SPACING` mm apart across the pass axis, the first at `X`, `Y` (default: centred where the cartridge reaches). Moves to `Z` first if given. Doesn't home (`PD_ALIGN_PRINT` does) |
 | `POLYDYE_ALIGN [CYAN=] [YELLOW=] [DIRECTION=] [CYAN_X=] [YELLOW_X=] [SAVE=1]` | The alignment page's readings, the block number where each row lines up (−16 to 16; e.g. −11.5 between two blocks): corrects the colour registration and `direction_trim` and stores them in `polydye.cfg` (`SAVE=0`: until the next restart only) |
 | `POLYDYE_OFFSET_PRINT [X=] [Y=] [LAYERS=5] [LAYER_HEIGHT=0.2] [GAP=1] [EXTRUDER_TEMP=] [BED_TEMP=] [PLAQUE=1] [Z=]` | **PLA and live ink** (`pass_axis: y`). A PLA plaque with a cross-shaped groove in its top 3 layers, centred on `X`, `Y`, then ink scales across the groove from `GAP` mm above the plaque; read them with `POLYDYE_OFFSET X_TICK= Y_TICK=` (see "Calibration prints"). Heats to `EXTRUDER_TEMP` and `BED_TEMP` if given, else needs the hotend's target set for PLA; the hotend and the part fan are off afterwards, also after an error. `PLAQUE=0` prints only the ink onto a plaque printed before, at `Z` (default: its top, `LAYERS` × `LAYER_HEIGHT`, plus `GAP`). Refused if the scales wouldn't stay 6.5 mm inside the plaque at the `dpi` and `nozzle_dpi` set. Doesn't home (`PD_OFFSET_PRINT` does) |
-| `POLYDYE_CARTRIDGE [TEMPLATE=color_b_late\|black_a\|black_b] [PULSE=6..8]` | Switches the board's waveform template and fire pulse until the next restart (to compare them at the nozzle check); without arguments, shows them and the bus clock. Only with live ink off and no passes queued (with older board firmware, the boost off too) |
+| `POLYDYE_CARTRIDGE [TEMPLATE=color_b_late\|black_a\|black_b] [PULSE=6..8] [GAP=0..16.8]` | Switches the board's waveform template, fire pulse and fire gap (µs, see "Fire gap") until the next restart (to compare them at the nozzle check); without arguments, shows them and the bus clock. Only with live ink off and no passes queued (with older board firmware, the boost off too), and the gap not while an ink job is loaded: its passes were capped for the gap it loaded with |
 | `POLYDYE_UPLOAD_TEST_PASS [LAYER=0] [PASS=0] [COLUMNS=600] [PATTERN=alternate\|all\|none\|stock] [REPEAT=1] [DENSITY=] [COLORS=] [FIRST=] [LAST=] [PER_PULSE=]` | Uploads a test pass over the board's data port. `alternate` (the dry run's) fires every nozzle in every other column, `all` in every column and `none` in none; `stock` is the stock firmware's random pattern with its knobs (below; `REPEAT` defaults to 2 there, at most 16; colour cartridges only); `REPEAT` sends each column that many times in a row, so the pass has `COLUMNS` × `REPEAT` columns (at most 65535). Not during a print: it briefly blocks Klipper while it sends |
 | `POLYDYE_FIRE_TEST [X=70] [Y=60] [Z=] [SPACING=18] [STRIPES=…] [PATTERN=stock\|all] [DENSITY=] [REPEAT=] [COLORS=] [FIRST=] [LAST=] [PER_PULSE=] [WARM=0] [WARM_PULSE=] [WARM_PERIOD_US=] [COLUMNS=600] [UPLOAD=1] [LAYER=0] [PASS=0]` | **Live ink.** Prints one stripe per `TEMPLATE:PULSE` in `STRIPES` (e.g. `color_b_late:6,color_b_late:8`): a pass of `COLUMNS` columns along the pass axis, the stripes `SPACING` mm apart across it, the first at `X`, `Y`. The default is one stripe with the stock firmware's settings, `color_b_late:6`. `PATTERN=stock` (the default) prints the stock firmware's random pattern, the one that ejects ink on a cold head, with the spit test's knobs (below), on any board firmware: the add-on makes the columns. Without `WARM` each stripe's pass warms a cold head by itself (see "Automatic head warm-up"); `WARM` instead warms the head for that many seconds right before each stripe (its `POLYDYE_PASS WARM`, with the stripe's template, at the pass's warm spot, so only a short travel and the run-up come in between; board firmware with the warm-up), and `WARM=0` not at all. `UPLOAD=0` prints the pass already stored as `LAYER`, `PASS` instead. Moves to `Z` first if given. Refused during a print, also a paused one, and with a black stripe for `PATTERN=stock` (a colour pattern) before anything moves. Afterwards, also after an error, turns live ink off (and the boost too with older board firmware; with this add-on's bundled firmware the boost stays on, as stock keeps it, until `POLYDYE_DISABLE`, a shutdown or 30 min unused; see "Stock baseline") and puts the template, pulse and G-code state back. Doesn't home (`PD_FIRE_TEST` does) |
 | `POLYDYE_SPIT [SECONDS=2] [TEMPLATE=] [PULSE=] [PATTERN=stock\|all] [DENSITY=] [REPEAT=] [COLORS=] [FIRST=] [LAST=] [PER_PULSE=] [PERIOD_US=1000] [WARM=0] [WARM_PULSE=] [WARM_PERIOD_US=] CONFIRM=1` | **Live ink, no motion.** Fires like the stock firmware (`PATTERN=stock`, the default, with its knobs, see below) a column every 508 µs, or every nozzle (`all`) at 1 kHz, or a column every `PERIOD_US`, for `SECONDS` (at most 10, and at most 10000 columns) into a paper towel held under the cartridge, through the same waveform and safety checks as a pass, starting at least 0.1 s after the boost came on. Refused without `CONFIRM=1`, during a print (also a paused one) or with passes queued. Turns live ink off afterwards (and the boost too with older board firmware; see "Stock baseline") and puts the template and pulse back. `WARM` warms the head first, in the same board run (see below) |
@@ -471,6 +481,7 @@ Macros (Mainsail's Macros panel, while the board is plugged in):
 | `PD_OFF` | Drops queued passes, then turns live output and the boost off |
 | `PD_CLEAN [WARM=] [SECONDS=] [STROKES=]` | **Live ink** into the wipe sponge. Homes if needed, then cleans the head (`POLYDYE_CLEAN`); also during a print |
 | `PD_TEST_PAGE [X=] [Y=] [Z=1] [WARM=] [PRIME=]` | **Live ink, on paper only.** Refused during a print. Homes if needed, then prints the test page (`POLYDYE_TEST_PAGE`) at `Z` |
+| `PD_FIRE_GAP_TEST [X=] [Y=] [Z=1] [WARM=] [PRIME=] [GAPS=7,15]` | **Live ink, on paper only.** Refused during a print. Homes if needed, then prints the fire gap test (`POLYDYE_FIRE_GAP_TEST`) at `Z` |
 | `PD_ALIGN_PRINT [X=] [Y=] [Z=1] [SPACING=8]` | **Live ink, on paper only.** Refused during a print. Homes if needed, then prints the alignment page (`POLYDYE_ALIGN_PRINT`) at `Z` |
 | `PD_OFFSET_PRINT [X=] [Y=] [LAYERS=] [LAYER_HEIGHT=] [GAP=] [EXTRUDER_TEMP=] [BED_TEMP=]` | **PLA and live ink.** Refused during a print. Homes if needed, then runs `POLYDYE_OFFSET_PRINT` |
 | `PD_FIRE_TEST [X=70] [Y=60] [Z=0.5] [SPACING=18] [PATTERN=stock\|all] [STRIPES=…] [COLUMNS=] [DENSITY=] [REPEAT=] [COLORS=] [FIRST=] [LAST=] [PER_PULSE=] [WARM=] [WARM_PULSE=] [WARM_PERIOD_US=]` | **Live ink.** Refused during a print (also a paused one) before anything moves. Homes if needed, then runs `POLYDYE_FIRE_TEST` at `Z`; the knobs mean `PATTERN=stock` unless you give another |
@@ -495,8 +506,9 @@ with board firmware that reports 5.714). `templates` lists the templates the boa
 `black_a`, `black_b`; without `polydye_set_clock` only the black ones) and `spit_patterns` the spit test's patterns
 (`all`, and `stock` with board firmware that also takes `PERIOD_US`); `spit_random` says whether the spit test takes the
 stock pattern's knobs, and `warm_max_us`, `warm_max_s` and `warm_duty_ppm` are the board's warm-up limits (`null` duty:
-older firmware, 0.75 µs pulses at most). It also has `last_pass`, `pass_axis`, `offset_x`, `offset_y` and `direction_trim`, the
-values in use including nudges.
+older firmware, 0.75 µs pulses at most). `fire_gap_words` and `fire_gap_us` are the board's fire gap (missing with older
+board firmware) and `fire_gap_max` its longest in words (`null` with older firmware). It also has `last_pass`,
+`pass_axis`, `offset_x`, `offset_y` and `direction_trim`, the values in use including nudges.
 
 ### Removed in the stock-only cleanup
 
@@ -698,13 +710,14 @@ prints, the third step, would need a parking spot on a damp sponge; there's none
 
 `PD_TEST_PAGE` (**live ink, on paper only**) checks on paper that the head prints the way a colour print needs it to,
 with a colour print's rules: nozzle positions 28–82 (`polydye_post.py`'s default), at most 4 heaters on a fire line
-and 5 on a packet, a two-ink square printed as two passes, one per fire line, the colour registration and
+and 5 on a packet, a two-ink square printed as two passes, one per fire line (one pass, 4 + 4, with a fire gap), the
+colour registration and
 `nozzle_skew`, and the ink blocks' gentle moves (`POLYDYE_INK_MOTION`). Like the calibration prints, the add-on draws
 it on the Pi and stores it on the board as layer 65000 (replacing what was there). First the head warms and primes over
 the wipe sponge, in one board run: `WARM` s (`prewarm_seconds`, 6) of the warm-up recipe, then `PRIME` s
 (`prime_seconds`, 0.3) of the stock pattern at the passes' template and pulse. Then come 8 passes (13 on the board) at
-`Z` (1 mm), in alternating directions. Afterwards, also after an error, the motion limits and the G-code state go back
-and live ink goes off.
+`Z` (1 mm), in alternating directions (8 on the board with a fire gap). Afterwards, also after an error, the motion
+limits and the G-code state go back and live ink goes off.
 
 The page is about 34 × 23 mm, centred on `X`, `Y` (default: the middle of where the cartridge reaches). The command
 says where its ink can land: tape paper over that with 5 mm to spare. Seen from the front, left to right, a column each
@@ -714,7 +727,34 @@ for cyan, magenta and yellow, then the blue join:
 |---|---|---|
 | Front | Nozzle check: every nozzle 14–85 fires a 16-column (0.5 mm) dash in turn, in 9 staircases of 8 dashes | A missing or faint dash is a nozzle that didn't fire: nozzle 14 + 8 × its staircase (0–8, from the right) + its dash (0–7, from the front). Every staircase should look alike |
 | Middle | A solid square of the colour (one ink: one pass) | Even and full. Streaks or a pale start: a cold or unprimed head, or weak nozzles |
-| Back | Red, green and blue squares (two inks: two passes over the same ground, one per fire line) | As solid as the single colours. A paler half (one side of the square) is one fire line not keeping up |
+| Back | Red, green and blue squares (two inks: two passes over the same ground, one per fire line; one with a fire gap) | As solid as the single colours. A paler half (one side of the square) is one fire line not keeping up |
+
+### Fire gap
+
+A packet fires its F3 and F5 pulses from the one 12.6 V rail, and with the stock timing F5 starts only 0.7 µs after F3
+ends (7.35 µs pass before the next packet's F3). Each line alone fires 4 heaters solid, but with F3 at 4, F5 streaked
+even at 3 (ladder 904). So by default a packet takes 5 heaters, and two-ink solids print as two passes, one per fire
+line (see "Colour prints from OrcaSlicer"), at twice the time.
+
+The fire gap (`fire_gap_us`, `POLYDYE_CARTRIDGE GAP=`; opt-in, board firmware from this add-on's bundle) holds the
+waveform between the two pulses that much longer, up to 16.8 µs: F5 then fires later after F3, with every data and
+clock edge as before. Passes and spit tests get it; warm-ups and prewarm bursts don't. With a gap set each line keeps
+its own 4 heaters, so a packet takes 4 + 4 and nothing is split: the test page and ink jobs print two inks in one pass.
+
+`PD_FIRE_GAP_TEST` (**live ink, on paper only**) finds the gap the head needs. It starts like the test page (warm-up and
+prime over the sponge, `Z` 1 mm, gentle moves), then prints rows of a red, a green and a blue square (two inks at
+positions 28–82: 4 heaters on each line of every packet, one pass each), front to back:
+
+| Row | Fire gap | Heaters (F3 + F5) |
+|---|---|---|
+| 1 | stock timing (0) | 4 + 4: the F5 half streaked on ladder 904 |
+| 2 | stock timing (0) | 4 + 2, F5 capped (the control): solid, lighter on the F5 half |
+| 3, 4, … | each of `GAPS` (default 7 and 15 µs, 20 and 43 words) | 4 + 4 |
+
+Seen from the front, the left half of each square (towards −X) is fire line F5, the right half F3. Set `fire_gap_us`
+to the smallest gap whose squares are solid in both halves, or keep the stock timing if none is. The gap rows come
+last, with the head coolest, so a solid one isn't a flattering result. Between rows live ink goes off while the board
+takes the new gap; afterwards, also after an error, the board's own gap goes back.
 | Right | Two sweeps of blue side by side, overlapping by 6 positions with the feathered join, printed in opposite directions like a print's | No line where they meet. A line: `direction_trim` (the alignment page's D row) |
 
 ### Calibration prints
