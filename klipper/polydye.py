@@ -2078,11 +2078,14 @@ class PolyDye:
 
     def _align_paper(self, gcmd, cmd, drawings, built, start, side, spacing):
         """The bed area the alignment page's ink can cover (all rows, the nozzle row at 10 % more than nozzle_dpi, the
-        priming blocks), as text; refuses, before anything moves, settings that need more paper than ALIGN_PAPER with
-        ALIGN_PAPER_MARGIN all round."""
+        priming blocks, the reverse pass moved by direction_trim), as text, where it is on the bed (with the G-code
+        offset, as pass_geometry() puts it); refuses, before anything moves, settings that need more paper than
+        ALIGN_PAPER with ALIGN_PAPER_MARGIN all round."""
         pitch, wide = 25.4 / self.dpi, 25.4 / self.nozzle_dpi * 1.1
-        ends = [(b[2], b[2] + b[1] - 1) if d[2] > 0 else (b[2] - b[1] + 1, b[2]) for b, d in zip(built, drawings)]
-        along = (start + min(e[0] for e in ends) * pitch, start + max(e[1] for e in ends) * pitch)
+        ends = [(b[2] * pitch, (b[2] + b[1] - 1) * pitch) if d[2] > 0 else
+                ((b[2] - b[1] + 1) * pitch + self.direction_trim, b[2] * pitch + self.direction_trim)
+                for b, d in zip(built, drawings)]
+        along = (start + min(e[0] for e in ends), start + max(e[1] for e in ends))
         extents = [drawing_extent(d) for _, d, _ in drawings]
         half = max(max(e[3] for e in extents) - OFFSET_REF_POSITION,
                    OFFSET_REF_POSITION - min(e[2] for e in extents)) * wide
@@ -2093,9 +2096,9 @@ class PolyDye:
                              "margins), more than the %.0f x %.0f mm it asks for: use a smaller SPACING, or the "
                              "default dpi" % (cmd, spacing, self.dpi, need[0], need[1], ALIGN_PAPER_MARGIN,
                                               ALIGN_PAPER[0], ALIGN_PAPER[1]))
-        if self.pass_axis == 'y':
-            return "X %.0f-%.0f, Y %.0f-%.0f" % (across[0], across[1], along[0], along[1])
-        return "X %.0f-%.0f, Y %.0f-%.0f" % (along[0], along[1], across[0], across[1])
+        base = self.printer.lookup_object('gcode_move').base_position
+        x, y = (across, along) if self.pass_axis == 'y' else (along, across)
+        return "X %.0f-%.0f, Y %.0f-%.0f" % (x[0] + base[0], x[1] + base[0], y[0] + base[1], y[1] + base[1])
 
     cmd_POLYDYE_OFFSET_PRINT_help = ("PLA and LIVE INK: a PLA plaque with a cross-shaped groove centred on X, Y "
                                      "(LAYERS of LAYER_HEIGHT, the groove in the top 3; heats to EXTRUDER_TEMP and "

@@ -1826,6 +1826,19 @@ class CalibrationPrints(unittest.TestCase):
         # side), the page with its priming blocks along Y.
         self.assertIn("Its ink spans X 57-111, Y 38-163: the paper must cover that with 5 mm to spare, at least 70 x "
                       "140 mm", [s for s in self.said if s.startswith("PolyDye alignment page, live ink")][0])
+        # With a G-code offset the ink lands that much further on the bed; the reverse pass's ink moves by
+        # direction_trim, which can make the page too long for the paper.
+        pd, board = self.make()
+        self.objects['gcode_move'].base_position = [2., -10., 0., 0.]
+        pd.direction_trim = -3.
+        pd.cmd_POLYDYE_ALIGN_PRINT(self.gcmd(X=60., Y=60., Z=1.))
+        self.assertIn("Its ink spans X 59-113, Y 38-160",
+                      [s for s in self.said if s.startswith("PolyDye alignment page, live ink")][-1])
+        pd, board = self.make()
+        pd.direction_trim = 10.
+        with self.assertRaisesRegex(RuntimeError, r"the page would need 65 x 145 mm of paper"):
+            pd.cmd_POLYDYE_ALIGN_PRINT(self.gcmd(X=60., Y=50., Z=1.))
+        self.assertEqual(board.sent, [])
 
     def test_refused_before_anything_is_sent(self):
         for homed, params, setup, error in (
