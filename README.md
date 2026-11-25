@@ -261,6 +261,7 @@ offset_y: -8.7
 #cyan_positions: 0    #   in bus columns along the pass (DIR=1's order) and nozzle positions across it
 #yellow_columns: 0
 #yellow_positions: 0
+#nozzle_skew: 0       # the nozzle row's yaw (see "Calibration prints"); POLYDYE_OFFSET SKEW= sets it
 #nozzle_dpi: 300      # nozzles per inch across the pass: the offset print's X scale
 #mcu: polydye
 #data_port:           # the board's data port; default: the [mcu polydye] serial path with -if02 instead of -if00
@@ -307,6 +308,67 @@ card show it. `bus_clock: stock` in `polydye.cfg` is still taken (it changes not
 `POLYDYE_ENABLE LIVE=1` waits, through the move queue, until the boost has been on for 0.15 s before the next move,
 because the board refuses live ink sooner than 0.1 s after the boost comes on.
 
+## Colour prints from OrcaSlicer
+
+`scripts/polydye_post.py` turns a colour model sliced in OrcaSlicer into a PolyDye print: the model prints in the one
+white (or natural) spool loaded, and its colours go on as ink between the layers. Each layer's ink is printed right
+after the layer's last extrusion, `--gap` mm (1) above it, so the next layer seals it in.
+
+**Set up OrcaSlicer (once):**
+1. On the PC: Python 3 with numpy (`pip install numpy`), and `scripts/polydye_post.py` from this repository.
+2. Printer settings (the PolyDye printer profile): G-code flavour Klipper; Multimaterial > Single extruder
+   multi-material on, with one extruder per colour you want; Machine G-code > **Change filament G-code empty** (every
+   filament is the spool loaded: no M600).
+3. Filaments: one per colour, all with the loaded spool's settings (the same temperatures and diameter: the
+   post-processor refuses differing ones). **A filament's colour is the ink**: white (`#FFFFFF`) prints none; any other
+   colour becomes cyan, magenta and yellow (`1 − R`, `1 − G`, `1 − B`).
+4. Process: **Prime tower off**; **Arc fitting off** (Quality > Precision); Print sequence **By layer**; no spiral vase;
+   Multimaterial > *Maximum width of a segmented region* **2.5 mm**, so painted colours are a shell that deep: through
+   translucent PLA a deeper shell reads stronger (on the first full-colour box, 2–2.5 mm deep walls came out solid and
+   crisp, 1.6 mm streaky, 1.2 mm light and streaked; 2.5 mm at 100 % bonded fine). A **brim** is recommended: ink is
+   only put where a drop that lands up to `--edge-margin` (0.5 mm) off still lands on plastic, so without one the
+   first layers' colours stop short of the model's edge.
+5. Others > Post-processing Scripts: `"C:\path\to\python.exe" "C:\path\to\polydye_post.py";` (add options before
+   the `;`, e.g. `--prime-idle 60`).
+
+**Colour the model** with Orca's colour painting tool. A textured model (OBJ, 3MF with a texture) can be baked into
+colour painting in OrcaSlicer itself (the OrcaSlicer wiki's texture-to-colour-painting steps,
+`prepare_texture_displacement` / `prepare_color_painting`); printpal.io's AMS converter (GLB/OBJ to a painted 3MF) is
+another way.
+
+**What the post-processor does:** the tool changes go; per layer, where each coloured filament's lines are becomes
+ink, one object at a time, cut into passes along Y about 5.8 mm wide (68 nozzle positions), in alternating directions.
+- **Solid colours fire every dot of their inks, in one coat** (`--ink-limit 100`, `--wall-coats 1`, `--top-coats 1`):
+  on paper 100 % in one coat was the cleanest and most vivid; 60 % in two coats came close, 35 % was pale and grainy.
+- **Partial tones** (a colour's ink between 0 and 100 %) are an ordered dither (an 8 × 8 Bayer matrix fixed on the
+  plate), decided per pair of columns: every nozzle fires at least two columns running, because a fire on its own
+  doesn't eject. Cyan, magenta and yellow read the matrix shifted, so up to 25 % each they fall on different dots.
+- **At most 4 heaters fire on each fire pulse** (a packet, one fire line, across the colours): the add-on keeps that
+  when it sends a job's passes, sharing them out by an even rotation, the same for both columns of a pair, and drops
+  any fire left on its own. Cyan and yellow together at full width printed solid green at 3–4 per pulse and failed at
+  6; one colour at full width is about 3.
+- **Prewarm and prime:** `POLYDYE_PREWARM SECONDS=6` goes in about 6 s of moves before each ink layer's end (the moves
+  timed as Klipper plans them; within 3 % of Orca's estimate), so the burst ends as the ink starts; a layer shorter
+  than that warms through. `POLYDYE_PRIME` comes before the first ink layer's passes, and before any layer using a
+  colour that hasn't ejected for `--prime-idle` s (90) by that estimate (see "Priming").
+- **The job:** the passes' nozzle data goes into the G-code too, compressed, after the print and before the slicer's
+  config block. `POLYDYE_JOB` at the start of the print has the add-on read it from the print's own file and upload
+  the passes to the board as the print runs, a few MB ahead, each deleted once printed; `POLYDYE_JOB_PASS N=` prints
+  one. The colour registration, nozzle skew and direction trim are applied on the Pi from `polydye.cfg`, so a
+  recalibration needs no re-slice (the registration and skew can't change while a job is loaded: its passes are
+  made with them); `dpi` and `nozzle_dpi` must match (the job is refused otherwise). It needs `data_port`.
+
+**Options** (all optional): `--ink-limit` %, `--wall-coats`, `--top-coats`, `--gap` mm, `--dry` s (5: the ink dries
+before the next layer), `--retract` mm (1.5), `--travel` mm/s (150), `--edge-margin` mm (0.5), `--inset` mm (0.05: the ink stops that far
+inside the model's surface, so none lands on a base or brim below it), `--positions` (16-83:
+two to spare each way for the colour registration), `--one-direction`, `--prewarm` s (6; 0: none), `--prime-idle` s
+(90; 0: never), `--dpi`, `--nozzle-dpi`, `--pass-speed` (polydye.cfg's), and `--accel`, `--scv`, `--max-velocity` for
+the timing (default: the profile's). `--dry-run` runs the passes with live ink off, and without bursts or primes.
+
+It refuses G-code it can't ink safely, leaving the file unchanged: a prime tower, a Change filament G-code, differing
+filament temperatures, print by object, spiral vase, arcs, or a file already processed. Not tested yet: how well wet
+ink at 100 % holds the next layer on plastic.
+
 ## How a pass works
 
 Each ink pass is one G-code command:
@@ -345,11 +407,14 @@ If anything would print a pass wrongly, Klipper stops with a readable reason, fo
 | `POLYDYE_PASS LAYER= PASS= X= Y= [DIR=1] [SPEED=] [WARM=] [WARM_PULSE=] [WARM_PERIOD_US=] [PRESPIT=]` | Prints one pass (above), after an automatic head warm-up off the print if live ink is on and the head is cold; `WARM` asks for one (seconds), `WARM=0` for none, `PRESPIT` adds a stock-pattern pre-spit after it (see "Automatic head warm-up") |
 | `POLYDYE_PREWARM [SECONDS=6]` | Warms the head in the background while the moves after it run, so it's hot for the next pass (see "Prewarm bursts"): `SECONDS` (default `prewarm_seconds`, 6) of every nozzle at 1 word (0.35 µs, which doesn't eject) every `warm_period_us`, from where the moves before it end, without stopping them. Turns live ink on. A pass never waits for it: one that comes first cuts it short, and needs no warm-up of its own. At most 16.6 s at 254 µs. Needs this add-on's bundled board firmware |
 | `POLYDYE_PRIME [SECONDS=0.3]` | Primes the nozzles over the wipe sponge before an ink layer whose colours have been idle (see "Priming"): waits for the passes before it, turns live ink on, goes up by `POLYDYE_WIPE`'s `z_hop` and over the sponge, spits `SECONDS` (default `prime_seconds`, 0.3; up to 5) of the stock pattern in every colour, then comes back. Allowed during a print, no `CONFIRM`. Colour templates only; needs the `POLYDYE_WIPE` macro and this add-on's bundled board firmware |
+| `POLYDYE_JOB [FILE=]` | At the start of a print sliced with `polydye_post.py` (it puts it there): loads the print's ink job and uploads its passes to the board as the print runs (see "Colour prints from OrcaSlicer"). Refuses, before anything moves, a job sliced for another `dpi` or `nozzle_dpi`, one the colour registration would move off nozzle positions 14–85, ink beyond the axis limits (each pass's run-up at the acceleration the G-code sets for the ink) or above the Z axis (`--gap` over the top layer), or bursts and primes the board or macros can't run. While it's loaded the colour registration and `nozzle_skew` can't change. Needs `data_port` |
+| `POLYDYE_JOB_PASS N=` | Prints the job's pass `N` with `POLYDYE_PASS` once it's on the board (waits for it); skipped if its object is excluded |
+| `POLYDYE_JOB_END` | Stops the job's uploads and says what was printed (also done when the print ends, however it ends) |
 | `POLYDYE_CANCEL` | Drops passes that are scheduled but not started (for a cancel macro). The add-on does this itself, and turns live ink off, within 2 s of a print being cancelled or stopping with an error: the print's own `POLYDYE_ENABLE LIVE=0` never runs then (`CANCEL_PRINT` waits for the command running, such as a pass's warm-up) |
 | `POLYDYE_STATUS` | Board status: boost, live, passes printed and queued, worst column lateness, faults, stored passes, cartridge template, fire pulse, the last prewarm burst; and the offsets and direction trim in use |
 | `POLYDYE_NUDGE [X=] [Y=] [TRIM=]` | Moves where the ink lands by `X`, `Y` mm on the bed, and the ink of reverse passes by `TRIM` mm along the pass axis (each at most ±5 mm), from the next pass on. Changes `offset_x`/`offset_y` (in the opposite direction: the offset is where the cartridge is) and `direction_trim` until the next restart |
-| `POLYDYE_OFFSET [X=] [Y=] [TRIM=] [CYAN_COLUMNS=] [CYAN_POSITIONS=] [YELLOW_COLUMNS=] [YELLOW_POSITIONS=] [X_TICK=] [Y_TICK=] [SAVE=]` | Sets `offset_x`, `offset_y`, `direction_trim` and the colour registration until the next restart; without arguments, shows them. `X_TICK`, `Y_TICK` are the offset print's readings: they move the ink by that many ticks and store the offsets in `polydye.cfg` (`SAVE=0`: don't). `SAVE=1` stores the others too |
-| `POLYDYE_SAVE` | Stores the offsets, direction trim and colour registration in use in `polydye.cfg` (next to `printer.cfg`; the colour registration once it isn't zero) |
+| `POLYDYE_OFFSET [X=] [Y=] [TRIM=] [CYAN_COLUMNS=] [CYAN_POSITIONS=] [YELLOW_COLUMNS=] [YELLOW_POSITIONS=] [SKEW=] [X_TICK=] [Y_TICK=] [SAVE=]` | Sets `offset_x`, `offset_y`, `direction_trim`, the colour registration and `nozzle_skew` (`SKEW`, ±0.2) until the next restart; without arguments, shows them. `X_TICK`, `Y_TICK` are the offset print's readings: they move the ink by that many ticks and store the offsets in `polydye.cfg` (`SAVE=0`: don't). `SAVE=1` stores the others too |
+| `POLYDYE_SAVE` | Stores the offsets, direction trim, colour registration and nozzle skew in use in `polydye.cfg` (next to `printer.cfg`; the colour registration and skew once they aren't zero) |
 | `POLYDYE_ALIGN_PRINT [X=] [Y=] [Z=] [SPACING=8]` | **Live ink, on paper only.** The alignment page (see "Calibration prints"), its rows `SPACING` mm apart across the pass axis, the first at `X`, `Y` (default: centred where the cartridge reaches). Moves to `Z` first if given. Doesn't home (`PD_ALIGN_PRINT` does) |
 | `POLYDYE_ALIGN [CYAN=] [YELLOW=] [DIRECTION=] [CYAN_X=] [YELLOW_X=] [SAVE=1]` | The alignment page's readings, the block number where each row lines up (−16 to 16; e.g. −11.5 between two blocks): corrects the colour registration and `direction_trim` and stores them in `polydye.cfg` (`SAVE=0`: until the next restart only) |
 | `POLYDYE_OFFSET_PRINT [X=] [Y=] [LAYERS=5] [LAYER_HEIGHT=0.2] [GAP=1] [EXTRUDER_TEMP=] [BED_TEMP=] [PLAQUE=1] [Z=]` | **PLA and live ink** (`pass_axis: y`). A PLA plaque with a cross-shaped groove in its top 3 layers, centred on `X`, `Y`, then ink scales across the groove from `GAP` mm above the plaque; read them with `POLYDYE_OFFSET X_TICK= Y_TICK=` (see "Calibration prints"). Heats to `EXTRUDER_TEMP` and `BED_TEMP` if given, else needs the hotend's target set for PLA; the hotend and the part fan are off afterwards, also after an error. `PLAQUE=0` prints only the ink onto a plaque printed before, at `Z` (default: its top, `LAYERS` × `LAYER_HEIGHT`, plus `GAP`). Refused if the scales wouldn't stay 6.5 mm inside the plaque at the `dpi` and `nozzle_dpi` set. Doesn't home (`PD_OFFSET_PRINT` does) |
@@ -604,8 +669,19 @@ offset is fixed on the bed: in a reverse pass a colour's dots move the other way
 printed without fringes in both directions on page 2). Brett's cartridge: `cyan_columns: -34`, `cyan_positions: 1`,
 `yellow_columns: 27`, `yellow_positions: 0`, `direction_trim: -0.41`.
 
-**The colour registration applies to the passes the add-on draws** (these prints, and the test image to come).
-The board doesn't know a pass's direction, so `.pdj` jobs need it applied by whatever makes them.
+**The colour registration applies to the passes the add-on draws or sends:** these prints, ink jobs from
+`polydye_post.py`, and the test image to come. The board doesn't know a pass's direction, so `.pdj` files made
+elsewhere need it applied by whatever makes them.
+
+**Nozzle skew.** The cartridge's nozzle row isn't quite square to the pass: on Brett's mount it's yawed about 1.7°, so
+nozzle position p's dots land `nozzle_skew` × (p − 50) nozzle pitches further along +Y than position 50's. Solid ink
+several swaths wide then shows a sawtooth step at every join (each swath's edges slope, then jump back). With
+`nozzle_skew` set, every pass the add-on draws or sends moves each position's dots back by that, rounded to whole bus
+columns (at 847/300 dpi and 0.03: ±3 columns at the row's ends), fixed on the bed like the colour registration, so the
+same for both directions. Position 50 is the pivot, the one `POLYDYE_PASS`'s X names, so the cartridge offset stays as
+calibrated. A ladder on paper put it at **0.03** (edge roughness 0.048 mm against 0.096 mm uncorrected). Set it with
+`POLYDYE_OFFSET SKEW=0.03 SAVE=1`, then **print the alignment page again**: its C, Y and D rows compare marks on
+different nozzle positions, so their readings shift by about 2–3 columns once the skew is corrected.
 
 **Offset print** (`PD_OFFSET_PRINT`, `pass_axis: y`). A 26 × 38 mm PLA plaque, `LAYERS` of `LAYER_HEIGHT` (5 × 0.2
 mm), with a 1 mm cross-shaped groove through its top 3 layers centred on `X`, `Y`; then, from `GAP` (1 mm) above the
@@ -686,8 +762,12 @@ python3 ~/polydye-klipper/scripts/polydye_upload.py job print.pdj
 python3 ~/polydye-klipper/scripts/polydye_upload.py list
 ```
 
-It needs pyserial; use `~/klippy-env/bin/python` if the system Python lacks it. Generating `.pdj` jobs from a
-sliced model is the next step (the post-processor).
+It needs pyserial; use `~/klippy-env/bin/python` if the system Python lacks it. Prints sliced in OrcaSlicer carry
+their passes in the G-code instead (see "Colour prints from OrcaSlicer").
+
+The board keeps passes in its PSRAM: a board restart (a firmware update, a power-cycle) empties the store, so upload
+them again. Ink jobs (`POLYDYE_JOB`) and the calibration prints upload their passes every time, so they aren't
+affected.
 
 ### Data port
 

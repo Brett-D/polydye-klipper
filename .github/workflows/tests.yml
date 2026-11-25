@@ -12,8 +12,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      - name: Install Jinja2 (Klipper's macro engine, for the macro tests)
-        run: python3 -m pip install -q jinja2
+      - name: Install Jinja2 (Klipper's macro engine, for the macro tests) and numpy (for polydye_post.py)
+        run: python3 -m pip install -q jinja2 numpy
       - name: Unit tests
         run: python3 -m unittest discover -s tests -v
       - name: Install / uninstall round trip
