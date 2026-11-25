@@ -97,6 +97,8 @@ does. It shows:
   show "not stored". **Store** writes them into `polydye.cfg` (`POLYDYE_SAVE`) and **Back to stored values** undoes
   the nudges.
 - **Calibration:**
+  - **Test page** (live ink on paper, with a confirmation): nozzle checks, solid colours and a feathered join, printed
+    by a colour print's rules (`PD_TEST_PAGE`; see "Test page").
   - **Fire test** (live ink on paper, with a confirmation): one stripe per template and fire pulse, side by side, with
     a table of where each stripe goes (`PD_FIRE_TEST`). The default is one stripe of the stock firmware's settings and
     pattern.
@@ -436,6 +438,7 @@ If anything would print a pass wrongly, Klipper stops with a readable reason, fo
 | `POLYDYE_NUDGE [X=] [Y=] [TRIM=]` | Moves where the ink lands by `X`, `Y` mm on the bed, and the ink of reverse passes by `TRIM` mm along the pass axis (each at most ±5 mm), from the next pass on. Changes `offset_x`/`offset_y` (in the opposite direction: the offset is where the cartridge is) and `direction_trim` until the next restart |
 | `POLYDYE_OFFSET [X=] [Y=] [TRIM=] [CYAN_COLUMNS=] [CYAN_POSITIONS=] [YELLOW_COLUMNS=] [YELLOW_POSITIONS=] [SKEW=] [X_TICK=] [Y_TICK=] [SAVE=]` | Sets `offset_x`, `offset_y`, `direction_trim`, the colour registration and `nozzle_skew` (`SKEW`, ±0.2) until the next restart; without arguments, shows them. `X_TICK`, `Y_TICK` are the offset print's readings: they move the ink by that many ticks and store the offsets in `polydye.cfg` (`SAVE=0`: don't). `SAVE=1` stores the others too |
 | `POLYDYE_SAVE` | Stores the offsets, direction trim, colour registration and nozzle skew in use in `polydye.cfg` (next to `printer.cfg`; the colour registration and skew once they aren't zero) |
+| `POLYDYE_TEST_PAGE [X=] [Y=] [Z=1] [WARM=6] [PRIME=0.3]` | **Live ink, on paper only** (`pass_axis: y`). The test page (see "Test page"), centred on `X`, `Y` (default: centred where the cartridge reaches), at `Z`, after a `WARM` s warm-up (default `prewarm_seconds`) and a `PRIME` s prime (default `prime_seconds`) over the wipe sponge; 0 leaves either out. Refused during a print, or if the colour registration would move its squares off nozzle positions 14–85, before anything moves. Needs `data_port`, the `POLYDYE_WIPE` macro and this add-on's bundled board firmware. Doesn't home (`PD_TEST_PAGE` does) |
 | `POLYDYE_ALIGN_PRINT [X=] [Y=] [Z=] [SPACING=8]` | **Live ink, on paper only.** The alignment page (see "Calibration prints"), its rows `SPACING` mm apart across the pass axis, the first at `X`, `Y` (default: centred where the cartridge reaches). Moves to `Z` first if given. Doesn't home (`PD_ALIGN_PRINT` does) |
 | `POLYDYE_ALIGN [CYAN=] [YELLOW=] [DIRECTION=] [CYAN_X=] [YELLOW_X=] [SAVE=1]` | The alignment page's readings, the block number where each row lines up (−16 to 16; e.g. −11.5 between two blocks): corrects the colour registration and `direction_trim` and stores them in `polydye.cfg` (`SAVE=0`: until the next restart only) |
 | `POLYDYE_OFFSET_PRINT [X=] [Y=] [LAYERS=5] [LAYER_HEIGHT=0.2] [GAP=1] [EXTRUDER_TEMP=] [BED_TEMP=] [PLAQUE=1] [Z=]` | **PLA and live ink** (`pass_axis: y`). A PLA plaque with a cross-shaped groove in its top 3 layers, centred on `X`, `Y`, then ink scales across the groove from `GAP` mm above the plaque; read them with `POLYDYE_OFFSET X_TICK= Y_TICK=` (see "Calibration prints"). Heats to `EXTRUDER_TEMP` and `BED_TEMP` if given, else needs the hotend's target set for PLA; the hotend and the part fan are off afterwards, also after an error. `PLAQUE=0` prints only the ink onto a plaque printed before, at `Z` (default: its top, `LAYERS` × `LAYER_HEIGHT`, plus `GAP`). Refused if the scales wouldn't stay 6.5 mm inside the plaque at the `dpi` and `nozzle_dpi` set. Doesn't home (`PD_OFFSET_PRINT` does) |
@@ -453,6 +456,7 @@ Macros (Mainsail's Macros panel, while the board is plugged in):
 | `PD_STATUS` | `POLYDYE_STATUS` |
 | `PD_DRY_RUN_TEST [X=100] [Y=40]` | Homes if needed, lifts Z to 20 mm, uploads a test pass and prints it in both directions without ink, then reports status. The printer moves; nothing fires |
 | `PD_OFF` | Drops queued passes, then turns live output and the boost off |
+| `PD_TEST_PAGE [X=] [Y=] [Z=1] [WARM=] [PRIME=]` | **Live ink, on paper only.** Refused during a print. Homes if needed, then prints the test page (`POLYDYE_TEST_PAGE`) at `Z` |
 | `PD_ALIGN_PRINT [X=] [Y=] [Z=1] [SPACING=8]` | **Live ink, on paper only.** Refused during a print. Homes if needed, then prints the alignment page (`POLYDYE_ALIGN_PRINT`) at `Z` |
 | `PD_OFFSET_PRINT [X=] [Y=] [LAYERS=] [LAYER_HEIGHT=] [GAP=] [EXTRUDER_TEMP=] [BED_TEMP=]` | **PLA and live ink.** Refused during a print. Homes if needed, then runs `POLYDYE_OFFSET_PRINT` |
 | `PD_FIRE_TEST [X=70] [Y=60] [Z=0.5] [SPACING=18] [PATTERN=stock\|all] [STRIPES=…] [COLUMNS=] [DENSITY=] [REPEAT=] [COLORS=] [FIRST=] [LAST=] [PER_PULSE=] [WARM=] [WARM_PULSE=] [WARM_PERIOD_US=]` | **Live ink.** Refused during a print (also a paused one) before anything moves. Homes if needed, then runs `POLYDYE_FIRE_TEST` at `Z`; the knobs mean `PATTERN=stock` unless you give another |
@@ -660,6 +664,29 @@ POLYDYE_PASS LAYER=5 PASS=0 X=120 Y=100 DIR=1
 On paper, a 6 s burst, then a 0.2 s prime, then one layer's eight wall passes printed all four walls; without the
 prime only the colour that had just fired did.
 
+### Test page
+
+`PD_TEST_PAGE` (**live ink, on paper only**) checks on paper that the head prints the way a colour print needs it to,
+with a colour print's rules: nozzle positions 28–82 (`polydye_post.py`'s default), at most 4 heaters on a fire line
+and 5 on a packet, a two-ink square printed as two passes, one per fire line, the colour registration and
+`nozzle_skew`, and the ink blocks' gentle moves (`POLYDYE_INK_MOTION`). Like the calibration prints, the add-on draws
+it on the Pi and stores it on the board as layer 65000 (replacing what was there). First the head warms and primes over
+the wipe sponge, in one board run: `WARM` s (`prewarm_seconds`, 6) of the warm-up recipe, then `PRIME` s
+(`prime_seconds`, 0.3) of the stock pattern at the passes' template and pulse. Then come 8 passes (13 on the board) at
+`Z` (1 mm), in alternating directions. Afterwards, also after an error, the motion limits and the G-code state go back
+and live ink goes off.
+
+The page is about 34 × 23 mm, centred on `X`, `Y` (default: the middle of where the cartridge reaches). The command
+says where its ink can land: tape paper over that with 5 mm to spare. Seen from the front, left to right, a column each
+for cyan, magenta and yellow, then the blue join:
+
+| Where | What | Look for |
+|---|---|---|
+| Front | Nozzle check: every nozzle 14–85 fires a 16-column (0.5 mm) dash in turn, in 9 staircases of 8 dashes | A missing or faint dash is a nozzle that didn't fire: nozzle 14 + 8 × its staircase (0–8, from the right) + its dash (0–7, from the front). Every staircase should look alike |
+| Middle | A solid square of the colour (one ink: one pass) | Even and full. Streaks or a pale start: a cold or unprimed head, or weak nozzles |
+| Back | Red, green and blue squares (two inks: two passes over the same ground, one per fire line) | As solid as the single colours. A paler half (one side of the square) is one fire line not keeping up |
+| Right | Two sweeps of blue side by side, overlapping by 6 positions with the feathered join, printed in opposite directions like a print's | No line where they meet. A line: `direction_trim` (the alignment page's D row) |
+
 ### Calibration prints
 
 Two prints, drawn by the add-on on the Pi (no PC or slicer), set the colour registration, the direction trim and the
@@ -690,8 +717,8 @@ offset is fixed on the bed: in a reverse pass a colour's dots move the other way
 printed without fringes in both directions on page 2). Brett's cartridge: `cyan_columns: -34`, `cyan_positions: 1`,
 `yellow_columns: 27`, `yellow_positions: 0`, `direction_trim: -0.41`.
 
-**The colour registration applies to the passes the add-on draws or sends:** these prints, ink jobs from
-`polydye_post.py`, and the test image to come. The board doesn't know a pass's direction, so `.pdj` files made
+**The colour registration applies to the passes the add-on draws or sends:** these prints, the test page, ink jobs
+from `polydye_post.py`, and the test image to come. The board doesn't know a pass's direction, so `.pdj` files made
 elsewhere need it applied by whatever makes them.
 
 **Nozzle skew.** The cartridge's nozzle row isn't quite square to the pass: on Brett's mount it's yawed about 1.7°, so

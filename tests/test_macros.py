@@ -158,13 +158,17 @@ class CalibrationPrints(unittest.TestCase):
         self.assertEqual(run(self.macros, "PD_OFFSET_PRINT", "LAYERS=3 EXTRUDER_TEMP=215 BED_TEMP=60", homed=""),
                          ["G28", "POLYDYE_OFFSET_PRINT LAYERS=3 EXTRUDER_TEMP=215.0 BED_TEMP=60.0"])
         self.assertEqual(run(self.macros, "PD_OFFSET_PRINT", homed="xyz"), ["POLYDYE_OFFSET_PRINT"])
+        self.assertEqual(run(self.macros, "PD_TEST_PAGE", "X=120 PRIME=0.5", homed="xy"),
+                         ["G28", "POLYDYE_TEST_PAGE Z=1.0 X=120.0 PRIME=0.5"])
+        self.assertEqual(run(self.macros, "PD_TEST_PAGE", "Z=1.5", homed="xyz"), ["POLYDYE_TEST_PAGE Z=1.5"])
 
     def test_refused_during_a_print_before_homing(self):
-        for name in ("PD_ALIGN_PRINT", "PD_OFFSET_PRINT"):
+        for name in ("PD_ALIGN_PRINT", "PD_OFFSET_PRINT", "PD_TEST_PAGE"):
             with self.assertRaisesRegex(MacroError, "not during a print"):
                 run(self.macros, name, homed="", print_state="paused")
-        with self.assertRaisesRegex(MacroError, "Z must be"):
-            run(self.macros, "PD_ALIGN_PRINT", "Z=0.1")
+        for name in ("PD_ALIGN_PRINT", "PD_TEST_PAGE"):
+            with self.assertRaisesRegex(MacroError, "Z must be"):
+                run(self.macros, name, "Z=0.1")
 
 
 if __name__ == "__main__":
