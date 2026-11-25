@@ -121,8 +121,8 @@ class Layer:
         self.index = index
         self.start_line = None  # its ;LAYER_CHANGE line
         self.z = None
-        self.heights = {}  # object index -> its layer height (;HEIGHT:), where the G-code says
         self.segs = []  # (tool, kind, object, x0, y0, x1, y1, width)
+        self.seg_heights = []  # each one's ;HEIGHT: (None where the G-code doesn't say)
         self.last_line = None  # the line of its last extrusion
         self.end = None  # (x, y, z) after it
         self.end_object = None  # the EXCLUDE_OBJECT name it was in, or None
@@ -210,8 +210,7 @@ def parse(lines):
             if de > 0 and (nx != x or ny != y) and cur is not None:
                 index = objects.setdefault(obj, len(objects))
                 cur.segs.append((tool, kind, index, x, y, nx, ny, width))
-                if height and kind != OTHER:
-                    cur.heights[index] = height
+                cur.seg_heights.append(height)
                 cur.last_line, cur.end, cur.end_object, cur.accel = n, (nx, ny, nz), obj, accel
             if de or nx != x or ny != y or nz != z:
                 moves.append((n, nx - x, ny - y, nz - z, de, speed, accel, scv, flush))
@@ -556,22 +555,30 @@ class Shell:
     layer and the ones above and below: the distance from the cell's centre, half-way up the layer, to the nearest
     place outside the object (beside it in its own or another layer's plastic, above its top, below its bottom). Each
     layer's plastic is its lines' cells, gaps in the infill filled in but holes in the model kept (fill_body()), as a
-    slab its layer height thick; per object, from its own layers' lines (an object's layer heights can differ)."""
+    slab its layer height thick; per object, from its own layers' lines (an object's layer heights can differ). The
+    layer height is its thinnest line's ;HEIGHT:; a thicker line (combined infill, several layers' high) is plastic in
+    the layers below it too, down as far as it reaches."""
 
     def __init__(self, grid, layers, support, depth):
         self.grid, self.layers, self.depth = grid, layers, depth
         self.windows = dict((k, (r0, g0, cells.shape)) for k, (r0, g0, cells) in support.windows.items())
-        self.own, self.at, self.cache = {}, {}, {}
+        self.own, self.at, self.cache, self.thickest = {}, {}, {}, {}
         last = {}
         for layer in layers:
-            mine = set(s[2] for s in layer.segs if s[1] != OTHER)
+            mine = {}
+            for s, h in zip(layer.segs, layer.seg_heights):
+                if s[1] != OTHER:
+                    mine.setdefault(s[2], []).append(h)
             top = layer.z if layer.z is not None else layer.end[2] if layer.end else None
             for k in sorted(mine):
                 if top is None or (k in last and top <= last[k] + 1e-6):
                     raise PostError("--depth needs each object's layers going up in Z (not by-object printing)")
-                height = round(layer.heights.get(k) or top - last.get(k, 0.), 4)
+                known = [h for h in mine[k] if h]
+                height = round(min(known) if known else top - last.get(k, 0.), 4)
+                thick = max(height, round(max(known), 4) if known else 0.)
                 self.at[(k, layer.index)] = len(self.own.setdefault(k, []))
-                self.own[k].append((layer.index, round(top, 4), height))
+                self.own[k].append((layer.index, round(top, 4), height, thick))
+                self.thickest[k] = max(self.thickest.get(k, 0.), thick)
                 last[k] = top
 
     def distances(self, k, j):
@@ -579,10 +586,19 @@ class Shell:
         key = (k, j)
         if key not in self.cache:
             r0, g0, shape = self.windows[k]
-            grid = self.grid
-            layer = self.layers[self.own[k][j][0]]
-            segs = np.array([s[3:] for s in layer.segs], float).reshape(-1, 5)
-            meta = np.array([s[:3] for s in layer.segs], int).reshape(-1, 3)
+            grid, own = self.grid, self.own[k]
+            mid = own[j][1] - own[j][2] / 2.
+            lines = list(self.layers[own[j][0]].segs)
+            # Lines of the layers above that reach down past this one's middle (combined infill).
+            for m in range(j + 1, len(own)):
+                if own[m][1] - self.thickest[k] >= mid:
+                    break
+                if own[m][3] > own[m][2] + Z_GAP:
+                    above = self.layers[own[m][0]]
+                    lines += [s for s, h in zip(above.segs, above.seg_heights)
+                              if s[2] == k and s[1] != OTHER and h and own[m][1] - h < mid]
+            segs = np.array([s[3:] for s in lines], float).reshape(-1, 5)
+            meta = np.array([s[:3] for s in lines], int).reshape(-1, 3)
             mine = (meta[:, 2] == k) & (meta[:, 1] != OTHER)
             lines, infill = np.zeros(shape, bool), np.zeros(shape, bool)
             stamp(lines, r0, g0, grid, segs[mine])
