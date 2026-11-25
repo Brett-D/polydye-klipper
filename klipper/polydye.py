@@ -1529,6 +1529,16 @@ class PolyDye:
             self._warm_plan(gcmd, cmd, warm,
                             *pass_warm_settings(warm_words, warm_period, self.warm_pulse, self.warm_period_us))
         prespit = gcmd.get_float('PRESPIT', None, minval=0., maxval=PRESPIT_MAX_S)
+        # The pre-spit is the stock pattern, for colour templates: refuse a black stripe whose pass would pre-spit
+        # (PRESPIT, else warm_prespit, after its warm-up: WARM, or the automatic one) before anything moves or prints.
+        if (self.warm_prespit if prespit is None else prespit) and (
+                warm if explicit_warm else
+                self.warm_seconds and self.spit_run_cmd is not None and self.warm_duty_ppm is not None):
+            black = [tpl for tpl, _ in stripes if tpl.startswith('black')]
+            if black:
+                raise gcmd.error("%s: the pre-spit (%s) is the stock pattern, for a colour cartridge template, not %s; "
+                                 "use PRESPIT=0 with black stripes"
+                                 % (cmd, "PRESPIT" if prespit is not None else "warm_prespit", ", ".join(black)))
         pass_warm = ((" WARM=%g%s%s" % (warm, " WARM_PULSE=%d" % (warm_words,) if warm_words else "",
                                         " WARM_PERIOD_US=%d" % (warm_period,) if warm_period else "")
                       if explicit_warm else "") + (" PRESPIT=%g" % (prespit,) if prespit is not None else ""))

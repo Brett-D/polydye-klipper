@@ -719,6 +719,26 @@ class TestCleanup(unittest.TestCase):
         pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b_late:6", PRESPIT=0.3, **self.FIRE))
         self.assertTrue([s for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_PASS")][0].endswith(
             " DIR=1 PRESPIT=0.3"))
+        # The pre-spit is the stock pattern: a black stripe whose pass would pre-spit (PRESPIT or warm_prespit, after an
+        # asked-for or automatic warm-up) is refused before anything moves; with no warm-up or no pre-spit it prints.
+        cases = ((dict(WARM=0.5, PRESPIT=0.3), 0., "PRESPIT"), (dict(PRESPIT=0.3), 0., "PRESPIT"),
+                 ({}, 0.2, "warm_prespit"), (dict(WARM=0., PRESPIT=0.3), 0., None),
+                 (dict(WARM=0.5, PRESPIT=0.), 0.2, None))
+        for kw, warm_prespit, refused in cases:
+            pd, board = self.make(fail_on="NOTHING")
+            pd.spit_run_cmd = object()
+            self.newer_warm_up(pd)
+            pd.warm_prespit = warm_prespit
+            fire = lambda: pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b_late:6,black_b:6", PATTERN='all',
+                                                              **dict(self.FIRE, **kw)))
+            if refused:
+                with self.assertRaisesRegex(RuntimeError, r"the pre-spit \(%s\) is the stock pattern, for a colour "
+                                                          "cartridge template, not black_b" % (refused,)):
+                    fire()
+                self.assertEqual(board.sent, [], kw)
+            else:
+                fire()
+                self.assertEqual(len([s for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_PASS")]), 2)
         for warm, tail in ((0., " DIR=1 WARM=0"), (None, " DIR=1")):
             pd, board = self.make(fail_on="NOTHING")
             pd.spit_run_cmd = object()
