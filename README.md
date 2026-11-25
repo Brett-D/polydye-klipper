@@ -249,8 +249,9 @@ offset_y: -8.7
 #warm_pulse: 1        # its pulse in bus words (1 = 0.35 us: no ink even on a hot head; up to 8 = 2.80 us)
 #warm_period_us: 254  # one all-nozzle warm-up column every this many us (at most 0.58 % heater duty)
 #warm_idle_time: 60   # s without firing after which the head counts as cold again
-#warm_position: pass  # where warm-ups run: pass (warm_clearance mm behind the pass's run-up), sponge, or X, Y
+#warm_position: sponge # where warm-ups run: sponge (POLYDYE_WIPE's X), X, Y over printed plastic, or pass
 #warm_clearance: 10   # mm behind the pass's run-up start, for warm_position: pass
+#warm_prespit: 0      # s of stock-pattern spit at the warm spot right after a warm-up (0: none; up to 5)
 #mcu: polydye
 #data_port:           # the board's data port; default: the [mcu polydye] serial path with -if02 instead of -if00
 ```
@@ -331,8 +332,8 @@ If anything would print a pass wrongly, Klipper stops with a readable reason, fo
 |---|---|
 | `POLYDYE_ENABLE [LIVE=1]` | Turns the board's boost on. `LIVE=1` (default) allows real ink; `LIVE=0` is a dry run: the bus runs with the fire lines held off |
 | `POLYDYE_DISABLE` | Waits for queued moves, then turns live output and the boost off |
-| `POLYDYE_PASS LAYER= PASS= X= Y= [DIR=1] [SPEED=] [WARM=] [WARM_PULSE=] [WARM_PERIOD_US=]` | Prints one pass (above), after an automatic head warm-up off the print if live ink is on and the head is cold; `WARM` asks for one (seconds), `WARM=0` for none (see "Automatic head warm-up") |
-| `POLYDYE_CANCEL` | Drops passes that are scheduled but not started (for a cancel macro) |
+| `POLYDYE_PASS LAYER= PASS= X= Y= [DIR=1] [SPEED=] [WARM=] [WARM_PULSE=] [WARM_PERIOD_US=] [PRESPIT=]` | Prints one pass (above), after an automatic head warm-up off the print if live ink is on and the head is cold; `WARM` asks for one (seconds), `WARM=0` for none, `PRESPIT` adds a stock-pattern pre-spit after it (see "Automatic head warm-up") |
+| `POLYDYE_CANCEL` | Drops passes that are scheduled but not started (for a cancel macro). The add-on does this itself, and turns live ink off, within 2 s of a print being cancelled or stopping with an error: the print's own `POLYDYE_ENABLE LIVE=0` never runs then (`CANCEL_PRINT` waits for the command running, such as a pass's warm-up) |
 | `POLYDYE_STATUS` | Board status: boost, live, passes printed and queued, worst column lateness, faults, stored passes, cartridge template, fire pulse; and the offsets and direction trim in use |
 | `POLYDYE_NUDGE [X=] [Y=] [TRIM=]` | Moves where the ink lands by `X`, `Y` mm on the bed, and the ink of reverse passes by `TRIM` mm along the pass axis (each at most ±5 mm), from the next pass on. Changes `offset_x`/`offset_y` (in the opposite direction: the offset is where the cartridge is) and `direction_trim` until the next restart |
 | `POLYDYE_OFFSET [X=] [Y=] [TRIM=]` | Sets `offset_x`, `offset_y` and `direction_trim` until the next restart; without arguments, shows them |
@@ -463,15 +464,24 @@ and `WARM=0` for none.
   17 mm before a cyan text pass: 0.35 µs every 508 µs lost the word's first 10 mm; **0.35 µs every 254 µs printed it
   complete, with no dot where it warmed** (2 of 39,370 column times missed); 0.70 µs every 508 µs printed it complete
   but left a small dot, every 192 µs a blob; 2.80 µs spat a puddle.
-- **Where: `warm_position`, never over the print.** A hot head can put ink down during a warm-up, and a long travel
-  after it lets the head cool (140 mm from a park spot lost the first ~6 mm of the pass). So by default (`pass`) it
-  warms `warm_clearance` mm (10) behind the pass's run-up start along the pass axis, at the pass's Z and within the
-  axis, and the pass travels on from there. Or:
-  - `sponge`: the wipe sponge, at `POLYDYE_WIPE`'s X (G-code coordinates; `variable_x`, 245);
-  - `X, Y`: a bed spot for the cartridge (bed coordinates, like `POLYDYE_PASS`'s X and Y), e.g. a strip of paper towel.
+- **Where: `warm_position`, never over the print, and no ink on the glass bed.** A hot head can put ink down during a
+  warm-up, a pre-spit does on purpose, and the spot is often beyond the print. So by default (`sponge`) it warms over
+  the wipe sponge at the X gantry's right end, at `POLYDYE_WIPE`'s X (G-code coordinates; `variable_x`, 245). Nothing
+  wipes the cartridge there (`POLYDYE_WIPE` does that on its own). Or:
+  - `X, Y`: a bed spot for the cartridge (bed coordinates, like `POLYDYE_PASS`'s X and Y) over printed plastic, e.g. a
+    prime pad printed first;
+  - `pass`: `warm_clearance` mm (10) behind the pass's run-up start along the pass axis, at the pass's Z and within the
+    axis, and the pass travels on from there. Only where printed plastic lies under it, such as a base under the part.
+    A long travel after a warm-up lets the head cool (140 mm from a park spot lost the first ~6 mm of the pass), and
+    `pass` keeps it short; a pre-spit at the sponge is the other cure.
 
-  For those two the toolhead rises by `POLYDYE_WIPE`'s `z_hop` (1 mm, no higher than the Z axis allows), travels
-  there at `travel_speed`, warms, travels back at that height and comes down.
+  For `sponge` and `X, Y` the toolhead rises by `POLYDYE_WIPE`'s `z_hop` (1 mm, no higher than the Z axis allows),
+  travels there at `travel_speed`, warms, travels back at that height and comes down.
+- **Optional pre-spit (testing):** `warm_prespit` (or `POLYDYE_PASS PRESPIT=`, passed on by the fire test) adds that
+  many seconds of the stock pattern every 508 µs right after the warm-up, at the warm spot, in the same board run, for
+  testing whether cyan, which still missed the first 9–14 mm of some passes after a gentle warm-up, needs real
+  ejection first. It puts ink down there: at the sponge by default, or on the printed plastic under an `X, Y` or `pass`
+  spot; never on the glass. Off by default; colour templates only.
 - **If a warm-up fails,** the board's run is cancelled, and the cartridge goes back (or the pass goes on) only once the
   board is seen idle; otherwise it stays over the warm spot and the pass doesn't run.
 - During a print it costs `warm_seconds` each time the head has been idle that long (between layers, typically), with
