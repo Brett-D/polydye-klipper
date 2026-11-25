@@ -28,7 +28,9 @@ post-processing script, this then rewrites the G-code:
 No ink on the glass bed: a dot is only inked where a drop landing up to --edge-margin mm off still lands on plastic
 printed so far (with a brim, the colour reaches the model's edge). Nor beyond the model's surface: a dot is only inked
 where the layer's own part reaches at least --inset mm further out (ink outside the wall fell on the base below and
-smeared at its foot, 2026-11-25).
+smeared at its foot, 2026-11-25). With --depth, only near it: a dot is inked only where it lies at most --depth mm
+under the model's surface, beside it or above or below it (a top or bottom face), however deep Orca's colour goes (ink
+2.3 mm into natural PLA read blurred and darker, 2026-11-25).
 
 The add-on applies the colour registration and direction trim from polydye.cfg, so recalibrating needs no re-slice;
 dpi and nozzle_dpi must be the ones in polydye.cfg (POLYDYE_JOB checks).
@@ -78,7 +80,15 @@ CHANNELS = 'cmy'
 # Line types (;TYPE:) that are not the model's surface: never inked, even when a coloured filament prints them.
 NO_INK_TYPES = ('skirt', 'brim', 'support', 'ironing', 'prime tower', 'wipe tower', 'custom')
 TOP_TYPE = 'top surface'
-MODEL, TOP, OTHER = 1, 2, 0
+# Line kinds: OTHER (never inked), the model's walls and others (MODEL), its top surface (TOP) and its other infill
+# (INFILL: sparse, solid, bottom surface, bridges, gap fill), which --depth tells from walls.
+MODEL, TOP, OTHER, INFILL = 1, 2, 0, 3
+# --depth: an enclosed empty region of a layer that touches no infill and is at least HOLE_MIN_MM2 is a hole in the
+# model (its walls are a surface); otherwise it's a gap in the infill, inside the model.
+HOLE_MIN_MM2 = 0.1
+# Heights and Z within Z_TOLERANCE mm are the same (Orca writes ;HEIGHT:0.200001): a layer exactly --depth under the
+# top is inked. A step over Z_GAP mm between an object's layers is a gap (no plastic of it there).
+Z_TOLERANCE, Z_GAP = 1e-3, 0.01
 # The ordered dither: an 8 x 8 Bayer matrix over the plate's cells (nozzle positions across, column pairs along), a cell
 # firing where its colour's level is over the threshold. Each colour reads it shifted (cyan, magenta, yellow), so at up
 # to 25 % each they fire on different cells, and coat k by k - 1 cells both ways, between coat 1's.
@@ -111,6 +121,7 @@ class Layer:
         self.index = index
         self.start_line = None  # its ;LAYER_CHANGE line
         self.z = None
+        self.heights = {}  # object index -> its layer height (;HEIGHT:), where the G-code says
         self.segs = []  # (tool, kind, object, x0, y0, x1, y1, width)
         self.last_line = None  # the line of its last extrusion
         self.end = None  # (x, y, z) after it
@@ -129,7 +140,7 @@ def parse(lines):
     in_config = False
     tool, x, y, z, e = 0, 0., 0., 0., 0.
     absolute, e_relative = True, False
-    width, kind, obj, cur = 0.45, MODEL, None, None
+    width, kind, obj, cur, height = 0.45, MODEL, None, None, None
     objects = {}
     moves, dwells = [], []
     speed, accel, scv, flush = 25., None, None, True
@@ -145,9 +156,15 @@ def parse(lines):
                     cur.z = float(s[3:])
             elif s.startswith(';WIDTH:'):
                 width = float(s[7:])
+            elif s.startswith(';HEIGHT:'):
+                try:
+                    height = float(s[8:])
+                except ValueError:
+                    height = None
             elif s.startswith(';TYPE:'):
                 t = s[6:].strip().lower()
-                kind = OTHER if t.startswith(NO_INK_TYPES) else TOP if t == TOP_TYPE else MODEL
+                kind = (OTHER if t.startswith(NO_INK_TYPES) else TOP if t == TOP_TYPE else
+                        INFILL if 'infill' in t or 'surface' in t or 'bridge' in t or t == 'gap fill' else MODEL)
             elif s == '; EXECUTABLE_BLOCK_START':
                 markers['exec_start'] = n
             elif s == '; EXECUTABLE_BLOCK_END':
@@ -193,6 +210,8 @@ def parse(lines):
             if de > 0 and (nx != x or ny != y) and cur is not None:
                 index = objects.setdefault(obj, len(objects))
                 cur.segs.append((tool, kind, index, x, y, nx, ny, width))
+                if height and kind != OTHER:
+                    cur.heights[index] = height
                 cur.last_line, cur.end, cur.end_object, cur.accel = n, (nx, ny, nz), obj, accel
             if de or nx != x or ny != y or nz != z:
                 moves.append((n, nx - x, ny - y, nz - z, de, speed, accel, scv, flush))
@@ -471,9 +490,172 @@ class Support:
         return out
 
 
-def layer_passes(layer, grid, support, tools, objects, opts, pitch):
+def fill_body(lines, infill, min_cells):
+    """A layer's plastic as a solid: `lines` (its lines' cells) with the enclosed empty regions that are gaps in the
+    infill filled in: those touching `infill` (cells next to its infill lines), or smaller than `min_cells`. An empty
+    region that reaches the window's edge is outside; one enclosed by walls alone is a hole in the model."""
+    free = ~lines
+    h, w = free.shape
+    edge = np.diff(np.pad(free, ((0, 0), (1, 1))).astype(np.int8), axis=1)
+    rs, cs = np.nonzero(edge == 1)  # runs of empty cells along each row: row, first column, column after the last
+    _, ce = np.nonzero(edge == -1)
+    n = len(rs)
+    if not n:
+        return lines
+    # Runs on neighbouring rows that overlap are one region: label them (hooking, then shortcutting to the roots).
+    wide = w + 1
+    key_start, key_end = rs * wide + cs, rs * wide + ce
+    up = np.nonzero(rs > 0)[0]
+    lo = np.searchsorted(key_end, (rs[up] - 1) * wide + cs[up], 'right')
+    hi = np.searchsorted(key_start, (rs[up] - 1) * wide + ce[up], 'left') - 1
+    count = np.maximum(hi - lo + 1, 0)
+    ea = np.repeat(up, count)
+    eb = np.arange(count.sum()) - np.repeat(np.cumsum(count) - count, count) + np.repeat(lo, count)
+    root = np.arange(n)
+    while len(ea):
+        pa, pb = root[ea], root[eb]
+        keep = pa != pb
+        if not keep.any():
+            break
+        ea, eb, pa, pb = ea[keep], eb[keep], pa[keep], pb[keep]
+        np.minimum.at(root, np.maximum(pa, pb), np.minimum(pa, pb))
+        while True:
+            nxt = root[root]
+            if (nxt == root).all():
+                break
+            root = nxt
+    flat = np.concatenate(([0], np.cumsum(infill.ravel() & free.ravel())))
+    touches = flat[rs * w + ce] > flat[rs * w + cs]
+    border = (rs == 0) | (rs == h - 1) | (cs == 0) | (ce == w)
+    area = np.bincount(root, weights=ce - cs, minlength=n)
+    inside = ~(np.bincount(root, weights=border, minlength=n) > 0) & (
+        (np.bincount(root, weights=touches, minlength=n) > 0) | (area < min_cells))
+    fill = inside[root]
+    if not fill.any():
+        return lines
+    start, length = (rs * w + cs)[fill], (ce - cs)[fill]
+    idx = np.arange(length.sum()) - np.repeat(np.cumsum(length) - length, length) + np.repeat(start, length)
+    body = lines.copy()
+    body.ravel()[idx] = True
+    return body
+
+
+def row_distance(body, sx, cap):
+    """Per cell, the distance (mm) along its row from its centre to the nearest cell outside `body` (to that cell's
+    edge: half a cell less than to its centre; 0 outside), at most `cap`."""
+    w = body.shape[1]
+    col = np.arange(w, dtype=np.int32)
+    left = np.maximum.accumulate(np.where(body, np.int32(-10 ** 6), col), axis=1)
+    right = np.minimum.accumulate(np.where(body, np.int32(10 ** 7), col)[:, ::-1], axis=1)[:, ::-1]
+    k = np.minimum(col - left, right - col)
+    return np.minimum(np.maximum(k - .5, 0.) * sx, cap).astype(np.float32)
+
+
+class Shell:
+    """--depth: how deep under the model's surface each cell of a layer's ink is, from the object's plastic in that
+    layer and the ones above and below: the distance from the cell's centre, half-way up the layer, to the nearest
+    place outside the object (beside it in its own or another layer's plastic, above its top, below its bottom). Each
+    layer's plastic is its lines' cells, gaps in the infill filled in but holes in the model kept (fill_body()), as a
+    slab its layer height thick; per object, from its own layers' lines (an object's layer heights can differ)."""
+
+    def __init__(self, grid, layers, support, depth):
+        self.grid, self.layers, self.depth = grid, layers, depth
+        self.windows = dict((k, (r0, g0, cells.shape)) for k, (r0, g0, cells) in support.windows.items())
+        self.own, self.at, self.cache = {}, {}, {}
+        last = {}
+        for layer in layers:
+            mine = set(s[2] for s in layer.segs if s[1] != OTHER)
+            top = layer.z if layer.z is not None else layer.end[2] if layer.end else None
+            for k in sorted(mine):
+                if top is None or (k in last and top <= last[k] + 1e-6):
+                    raise PostError("--depth needs each object's layers going up in Z (not by-object printing)")
+                height = round(layer.heights.get(k) or top - last.get(k, 0.), 4)
+                self.at[(k, layer.index)] = len(self.own.setdefault(k, []))
+                self.own[k].append((layer.index, round(top, 4), height))
+                last[k] = top
+
+    def distances(self, k, j):
+        """row_distance() of object k's j-th layer's plastic, over its window."""
+        key = (k, j)
+        if key not in self.cache:
+            r0, g0, shape = self.windows[k]
+            grid = self.grid
+            layer = self.layers[self.own[k][j][0]]
+            segs = np.array([s[3:] for s in layer.segs], float).reshape(-1, 5)
+            meta = np.array([s[:3] for s in layer.segs], int).reshape(-1, 3)
+            mine = (meta[:, 2] == k) & (meta[:, 1] != OTHER)
+            lines, infill = np.zeros(shape, bool), np.zeros(shape, bool)
+            stamp(lines, r0, g0, grid, segs[mine])
+            stamp(infill, r0, g0, grid, segs[mine & np.isin(meta[:, 1], (TOP, INFILL))])
+            body = fill_body(close(lines), dilate(infill, 1, 1), HOLE_MIN_MM2 / (grid.sx * grid.sy))
+            self.cache[key] = row_distance(body, grid.sx, self.depth + grid.sx)
+        return self.cache[key]
+
+    def near(self, layer, k, ra, ga, need):
+        """Of the cells `need` (bool, rows ra.., columns ga.. of the grid), those at most --depth under object k's
+        surface in `layer`."""
+        grid, depth = self.grid, self.depth
+        own = self.own[k]
+        j = self.at[(k, layer.index)]
+        top, height = own[j][1], own[j][2]
+        mid = top - height / 2.
+        for key in [key for key in self.cache if key[0] == k and own[key[1]][1] < mid - depth - Z_GAP]:
+            del self.cache[key]  # below everything still to come
+        # The object's layers within --depth above and below, each as (its index, how far above or below its slab
+        # is); where its plastic stops (its top, its bottom, a gap between its layers), everything is outside.
+        slabs, free = [(j, 0.)], []
+        edge, n = top, j + 1
+        while True:
+            if n == len(own) or own[n][1] - own[n][2] > edge + Z_GAP:
+                free.append(edge - mid)
+                break
+            dz = own[n][1] - own[n][2] - mid
+            if dz > depth + Z_TOLERANCE:
+                break
+            slabs.append((n, dz))
+            edge, n = own[n][1], n + 1
+        edge, n = top - height, j - 1
+        while True:
+            if n < 0 or own[n][1] < edge - Z_GAP:
+                free.append(mid - edge)
+                break
+            dz = mid - own[n][1]
+            if dz > depth + Z_TOLERANCE:
+                break
+            slabs.append((n, dz))
+            edge, n = own[n][1] - own[n][2], n - 1
+        limit = depth + Z_TOLERANCE
+        if free and min(free) <= limit:
+            return need.copy()
+        r0, g0, shape = self.windows[k]
+        rr, gg = np.nonzero(need)
+        wr, wg = rr + ra - r0, gg + ga - g0
+        found = np.zeros(len(rr), bool)
+        todo = np.arange(len(rr))
+        for n, dz in sorted(slabs, key=lambda s: s[1]):
+            if not len(todo):
+                break
+            fx = self.distances(k, n)
+            reach = math.sqrt(max(0., limit * limit - dz * dz))
+            best = np.full(len(todo), np.inf, np.float32)
+            for dr in range(-int(reach / grid.sy + 1.5), int(reach / grid.sy + 1.5) + 1):
+                ay = max(0., abs(dr) * grid.sy - grid.sy / 2.)
+                if ay > reach:
+                    continue
+                v = fx[np.clip(wr[todo] + dr, 0, shape[0] - 1), wg[todo]]
+                np.minimum(best, v * v + ay * ay, out=best)
+            hit = best + dz * dz <= limit * limit
+            found[todo[hit]] = True
+            todo = todo[~hit]
+        out = np.zeros(need.shape, bool)
+        out[rr[found], gg[found]] = True
+        return out
+
+
+def layer_passes(layer, grid, support, tools, objects, opts, pitch, shell=None):
     """The ink passes for `layer`, in printing order, with their directions; `support` (a Support: plastic so far, all
-    layers up to this one) is updated with the layer."""
+    layers up to this one) is updated with the layer; `shell` (a Shell, with --depth) keeps the ink near the
+    surface."""
     segs = np.array([s[3:] for s in layer.segs], float).reshape(-1, 5)
     meta = np.array([s[:3] for s in layer.segs], int).reshape(-1, 3)
     support.add(segs, meta)
@@ -520,6 +702,9 @@ def layer_passes(layer, grid, support, tools, objects, opts, pitch):
             cells, top = close(cells) & allowed, close(top)
             n = np.where(top & cells, opts.top_coats, np.where(cells, opts.wall_coats, 0))
             coats.append((tools[t], n))
+        if shell is not None and coats:
+            near = shell.near(layer, obj, r0, g0, np.logical_or.reduce([n > 0 for _, n in coats]))
+            coats = [(cov, np.where(near, n, 0)) for cov, n in coats]
         name = objects[obj]
         for coat in range(1, max(opts.top_coats, opts.wall_coats) + 1):
             level = np.zeros((3,) + shape, np.float32)
@@ -662,11 +847,12 @@ def process(lines, opts):
     grid = Grid(x0, y0, int((pts[:, [0, 2]].max() + pad - x0) / sx) + 1, int((pts[:, [1, 3]].max() + pad - y0) / sy)
                 + 1, sx, sy)
     support = Support(grid, layers, objects, pad)
+    shell = Shell(grid, layers, support, opts.depth) if opts.depth else None
     plan = []  # (layer, passes)
     for layer in layers:
         if not layer.segs:
             continue
-        passes = layer_passes(layer, grid, support, tools, objects, opts, pitch)
+        passes = layer_passes(layer, grid, support, tools, objects, opts, pitch, shell)
         if passes:
             plan.append((layer, passes))
     passes = [p for _, ps in plan for p in ps]
@@ -683,9 +869,10 @@ def process(lines, opts):
     job = job_block(passes, opts, len(plan), len(before), count, ink_accel, ink_z,
                     opts.prewarm if before else 0.)
     size = sum(len(p.data) for p in passes)
-    summary = ("PolyDye ink job: %d passes on %d layers, %.2f MB; dpi %g, nozzle_dpi %g, ink limit %g %%; %d prewarm "
-               "bursts, %d primes" % (len(passes), len(plan), size / 1e6, opts.dpi, opts.nozzle_dpi,
-                                      opts.ink_limit * 100, len(before), count))
+    summary = ("PolyDye ink job: %d passes on %d layers, %.2f MB; dpi %g, nozzle_dpi %g, ink limit %g %%%s; %d "
+               "prewarm bursts, %d primes" % (len(passes), len(plan), size / 1e6, opts.dpi, opts.nozzle_dpi,
+                                              opts.ink_limit * 100, ", depth %g mm" % (opts.depth,) if opts.depth
+                                              else "", len(before), count))
     insert = {}
     for layer, ps in plan:
         insert.setdefault(layer.last_line, []).extend(ink_block(layer, ps, opts, layer.end_object,
@@ -805,6 +992,9 @@ def options(argv=None):
                     "printed so far; ink nearer the edge than that is left out, so none reaches the bed (default 0.5)")
     ap.add_argument("--inset", type=float, default=0.05, help="mm inside the model's surface the ink stops, so none "
                     "lands beyond it on what's below (default 0.05)")
+    ap.add_argument("--depth", type=float, default=0., help="mm: ink only where a dot is at most this far under the "
+                    "model's surface (beside, above or below it), however deep Orca's colour goes; 0: wherever the "
+                    "colour is (default 0)")
     ap.add_argument("--positions", type=positions, default=DEFAULT_POSITIONS, help="nozzle positions a pass draws on, "
                     "FIRST-LAST (default 28-82: two groups of 14 on each fire line, cyan's 29-83 with its "
                     "registration, so two inks want exactly 4 heaters per fire pulse)")
@@ -833,7 +1023,8 @@ def options(argv=None):
                     "(default: the profile's maximum X speed)")
     opts = ap.parse_args(argv)
     for name, lo in (('dpi', 1.), ('nozzle_dpi', 1.), ('ink_limit', 0.), ('gap', 0.), ('dry', 0.), ('retract', 0.),
-                     ('travel', 1.), ('edge_margin', 0.), ('inset', 0.), ('prewarm', 0.), ('prime_idle', 0.),
+                     ('travel', 1.), ('edge_margin', 0.), ('inset', 0.), ('depth', 0.), ('prewarm', 0.),
+                     ('prime_idle', 0.),
                      ('pass_speed', 1.), ('accel', 0.), ('scv', 0.), ('max_velocity', 0.), ('ink_accel', 0.),
                      ('ink_scv', 0.)):
         if getattr(opts, name) < lo:
