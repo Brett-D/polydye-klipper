@@ -8,8 +8,14 @@ post-processing script, this then rewrites the G-code:
 - every filament prints with the spool loaded: the tool changes (T0, T1, ...) go;
 - per layer, where each coloured filament's lines are becomes cyan, magenta and yellow dots: a solid colour fires every
   dot of its inks (--ink-limit, 100 %), a partial one an ordered (Bayer) dither of them, decided per pair of columns
-  (every nozzle fires at least two columns running: one fire on its own doesn't eject); cut into passes along Y about
-  5.8 mm wide, one object at a time. The add-on keeps at most 4 heaters on each fire pulse when it sends them;
+  (every nozzle fires at least two columns running: one fire on its own doesn't eject); printed as sweeps along Y
+  over each object's whole footprint, every colour in each, about 4.2 mm apart (positions 28-82), neighbours
+  overlapping by --feather positions (6) whose dots go to one or the other by a fixed random ramp, so the joins show no
+  line; the grid shifted every layer so the seams don't stack. The add-on keeps at most 4 heaters on each fire pulse
+  and 5 on a packet's two together when it sends them, splitting a sweep that needs more into one board pass per fire
+  line;
+- each layer's ink moves gently (POLYDYE_INK_MOTION: --ink-accel 1000, --ink-scv 1), the print's limits put back
+  after it;
 - after each layer's last extrusion, POLYDYE_JOB_PASS prints those passes --gap mm above it, so the next layer seals the
   ink in, in --wall-coats and --top-coats coats (1);
 - the head is hot and its nozzles primed when the ink comes: POLYDYE_PREWARM about --prewarm s (6) of moves before each
@@ -59,12 +65,12 @@ except ImportError:  # reported by main(), so the module still imports for its t
 # byte j holding nozzle positions p with p % 14 == j, as bit p // 14. Position p lands at X = x + (50 - p) * 25.4 /
 # nozzle_dpi (positions go towards -X; POLYDYE_PASS's X names where position 50 lands), column i at Y = y + i * 25.4 /
 # dpi before colour registration. object is the EXCLUDE_OBJECT name the ink belongs to ("-": none).
-JOB_VERSION = 1
+JOB_VERSION = 2  # 2: POLYDYE_INK_MOTION in the ink blocks (an older add-on refuses the job before the print starts)
 COLOR_BYTES = 14
 # The nozzle positions the stock firmware fires (its random pattern's, 14-85); the job draws on DEFAULT_POSITIONS,
 # leaving 2 positions each way for the colour registration across the pass.
 NOZZLE_FIRST, NOZZLE_LAST = 14, 85
-DEFAULT_POSITIONS = (16, 83)
+DEFAULT_POSITIONS = (28, 82)
 REF_POSITION = 50
 DATA_LINE = 1024  # base64 characters per ;PDD line
 MAX_LAYERS = 65000  # the board's pass keys: layer numbers from 65000 on are the add-on's own (calibration)
@@ -402,14 +408,25 @@ def _box(a, hy, hx, every):
     return a
 
 
-def swaths(occupied, width):
-    """Fewest runs of `width` grid columns covering the sorted column numbers `occupied`: their first columns."""
-    starts, end = [], None
-    for g in occupied:
-        if end is None or g >= end:
-            starts.append(g)
-            end = g + width
-    return starts
+GOLDEN = (5 ** 0.5 - 1) / 2
+
+
+def cell_hash(q, r):
+    """A fixed pseudo-random 0-1 per plate cell (rows q, grid columns r: integer arrays), the same for every sweep."""
+    h = (q.astype(np.int64) * 73856093) ^ (r.astype(np.int64) * 19349663)
+    h = (h ^ (h >> 13)) * 1274126177
+    return ((h ^ (h >> 16)) & 0xFFFF) / 65536.
+
+
+def swaths(lo, hi, width, overlap, phase):
+    """The first grid columns of the fewest runs of `width` columns, each overlapping the next by `overlap`, that
+    cover columns lo..hi: the sweeps over an object's whole footprint. Their spare columns go `phase` (0-1) of the way
+    to the low side, so layers with different phases don't line up their seams."""
+    span, step = hi - lo + 1, width - overlap
+    n = 1 if span <= width else 1 + int(math.ceil((span - width) / float(step)))
+    spare = (n - 1) * step + width - span
+    start = lo - int(math.floor(phase * (spare + 1)))
+    return [start + j * step for j in range(n)]
 
 
 class InkPass:
@@ -521,9 +538,31 @@ def layer_passes(layer, grid, support, tools, objects, opts, pitch):
                 cols = (np.arange(g0, g0 + shape[1]) + dg) % 8
                 fires[ch] = level[ch] > bayer[np.ix_(rows, cols)]
             occupied = np.nonzero(fires.any(axis=(0, 1)))[0]
-            for gs in swaths(occupied.tolist(), width):
-                sub = fires[:, :, gs:gs + width]
+            if not len(occupied):  # a tone so light the dither fires nothing (--ink-limit 0.5, say)
+                continue
+            # Sweeps over the whole footprint along Y, every colour in each, the grid shifted per layer (and coat).
+            # Neighbours overlap by --feather positions; there each cell (two rows, so four bus columns: pairs stay
+            # together; one position) goes to one of them, the right one where its fixed hash is under a ramp that
+            # rises across the band: every dot prints once, and the join has no line (polydye_picture4, 2026-11-25).
+            phase = (layer.index * GOLDEN + (coat - 1) / 2.) % 1.
+            padded = np.pad(fires, ((0, 0), (0, 0), (width, width)))
+            starts = swaths(int(occupied[0]), int(occupied[-1]), width, opts.feather, phase)
+            if opts.feather:
+                band = np.arange(opts.feather)
+                ramp = (band + .5) / opts.feather
+                cells = (np.arange(r0, r0 + shape[0]) // 2)[:, None]
+            for j, gs in enumerate(starts):
+                sub = padded[:, :, gs + width:gs + 2 * width]
+                if opts.feather and len(starts) > 1:
+                    sub = sub.copy()
+                    if j > 0:  # the band shared with the sweep before: keep the cells the ramp gives this one
+                        sub[:, :, :opts.feather] &= cell_hash(cells, g0 + gs + band[None, :]) < ramp
+                    if j < len(starts) - 1:
+                        edge = width - opts.feather
+                        sub[:, :, edge:] &= cell_hash(cells, g0 + gs + edge + band[None, :]) >= ramp
                 rows = np.nonzero(sub.any(axis=(0, 2)))[0]
+                if not len(rows):
+                    continue
                 ri0, ri1 = rows[0], rows[-1]
                 colours, planes = '', []
                 for ch in range(3):
@@ -560,7 +599,10 @@ def ink_block(layer, passes, opts, inside, primes=()):
     g += ["SAVE_GCODE_STATE NAME=polydye_ink", "G90", "M83"]
     if opts.retract:
         g.append("G1 E-%.2f F2700" % (opts.retract,))
-    g += ["G1 Z%.3f F600" % (z + opts.gap,), "POLYDYE_ENABLE LIVE=%d" % (0 if opts.dry_run else 1)]
+    g.append("G1 Z%.3f F600" % (z + opts.gap,))
+    if opts.ink_accel:
+        g.append("POLYDYE_INK_MOTION ACCEL=%g SCV=%g" % (opts.ink_accel, opts.ink_scv))
+    g.append("POLYDYE_ENABLE LIVE=%d" % (0 if opts.dry_run else 1))
     for k, p in enumerate(passes):
         if k in primes:
             g.append("POLYDYE_PRIME ; colours idle %g s or more (or the first ink): primed at the sponge"
@@ -568,6 +610,8 @@ def ink_block(layer, passes, opts, inside, primes=()):
         g.append("POLYDYE_JOB_PASS N=%d ; layer %d pass %d, coat %d, %s, X=%.3f Y=%.3f DIR=%d" % (
             p.n, p.layer, p.number, p.coat, p.colours, p.x, p.y, p.dir))
     g += ["M400", "POLYDYE_ENABLE LIVE=0"]
+    if opts.ink_accel:
+        g.append("POLYDYE_INK_MOTION RESTORE=1")
     if opts.dry > 0:
         g.append("G4 P%d" % (int(round(opts.dry * 1000)),))
     g += ["G1 X%.3f Y%.3f F%d" % (x, y, opts.travel * 60), "G1 Z%.3f F600" % (z,)]
@@ -631,7 +675,9 @@ def process(lines, opts):
     for n, p in enumerate(passes):
         p.n = n
     before, primes = warm_and_prime(lines, layers, plan, config, timing, opts)
-    ink_accel = min([layer.accel for layer, _ in plan if layer.accel] or [0.])
+    # The lowest acceleration an ink block can run at: the G-code's, or POLYDYE_INK_MOTION's if lower (0: unknown).
+    ink_accel = min([layer.accel for layer, _ in plan if layer.accel] + ([opts.ink_accel] if opts.ink_accel else [])
+                    or [0.])
     ink_z = max(layer.end[2] + opts.gap for layer, _ in plan)
     count = sum(len(v) for v in primes.values())
     job = job_block(passes, opts, len(plan), len(before), count, ink_accel, ink_z,
@@ -704,7 +750,9 @@ def warm_and_prime(lines, layers, plan, config, timing, opts):
                 primes.setdefault(layer.index, []).append(j)
                 now += PRIME_TRIP_S
                 last_eject = dict.fromkeys(CHANNELS, now)
-            now += (p.columns * pitch + 2 * RUN_UP_MM) / opts.pass_speed + 60. / opts.travel
+            # Two inks or more may go as two board passes, one per fire line (the add-on decides).
+            sweeps = 2 if len(p.colours) > 1 else 1
+            now += sweeps * ((p.columns * pitch + 2 * RUN_UP_MM) / opts.pass_speed + 60. / opts.travel)
             last_eject.update(dict.fromkeys(p.colours, now))
         prime = 0 in primes.get(layer.index, ())
         if opts.prewarm > 0:
@@ -758,7 +806,14 @@ def options(argv=None):
     ap.add_argument("--inset", type=float, default=0.05, help="mm inside the model's surface the ink stops, so none "
                     "lands beyond it on what's below (default 0.05)")
     ap.add_argument("--positions", type=positions, default=DEFAULT_POSITIONS, help="nozzle positions a pass draws on, "
-                    "FIRST-LAST (default 16-83: 2 to spare for the colour registration each way)")
+                    "FIRST-LAST (default 28-82: two groups of 14 on each fire line, cyan's 29-83 with its "
+                    "registration, so two inks want exactly 4 heaters per fire pulse)")
+    ap.add_argument("--feather", type=int, default=6, help="nozzle positions neighbouring sweeps overlap by, their "
+                    "dots shared out by a fixed random ramp so the joins show no line; 0: side by side (default 6)")
+    ap.add_argument("--ink-accel", type=float, default=1000., help="mm/s^2 at most while a layer's ink prints "
+                    "(POLYDYE_INK_MOTION; 0: the print's own) (default 1000)")
+    ap.add_argument("--ink-scv", type=float, default=1., help="square corner velocity at most while a layer's ink "
+                    "prints, mm/s (default 1)")
     ap.add_argument("--one-direction", dest="bidirectional", action="store_false",
                     help="every pass along +Y (default: alternate directions)")
     ap.add_argument("--dry-run", action="store_true", help="the passes run with live ink off: the moves, no ink, and "
@@ -779,11 +834,14 @@ def options(argv=None):
     opts = ap.parse_args(argv)
     for name, lo in (('dpi', 1.), ('nozzle_dpi', 1.), ('ink_limit', 0.), ('gap', 0.), ('dry', 0.), ('retract', 0.),
                      ('travel', 1.), ('edge_margin', 0.), ('inset', 0.), ('prewarm', 0.), ('prime_idle', 0.),
-                     ('pass_speed', 1.), ('accel', 0.), ('scv', 0.), ('max_velocity', 0.)):
+                     ('pass_speed', 1.), ('accel', 0.), ('scv', 0.), ('max_velocity', 0.), ('ink_accel', 0.),
+                     ('ink_scv', 0.)):
         if getattr(opts, name) < lo:
             ap.error("--%s must be at least %g" % (name.replace('_', '-'), lo))
     if opts.ink_limit > 100.:
         ap.error("--ink-limit is a percentage, at most 100")
+    if not 0 <= opts.feather <= (opts.positions[1] - opts.positions[0] + 1) // 2:
+        ap.error("--feather must be 0 to half a sweep's width")
     if opts.prewarm > PREWARM_MAX_S:
         ap.error("--prewarm is at most %g s (a burst is at most 65535 columns: 16.6 s at warm_period_us 254)"
                  % (PREWARM_MAX_S,))

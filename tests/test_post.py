@@ -135,12 +135,15 @@ class Structure(unittest.TestCase):
         self.assertIn("POLYDYE_ENABLE LIVE=1\nPOLYDYE_PRIME ;", text.split("; PolyDye ink: layer 1")[0])
         block = text.split("; PolyDye ink: layer 2")[1].split(";TYPE:Custom")[0].split("\n")[1:]
         x, y = re.match(r"G1 X([\d.]+) Y([\d.]+) E", out[blocks[-1] - 1]).groups()
-        self.assertEqual(block[:7], ["EXCLUDE_OBJECT_END NAME=cube", "SAVE_GCODE_STATE NAME=polydye_ink", "G90", "M83",
-                                     "G1 E-1.50 F2700", "G1 Z1.600 F600", "POLYDYE_ENABLE LIVE=1"])
+        # Gentler moves while the ink prints (POLYDYE_INK_MOTION), the limits put back right after it.
+        self.assertEqual(block[:8], ["EXCLUDE_OBJECT_END NAME=cube", "SAVE_GCODE_STATE NAME=polydye_ink", "G90", "M83",
+                                     "G1 E-1.50 F2700", "G1 Z1.600 F600", "POLYDYE_INK_MOTION ACCEL=1000 SCV=1",
+                                     "POLYDYE_ENABLE LIVE=1"])
         passes = [ln for ln in block if ln.startswith("POLYDYE_JOB_PASS")]
         self.assertTrue(passes)
-        self.assertEqual(block[7 + len(passes):], [
-            "M400", "POLYDYE_ENABLE LIVE=0", "G4 P5000", "G1 X%.3f Y%.3f F9000" % (float(x), float(y)),
+        self.assertEqual(block[8 + len(passes):], [
+            "M400", "POLYDYE_ENABLE LIVE=0", "POLYDYE_INK_MOTION RESTORE=1", "G4 P5000",
+            "G1 X%.3f Y%.3f F9000" % (float(x), float(y)),
             "G1 Z0.600 F600", "G1 E1.50 F2400", "RESTORE_GCODE_STATE NAME=polydye_ink",
             "EXCLUDE_OBJECT_START NAME=cube", "POLYDYE_JOB_END", "G1 E-.8 F2100",
             "M104 S210 ; set nozzle temperature", "EXCLUDE_OBJECT_END NAME=cube", ""])
@@ -148,20 +151,29 @@ class Structure(unittest.TestCase):
         numbers = [int(n) for n in re.findall(r"POLYDYE_JOB_PASS N=(\d+)", text)]
         self.assertEqual(numbers, list(range(len(numbers))))
         tail = text.split("; EXECUTABLE_BLOCK_END\n")[1]
-        self.assertTrue(tail.lstrip().startswith("; POLYDYE_JOB_BEGIN\n;PDJ version=1 dpi=847 nozzle_dpi=300 "
-                                                 "pass_axis=y positions=16-83 passes=%d layers=3 " % (len(numbers),)))
+        self.assertTrue(tail.lstrip().startswith("; POLYDYE_JOB_BEGIN\n;PDJ version=2 dpi=847 nozzle_dpi=300 "
+                                                 "pass_axis=y positions=28-82 passes=%d layers=3 " % (len(numbers),)))
+        # --ink-accel 0: the print's own motion limits.
+        out, _ = run(src, "--ink-accel", "0")
+        self.assertNotIn("POLYDYE_INK_MOTION", "".join(out))
         self.assertTrue(tail.endswith("; filament used [mm] = 1.0, 1.0\n"))
         self.assertLess(tail.index("; POLYDYE_JOB_END"), tail.index("; CONFIG_BLOCK_START"))
 
     def test_the_job_says_how_high_and_how_slow_its_ink_goes(self):
         # The ink 1 mm (--gap) above the top inked layer (Z 0.6); the acceleration the G-code sets (none: 0); the
         # bursts' length.
-        out, _ = run(block_gcode(layers=3))
+        out, _ = run(block_gcode(layers=3), "--ink-accel", "0")
         self.assertIn(" ink_accel=0 ink_z=1.600 prewarm_s=6 ", "".join(out))
         src = block_gcode(layers=3)
         src.insert(src.index("G90\n"), "SET_VELOCITY_LIMIT ACCEL=1500\n")
-        out, _ = run(src, "--gap", "2", "--prewarm", "0")
+        out, _ = run(src, "--gap", "2", "--prewarm", "0", "--ink-accel", "0")
         self.assertIn(" ink_accel=1500 ink_z=2.600 prewarm_s=0 ", "".join(out))
+        # POLYDYE_INK_MOTION's 1000 (by default) is the lowest then; a lower one the G-code sets stays the lowest.
+        out, _ = run(src)
+        self.assertIn(" ink_accel=1000 ", "".join(out))
+        src[src.index("SET_VELOCITY_LIMIT ACCEL=1500\n")] = "SET_VELOCITY_LIMIT ACCEL=600\n"
+        out, _ = run(src)
+        self.assertIn(" ink_accel=600 ", "".join(out))
 
     def test_relative_moves_make_e_relative(self):
         # G91 makes E relative too, even after M82 (as Klipper): both moves extrude.
@@ -290,6 +302,9 @@ class Ink(unittest.TestCase):
             # The band: 9.6 mm lines 0.4 mm apart filling 4 mm, plus the lines' half widths all round.
             area = (9.6 + 0.42) * (4. + 0.02) / (SX * PITCH)
             self.assertAlmostEqual(len(dots) / area, share, delta=0.03)
+        # So light the dither fires nothing: nothing to ink, the G-code unchanged.
+        src = block_gcode(layers=1, band=4., top=True)
+        self.assertIsNone(run(src, "--ink-limit", "0.5")[0])
 
     def test_top_surfaces_get_their_coats(self):
         out, _ = run(block_gcode(layers=2, top=True), "--edge-margin", "0")
@@ -330,13 +345,69 @@ class Ink(unittest.TestCase):
         self.assertEqual({r['object'] for r in records}, {"-"})
 
     def test_swaths_tile_the_nozzle_grid(self):
-        # Passes side by side: the next pass's first nozzle position lands one pitch past the last one's.
-        out, _ = run(block_gcode(layers=1, band=4.), "--edge-margin", "0")
-        _, records, _ = job_dots(out)
+        # Sweeps over 55 positions (28-82), overlapping by 6 (--feather 6); with --feather 0 side by side, the next
+        # starting one pitch past the last one's.
+        for args, step in (((), 49.), (("--feather", "0"), 55.)):
+            out, _ = run(block_gcode(layers=1, band=4.), "--edge-margin", "0", *args)
+            _, records, _ = job_dots(out)
+            xs = sorted(r['x'] for r in records)
+            self.assertGreater(len(xs), 1)
+            for a, b in zip(xs, xs[1:]):
+                self.assertAlmostEqual((b - a) / SX, step, places=2)
+
+    def test_sweeps_cover_the_footprint_with_the_grid_shifted_per_layer(self):
+        # The same footprint every layer: the fewest sweeps that cover it, their grid shifted differently each layer
+        # (the golden ratio's multiples over the spare positions), so the seams don't stack up the wall.
+        out, _ = run(block_gcode(layers=8, band=4.), "--edge-margin", "0", "--inset", "0")
+        _, records, dots = job_dots(out)
+        firsts = {}
+        for r in records:
+            firsts.setdefault(r['layer'], []).append(r['x'])
+        self.assertEqual({len(v) for v in firsts.values()}, {3})  # 9.6 + 0.42 mm over 49-position steps
+        offsets = [round((min(v) - 94.) / SX) for _, v in sorted(firsts.items())]
+        self.assertGreater(len(set(offsets)), 5, offsets)
+        self.assertEqual(post.swaths(10, 129, 55, 1, 0.), [10, 64, 118])  # 120 columns: 3 sweeps, 43 to spare
+        self.assertEqual(post.swaths(10, 129, 55, 1, 0.999), [-33, 21, 75])
+        # Every layer's ink is all there, each dot once, wherever the seams fall.
+        per_layer = {}
+        for r, c, p, x, y, _ in dots:
+            per_layer.setdefault(r['layer'], []).append((c, round(x / SX), round(y / PITCH)))
+        self.assertEqual({len(v) for v in per_layer.values()}, {len(set(per_layer[0]))})
+        self.assertEqual({len(v) - len(set(v)) for v in per_layer.values()}, {0})
+
+    def test_feathered_joins_share_the_band_once(self):
+        # Magenta at 100 % (one ink: 2 + 2 per packet, so nothing is capped): with the joins feathered over 6
+        # positions, each dot prints exactly once, the same dots as with the sweeps side by side; in each band the
+        # cells go from one sweep to the next along a ramp, a whole cell (two column pairs) to one sweep.
+        src = block_gcode(layers=1, band=4.)
+        feathered, _ = run(src, "--edge-margin", "0", "--inset", "0")
+        plain, _ = run(src, "--edge-margin", "0", "--inset", "0", "--feather", "0")
+        _, records, dots = job_dots(feathered)
+        got = [(c, round(x / SX), round(y / PITCH)) for _, c, _, x, y, _ in dots]
+        self.assertEqual(len(got), len(set(got)))
+        self.assertEqual(set(got), {(c, round(x / SX), round(y / PITCH)) for _, c, _, x, y, _ in job_dots(plain)[2]})
+        self.assertEqual(len(records), 3)
         xs = sorted(r['x'] for r in records)
-        self.assertGreater(len(xs), 1)
-        for a, b in zip(xs, xs[1:]):
-            self.assertAlmostEqual((b - a) / SX, 68., places=2)
+        by_dot = {}
+        for r, c, p, x, y, run_length in dots:
+            self.assertGreaterEqual(run_length, 2)
+            by_dot[(round(x / SX), round(y / PITCH))] = r['x']
+        # A sweep's share changes only on cell boundaries: every four columns, the same phase in every band column.
+        changes = {(y + 1) % 4 for (g, y), o in by_dot.items() if by_dot.get((g, y + 1), o) != o}
+        self.assertEqual(len(changes), 1)
+        phase = changes.pop()
+        owners = {}
+        for (g, y), o in by_dot.items():
+            owners.setdefault((g, (y - phase) // 4), set()).add(o)
+        self.assertEqual({len(v) for v in owners.values()}, {1})
+        # The band between the first two sweeps, 6 positions wide: the second's share rises across it.
+        band = sorted({g for (g, q), o in owners.items() if xs[0] in o} & {g for (g, q), o in owners.items()
+                                                                                   if xs[1] in o})
+        self.assertEqual(len(band), 6)
+        shares = [sum(xs[1] in o for (g, q), o in owners.items() if g == b)
+                  / float(sum(g == b for g, q in owners)) for b in band]
+        self.assertLess(shares[0], 0.3)
+        self.assertGreater(shares[-1], 0.7)
 
 
 @unittest.skipIf(post.np is None, "needs numpy")

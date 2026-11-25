@@ -118,6 +118,9 @@ PRESPIT_MAX_S = 5.
 # been idle starts with a short stock-pattern spit at the sponge (it rides on the X gantry, so its gap is fixed; spits
 # from over ~5 mm mist). PRIME_S seconds of it by default.
 PRIME_S = 0.3
+# POLYDYE_INK_MOTION: an ink block's moves are gentler than the plastic's, so the head and bed shake less during the
+# passes (P box #4's ink blocks, 2026-11-25): acceleration and square corner velocity at most these by default.
+INK_ACCEL, INK_SCV = 1000., 1.
 # The board's warm-up duty limit (POLYDYE_WARM_MAX_DUTY_PPM), for checking polydye.cfg before connecting.
 WARM_MAX_DUTY_PPM = 5800
 REMOVED_PATTERNS = ('mid', 'sparse')
@@ -150,6 +153,15 @@ NOZDATA_SIZE = 42
 # width printed solid green with 3-4 per pulse and failed at 6; all three at 3 printed near-black, at ~9 failed; one
 # colour at full width is ~3 (2026-11-25).
 HEATERS_PER_PULSE = 4
+# F3 and F5 fire in the same slot from the one 12.6 V rail: each line alone takes 4 heaters, but with F3 at 4 F5
+# streaked even at 3; 3 + 2 printed solid (ladder 904, 2026-11-25). So at most this many on both lines of a packet
+# together; a job pass that would need more (two or three inks, solid) goes to the board as two passes, one per fire
+# line.
+HEATERS_PER_SLOT = 5
+# The second of those passes (fire line F5) is stored as pass number | SPLIT_PASS; job passes are numbered below it.
+SPLIT_PASS = 0x8000
+_NIBBLES = tuple(bin(v & 15).count('1') for v in range(256))
+_HIGH_NIBBLES = tuple(bin(v >> 4).count('1') for v in range(256))
 DATA_HELLO, DATA_PUT, DATA_ERR = 0x01, 0x10, 0xFF
 DATA_CHUNK = 16384
 
@@ -1082,7 +1094,8 @@ def cfg_with(text, values):
 # JOB_AHEAD_BYTES / JOB_AHEAD_PASSES on the board unprinted), each stored to be deleted once printed
 # (PASSSTORE_FLAG_ONCE); after each layer POLYDYE_JOB_PASS N=n prints pass n with POLYDYE_PASS. The passes are drawn
 # without colour registration: it's applied here, from polydye.cfg, so a recalibration needs no re-slice.
-JOB_VERSION = 1
+JOB_VERSION = 2
+JOB_VERSIONS = (1, 2)  # 2: POLYDYE_INK_MOTION in its ink blocks
 JOB_BEGIN, JOB_END = b"; POLYDYE_JOB_BEGIN", b"; POLYDYE_JOB_END"
 JOB_NOZZLES = (STOCK_RANDOM['first'], STOCK_RANDOM['last'])  # the positions the stock firmware fires, 14-85
 JOB_AHEAD_BYTES, JOB_AHEAD_PASSES = 3 * 1024 * 1024, 256
@@ -1162,9 +1175,9 @@ def job_load(path):
     if header is None:
         raise JobError("the job has no ;PDJ line")
     try:
-        if int(header.get('version', 0)) != JOB_VERSION:
-            raise JobError("the job is version %s, this add-on reads version %d: update the add-on, or slice with the "
-                           "polydye_post.py that comes with it" % (header.get('version'), JOB_VERSION))
+        if int(header.get('version', 0)) not in JOB_VERSIONS:
+            raise JobError("the job is version %s, this add-on reads version %d or older: update the add-on, or slice "
+                           "with the polydye_post.py that comes with it" % (header.get('version'), JOB_VERSION))
         lo, hi = (int(v) for v in header['positions'].split('-'))
         header = {'version': JOB_VERSION, 'dpi': float(header['dpi']), 'nozzle_dpi': float(header['nozzle_dpi']),
                   'pass_axis': header.get('pass_axis', 'y'), 'positions': (lo, hi), 'passes': int(header['passes']),
@@ -1176,6 +1189,7 @@ def job_load(path):
                 rec[key] = int(rec[key])
             rec['x'], rec['y'] = float(rec['x']), float(rec['y'])
             if rec['n'] != n or rec['dir'] not in (1, -1) or not 0 < rec['columns'] <= 65535 or \
+                    not 0 <= rec['pass'] < SPLIT_PASS or \
                     not rec['layer'] < CAL_LAYER or not rec['colours'] or set(rec['colours']) - set('cmy') or \
                     rec['end'] == rec['start']:
                 raise JobError("pass %d is malformed" % (n,))
@@ -1234,7 +1248,71 @@ def job_pass_data(data, colours, columns, direction, registration=(0, 0, 0, 0), 
     """Nozzle data to print a job pass (its colour planes `data`, `columns` long, for `colours`) in `direction` with
     colour registration and skew, like pass_data() for a drawing of the same dots, then the heater cap (cap_heaters()):
     (data, columns, first), first the drawing column of the pass's first column (its X, Y name column 0). None if no
-    dot is left."""
+    dot is left. As one board pass: job_pass_parts() splits it by fire line where it needs to."""
+    raw = _job_columns(data, colours, columns, registration, skew)
+    built = None if raw is None else _job_part(raw[0], raw[1], direction)
+    return built if built and built[1] else None
+
+
+def job_pass_parts(data, colours, columns, direction, registration=(0, 0, 0, 0), skew=None):
+    """A job pass as the board passes that print it: [(pass number offset, data, columns, first)], like
+    job_pass_data(). One, unless the pass has two or more inks and a packet would want more than HEATERS_PER_SLOT
+    heaters on its two fire lines together (each line counted up to HEATERS_PER_PULSE): then two, the dots on fire
+    line F3 (data positions 0-55) at offset 0 and those on F5 (56-111) at SPLIT_PASS, each trimmed to its own columns
+    and capped. A single ink stays one pass, capped (3 + 3 at positions 14-84 becomes 3 + 2): splitting it would double
+    its time for a dot or two. Empty if no dot is left."""
+    raw = _job_columns(data, colours, columns, registration, skew)
+    if raw is None:
+        return []
+    out, lo = raw
+    if len(colours) < 2 or not needs_split(out):
+        built = _job_part(out, lo, direction)
+        return [(0,) + built] if built[1] else []  # the cap can drop every fire: a lone dot, say
+    parts = []
+    for offset, mask in ((0, 0x0f), (SPLIT_PASS, 0xf0)):
+        half = out.translate(_mask_table(mask))
+        stripped = half.strip(b"\0")
+        if not stripped:
+            continue
+        a = (len(half) - len(half.lstrip(b"\0"))) // NOZDATA_SIZE
+        b = (len(half.rstrip(b"\0")) + NOZDATA_SIZE - 1) // NOZDATA_SIZE
+        built = _job_part(bytearray(half[a * NOZDATA_SIZE:b * NOZDATA_SIZE]), lo + a, direction)
+        if built[1]:
+            parts.append((offset,) + built)
+    return parts
+
+
+def needs_split(out):
+    """Whether some packet of the nozzle data `out` wants more than HEATERS_PER_SLOT heaters on its two fire lines,
+    each counted up to HEATERS_PER_PULSE."""
+    for base in range(0, len(out), NOZDATA_SIZE):
+        for k in range(base, base + 14):
+            a, b, c = out[k], out[k + 14], out[k + 28]
+            if a | b | c and (min(_NIBBLES[a] + _NIBBLES[b] + _NIBBLES[c], HEATERS_PER_PULSE) +
+                              min(_HIGH_NIBBLES[a] + _HIGH_NIBBLES[b] + _HIGH_NIBBLES[c], HEATERS_PER_PULSE)
+                              > HEATERS_PER_SLOT):
+                return True
+    return False
+
+
+def _job_part(out, lo, direction):
+    """`out` (columns from drawing column `lo` on, DIR=1's order) capped (cap_heaters()), trimmed of columns the cap
+    emptied at its ends, and in `direction`'s order: (data, columns, first)."""
+    cap_heaters(out, lo)
+    a = (len(out) - len(out.lstrip(b"\0"))) // NOZDATA_SIZE
+    b = (len(out.rstrip(b"\0")) + NOZDATA_SIZE - 1) // NOZDATA_SIZE
+    if b <= a:
+        return b"", 0, lo
+    out, lo = out[a * NOZDATA_SIZE:b * NOZDATA_SIZE], lo + a
+    n = len(out) // NOZDATA_SIZE
+    if direction < 0:
+        out = b"".join(out[i * NOZDATA_SIZE:(i + 1) * NOZDATA_SIZE] for i in range(n - 1, -1, -1))
+    return bytes(out), n, lo if direction > 0 else lo + n - 1
+
+
+def _job_columns(data, colours, columns, registration, skew):
+    """A job pass's dots as nozzle data with the registration and skew, uncapped: (bytearray of columns in DIR=1's
+    order, the drawing column of the first), or None if no dot is left."""
     along = (registration[0], 0, registration[2])
     across = (registration[1], 0, registration[3])
     size = columns * 14
@@ -1272,19 +1350,18 @@ def job_pass_data(data, colours, columns, direction, registration=(0, 0, 0, 0), 
     out = bytearray(n * NOZDATA_SIZE)
     for dest, v in merged.items():
         out[dest::NOZDATA_SIZE] = v.to_bytes(n, 'big')
-    cap_heaters(out, lo)
-    if direction < 0:
-        out = b"".join(out[i * NOZDATA_SIZE:(i + 1) * NOZDATA_SIZE] for i in range(n - 1, -1, -1))
-    return bytes(out), n, lo if direction > 0 else hi
+    return out, lo
 
 
-def cap_heaters(out, first, cap=HEATERS_PER_PULSE):
+def cap_heaters(out, first, cap=HEATERS_PER_PULSE, slot=HEATERS_PER_SLOT):
     """Keeps at most `cap` heaters firing on each fire pulse of the nozzle data `out` (a bytearray of columns,
-    changed in place; `first` the drawing column of its first): a fire pulse is one packet (board byte % 14) on one
-    fire line (F3: bits 0-3, F5: bits 4-7), across the colours. Where more want to fire, they share by an even
-    rotation, the same for both columns of a pair (drawing columns 2k, 2k + 1): the wanted heaters in (bit, colour)
-    order, keeping want[(s + t) % n] for t < cap with s = (pair * cap) % n. A fire left on its own in a column (none
-    in the columns either side), which doesn't eject, is dropped. Returns the fires dropped."""
+    changed in place; `first` the drawing column of its first), and at most `slot` on a packet's two pulses together: a
+    fire pulse is one packet (board byte % 14) on one fire line (F3: bits 0-3, F5: bits 4-7), across the colours.
+    Where both lines are over `slot` together, F5 gives way first (3 + 2 printed solid). Where more want to fire than
+    a line keeps (m), they share by an even rotation, the same for both columns of a pair (drawing columns 2k, 2k + 1):
+    the wanted heaters in (bit, colour) order, keeping want[(s + t) % n] for t < m with s = (pair * m) % n. A fire
+    left on its own in a column (none in the columns either side), which doesn't eject, is dropped. Returns the fires
+    dropped."""
     n = len(out) // NOZDATA_SIZE
     dropped = 0
     for i in range(n):
@@ -1292,14 +1369,22 @@ def cap_heaters(out, first, cap=HEATERS_PER_PULSE):
         pair = (first + i) // 2
         for k in range(14):
             v = (out[base + k], out[base + 14 + k], out[base + 28 + k])
-            if (v[0] != 0) + (v[1] != 0) + (v[2] != 0) < 2:
-                continue  # one colour: at most 4 per line
-            for line in (0, 4):
+            n3 = _NIBBLES[v[0]] + _NIBBLES[v[1]] + _NIBBLES[v[2]]
+            n5 = _HIGH_NIBBLES[v[0]] + _HIGH_NIBBLES[v[1]] + _HIGH_NIBBLES[v[2]]
+            if n3 <= cap and n5 <= cap and n3 + n5 <= slot:
+                continue
+            m3, m5 = min(n3, cap), min(n5, cap)
+            while m3 + m5 > slot:
+                if m5 >= m3:
+                    m5 -= 1
+                else:
+                    m3 -= 1
+            for line, m in ((0, m3), (4, m5)):
                 want = [(bit, c) for bit in range(line, line + 4) for c in range(3) if v[c] >> bit & 1]
-                if len(want) <= cap:
+                if len(want) <= m:
                     continue
-                s0 = (pair * cap) % len(want)
-                keep = set(want[(s0 + t) % len(want)] for t in range(cap))
+                s0 = (pair * m) % len(want)
+                keep = set(want[(s0 + t) % len(want)] for t in range(m))
                 for bit, c in want:
                     if (bit, c) not in keep:
                         out[base + 14 * c + k] &= ~(1 << bit) & 0xff
@@ -1330,7 +1415,7 @@ class JobStreamer:
         # Set by stop(); `put` and `delete` should refuse once it's set (JobStopped), checked where the data port is
         # used one request at a time, so nothing of this job reaches the board after a new job clears it.
         self.stopping = stopping or threading.Event()
-        self.ready = {}  # n -> (columns, first)
+        self.ready = {}  # n -> [(board pass number, columns, first)]: the board passes that print it (job_pass_parts())
         self.sizes = {}  # n -> bytes stored, until consumed
         self.consumed, self.skipped, self.deletes = set(), set(), []
         self.holding = {}  # n -> print time its pass ends: printed, but still on the board until then
@@ -1375,7 +1460,8 @@ class JobStreamer:
                 self.sizes.pop(n, None)
 
     def state(self, n):
-        """(error, (columns, first) once pass n is on the board or None, passes uploaded so far)."""
+        """(error, pass n's board passes [(number, columns, first)] once on the board or None, passes uploaded so
+        far)."""
         with self.lock:
             return self.error, self.ready.get(n), self.next
 
@@ -1396,7 +1482,8 @@ class JobStreamer:
                                                   sum(self.sizes.values()) + size <= self.ahead_bytes)
                         skip = n in self.skipped
                     for d in deletes:
-                        self._retry(lambda: self.delete(self.records[d]['layer'], self.records[d]['pass']))
+                        for number, _, _ in self.ready.get(d, ()):
+                            self._retry(lambda: self.delete(self.records[d]['layer'], number))
                     if n >= len(self.records) or skip:
                         if skip:
                             with self.lock:
@@ -1417,20 +1504,23 @@ class JobStreamer:
 
     def _upload(self, f, n):
         rec = self.records[n]
-        built = job_pass_data(job_record_data(f, rec), rec['colours'], rec['columns'], rec['dir'], self.registration,
-                              self.skew)
-        if built is None:
-            raise JobError("pass %d has no dots left after the colour registration" % (n,))
-        data, columns, first = built
-        self._retry(lambda: self.put(struct.pack("<HHBBH", rec['layer'], rec['pass'], 0, PASS_FLAG_ONCE, columns) +
-                                     data))
+        parts = job_pass_parts(job_record_data(f, rec), rec['colours'], rec['columns'], rec['dir'],
+                               self.registration, self.skew)
+        if not parts:
+            raise JobError("pass %d has no dots left after the colour registration and the heater cap" % (n,))
+        ready = []
+        for offset, data, columns, first in parts:
+            number = rec['pass'] | offset
+            self._retry(lambda: self.put(struct.pack("<HHBBH", rec['layer'], number, 0, PASS_FLAG_ONCE, columns) +
+                                         data))
+            ready.append((number, columns, first))
         with self.lock:
-            self.ready[n] = (columns, first)
+            self.ready[n] = ready
             self.next = n + 1
             if n in self.consumed:  # skipped while it went up
                 self.deletes.append(n)
             else:
-                self.sizes[n] = len(data)
+                self.sizes[n] = sum(len(data) for _, data, _, _ in parts)
 
     def _retry(self, request):
         for attempt in range(JOB_RETRIES):
@@ -1462,6 +1552,8 @@ class PolyDye:
         # Data port requests one at a time: the ink job's uploads run in their own thread (JobStreamer).
         self.data_lock = threading.Lock()
         self.job = None  # the ink job loaded (POLYDYE_JOB): {'streamer', 'header', 'records', ...}
+        # (max_accel, square_corner_velocity, lowered in a print) POLYDYE_INK_MOTION puts back afterwards
+        self.ink_motion = None
         # Pass direction and the cartridge nozzle-row centre relative to the hotend nozzle, in bed coordinates.
         # Required: they depend on the mount, and a wrong guess would put ink in the wrong place.
         self.pass_axis = config.getchoice('pass_axis', {'x': 'x', 'y': 'y'})
@@ -1603,6 +1695,8 @@ class PolyDye:
         gcode.register_command('POLYDYE_WARM', self.cmd_POLYDYE_WARM, desc=self.cmd_POLYDYE_WARM_help)
         gcode.register_command('POLYDYE_PREWARM', self.cmd_POLYDYE_PREWARM, desc=self.cmd_POLYDYE_PREWARM_help)
         gcode.register_command('POLYDYE_PRIME', self.cmd_POLYDYE_PRIME, desc=self.cmd_POLYDYE_PRIME_help)
+        gcode.register_command('POLYDYE_INK_MOTION', self.cmd_POLYDYE_INK_MOTION,
+                               desc=self.cmd_POLYDYE_INK_MOTION_help)
         gcode.register_command('POLYDYE_CLOCK_TEST', self.cmd_POLYDYE_CLOCK_TEST,
                                desc=self.cmd_POLYDYE_CLOCK_TEST_help)
         gcode.register_command('POLYDYE_ALIGN_PRINT', self.cmd_POLYDYE_ALIGN_PRINT,
@@ -2960,11 +3054,12 @@ class PolyDye:
             before, after = before + min(0, min(moved)), after + max(0, max(moved))
         for rec in records:
             columns = rec['columns'] + after - before
-            rec['size'] = columns * NOZDATA_SIZE
+            rec['size'] = 2 * columns * NOZDATA_SIZE  # at most two board passes (job_pass_parts())
             first = rec['y'] + (before if rec['dir'] > 0 else rec['columns'] - 1 + after) * pitch
-            # The pass sent lies within those columns but can be shorter (by up to the spread), and with
-            # minimum_cruise_ratio a shorter pass has a longer run-up: the longest it can have, over the widest extent.
-            run_up = self._run_up(self.pass_speed, slow, max(1, rec['columns'] - (after - before)))
+            # Each board pass sent lies within those columns but can be much shorter (one fire line's half of a split
+            # pass is trimmed to its own ink), and with minimum_cruise_ratio a shorter pass has a longer run-up: the
+            # longest any can have (a one-column pass's), over the widest extent.
+            run_up = self._run_up(self.pass_speed, slow, 1)
             start, _, end = pass_geometry('y', rec['x'], first, rec['dir'], columns, pitch, run_up,
                                           (self.offset_x, self.offset_y), base, self.direction_trim)
             for px, py in (start, end):
@@ -2990,20 +3085,22 @@ class PolyDye:
             streamer.consume(n, skipped=True)
             gcmd.respond_info("PolyDye: pass %d skipped: object %s is excluded" % (n, rec['object']))
             return
-        columns, first = self._wait_job_pass(gcmd, cmd, streamer, n)
-        if job['since_wait'] >= JOB_WAIT_EVERY:
-            self.printer.lookup_object('toolhead').wait_moves()  # the board queues at most 8 passes
-            job['since_wait'] = 0
-        self.printer.lookup_object('gcode').run_script_from_command(
-            "POLYDYE_PASS LAYER=%d PASS=%d X=%.4f Y=%.5f DIR=%d" % (rec['layer'], rec['pass'], rec['x'],
-                                                                   rec['y'] + first * 25.4 / self.dpi, rec['dir']))
-        job['since_wait'] += 1
+        # One board pass, or two where its fire lines are printed apart (job_pass_parts()), over the same ground.
+        for number, columns, first in self._wait_job_pass(gcmd, cmd, streamer, n):
+            if job['since_wait'] >= JOB_WAIT_EVERY:
+                self.printer.lookup_object('toolhead').wait_moves()  # the board queues at most 8 passes
+                job['since_wait'] = 0
+            self.printer.lookup_object('gcode').run_script_from_command(
+                "POLYDYE_PASS LAYER=%d PASS=%d X=%.4f Y=%.5f DIR=%d" % (rec['layer'], number, rec['x'],
+                                                                       rec['y'] + first * 25.4 / self.dpi, rec['dir']))
+            job['since_wait'] += 1
         # On the board until it has printed: it still counts against the room for the passes ahead.
         streamer.consume(n, until=self.printer.lookup_object('toolhead').get_last_move_time())
         streamer.release(self.mcu.estimated_print_time(self.printer.get_reactor().monotonic()))
 
     def _wait_job_pass(self, gcmd, cmd, streamer, n):
-        """(columns, first) of job pass n once it's on the board; raises if its upload failed or stalled."""
+        """Job pass n's board passes [(number, columns, first)] once on the board; raises if its upload failed or
+        stalled."""
         reactor = self.printer.get_reactor()
         said, last, since, drained = False, None, reactor.monotonic(), False
         while True:
@@ -3058,9 +3155,46 @@ class PolyDye:
                 logging.info("polydye: ink job stopped: %s", why)
 
     def _check_job_end(self, eventtime):
-        """A job its print loaded stops when the print ends, however it ends."""
+        """A job its print loaded stops when the print ends, however it ends; motion limits an ink block lowered
+        (POLYDYE_INK_MOTION) go back then too, if the print ended inside one."""
         if self.job is not None and self.job['from_print'] and not self._printing(eventtime):
             self._stop_job("its print ended")
+        if self.ink_motion is not None and self.ink_motion[2] and not self._printing(eventtime):
+            # G-code can't run from the status timer itself: from a callback, in turn with other commands.
+            self.printer.get_reactor().register_callback(lambda e: self._restore_ink_motion("the print ended"))
+
+    cmd_POLYDYE_INK_MOTION_help = ("Gentler moves for an ink block: ACCEL (1000) and SCV (square corner velocity, 1) "
+                                   "at most, until POLYDYE_INK_MOTION RESTORE=1 puts the limits before it back")
+
+    def cmd_POLYDYE_INK_MOTION(self, gcmd):
+        if gcmd.get_int('RESTORE', 0, minval=0, maxval=1):
+            self._restore_ink_motion(None)
+            return
+        accel = gcmd.get_float('ACCEL', INK_ACCEL, above=0.)
+        scv = gcmd.get_float('SCV', INK_SCV, minval=0.)
+        st = self.printer.lookup_object('toolhead').get_status(self.printer.get_reactor().monotonic())
+        if self.ink_motion is None:
+            # Put back by RESTORE=1, or when the print it was lowered in ends (one from the console: RESTORE=1 only).
+            self.ink_motion = (st['max_accel'], st['square_corner_velocity'],
+                               self._printing(self.printer.get_reactor().monotonic()))
+        self.printer.lookup_object('gcode').run_script_from_command(
+            "SET_VELOCITY_LIMIT ACCEL=%.3f SQUARE_CORNER_VELOCITY=%.3f"
+            % (min(accel, st['max_accel']), min(scv, st['square_corner_velocity'])))
+
+    def _restore_ink_motion(self, why):
+        """Puts back the motion limits POLYDYE_INK_MOTION lowered, if it did."""
+        saved, self.ink_motion = self.ink_motion, None
+        if saved is None:
+            return
+        script = "SET_VELOCITY_LIMIT ACCEL=%.3f SQUARE_CORNER_VELOCITY=%.3f" % saved[:2]
+        try:
+            if why:
+                self.printer.lookup_object('gcode').run_script(script)
+                logging.info("polydye: motion limits put back (%s): %s", why, script)
+            else:
+                self.printer.lookup_object('gcode').run_script_from_command(script)
+        except Exception:
+            logging.exception("polydye: couldn't put the motion limits back")
 
     cmd_POLYDYE_NUDGE_help = ("Move where the ink lands by X, Y mm on the bed, and reverse passes by TRIM mm along the"
                               " pass axis, from the next pass on")
