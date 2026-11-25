@@ -1566,6 +1566,27 @@ class Clean(unittest.TestCase):
                 pd.cmd_POLYDYE_CLEAN(self.gcmd())
             self.assertEqual((runs, moves, board.live, pd.last_fire), ([], [], False, None), error)
 
+    def test_live_ink_the_board_doesnt_take_or_a_failed_enable_goes_off_again(self):
+        # A board that doesn't turn live ink on: no trip, no spit, no wipe.
+        pd, board, runs, moves = self.clean()
+
+        def mode(args):
+            board.boost = bool(args[1])
+            board.sent.append(('mode', args[1], args[2]))
+        pd.mode_cmd = types.SimpleNamespace(send=mode)
+        with self.assertRaisesRegex(RuntimeError, "the board didn't turn live ink on, so it doesn't clean"):
+            pd.cmd_POLYDYE_CLEAN(self.gcmd())
+        self.assertEqual((runs, [m for m in moves if isinstance(m, str)], moves[-1]), ([], ['dwell'], ('mode', 0, 0)))
+        # The wait for the boost fails after live ink went on: off again.
+        pd, board, runs, moves = self.clean()
+
+        def dwell(t):
+            raise RuntimeError("Must home axis first")
+        self.objects['toolhead'].dwell = dwell
+        with self.assertRaisesRegex(RuntimeError, "Must home axis first"):
+            pd.cmd_POLYDYE_CLEAN(self.gcmd())
+        self.assertEqual((runs, moves, board.live), ([], [('mode', 1, 1), ('mode', 0, 0)], False))
+
     def test_a_print_that_ends_while_it_waits_gets_no_clean(self):
         pd, board, runs, moves = self.clean()
         board.print_state = 'printing'

@@ -2424,9 +2424,13 @@ class PolyDye:
         feed = speed * 60.
         then = "\n".join("G1 X%.3f F%d\nG1 X%.3f F%d" % (x - length, feed, x, feed) for _ in range(strokes))
         was_live, cleaned = st['live'], False
-        # Live ink on; if the boost was off, the moves to the sponge wait for it to settle.
-        self._enable(gcmd, cmd, True)
         try:
+            # Live ink on; if the boost was off, the moves to the sponge wait for it to settle. A board that didn't
+            # take it would fire nothing, and the wipe would only smear the plate.
+            self._enable(gcmd, cmd, True)
+            if not self._fresh_status()['live']:
+                raise gcmd.error("%s: the board didn't turn live ink on, so it doesn't clean (POLYDYE_STATUS says "
+                                 "why)" % (cmd,))
             self._fire_at_spot(
                 gcmd, cmd, "clean", None if plan is None else (plan[2], plan[0], plan[1]), spit, None, 1, 'sponge',
                 lambda where: "PolyDye: cleaning the head %s: %s%g s of the stock pattern (%d columns every %d us)%s"
