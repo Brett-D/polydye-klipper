@@ -1226,6 +1226,8 @@ class PolyDye:
 
     def cmd_POLYDYE_CANCEL(self, gcmd):
         self.cancel_cmd.send([self.oid])
+        # The passes dropped never fired, but last_fire counted them: forget it, so the next live pass warms the head.
+        self.last_fire = None
 
     cmd_POLYDYE_STATUS_help = "Report PolyDye board status"
 

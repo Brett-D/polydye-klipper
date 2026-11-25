@@ -1079,6 +1079,12 @@ class AutoWarm(unittest.TestCase):
                                                  WARM_PERIOD_US=508))
         self.assertEqual((runs, moves, self.travel), ([], [], []))
 
+    def test_cancelled_passes_dont_count_as_firing(self):
+        pd, board, runs, moves = self.make()
+        pd.last_fire = 99.
+        pd.cmd_POLYDYE_CANCEL(self.gcmd())
+        self.assertEqual((self.cancels, pd.last_fire), ([[0]], None))
+
     def test_off_switches(self):
         pd, board, runs, moves = self.make()
         board.live = True
