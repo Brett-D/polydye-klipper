@@ -91,6 +91,11 @@ SPIT_PATTERNS = {'all': 0, 'stock': 3}
 # AUTO_WARM_CLEARANCE mm behind the pass's run-up start (warm_position: pass, warm_clearance).
 AUTO_WARM_S, AUTO_WARM_WORDS, AUTO_WARM_PERIOD_US, AUTO_WARM_IDLE_S = 10., 1, 254, 60.
 AUTO_WARM_CLEARANCE = 10.
+# An optional pre-spit right after a pass's warm-up, at the warm spot, in the same board run ([polydye] warm_prespit,
+# POLYDYE_PASS PRESPIT): the stock pattern every STOCK_PERIOD_US for that many seconds (at most PRESPIT_MAX_S). Off by
+# default; for testing whether cyan, which still missed the first 9-14 mm of some passes after a gentle warm-up, needs
+# real ejection first.
+PRESPIT_MAX_S = 5.
 # The board's warm-up duty limit (POLYDYE_WARM_MAX_DUTY_PPM), for checking polydye.cfg before connecting.
 WARM_MAX_DUTY_PPM = 5800
 REMOVED_PATTERNS = ('mid', 'sparse')
@@ -350,6 +355,14 @@ def auto_warm_error(seconds, words, period_us):
     if seconds * 1e6 / period_us > WARM_MAX_COLUMNS:
         return "warm_seconds %g is too long at %d us" % (seconds, period_us)
     return None
+
+
+def pass_warm_settings(words, period, cfg_words, cfg_period):
+    """The pulse and period of a warm-up asked for before a pass (POLYDYE_PASS WARM): polydye.cfg's warm_pulse and
+    warm_period_us unless given; a pulse given without a period gets the fastest its column and duty allow (None)."""
+    if words is None and period is None:
+        return cfg_words, cfg_period
+    return (cfg_words if words is None else words), period
 
 
 def head_cold(last_fire, now, idle_time):
@@ -665,6 +678,7 @@ class PolyDye:
         if error:
             raise config.error("[polydye] %s" % (error,))
         self.warm_clearance = config.getfloat('warm_clearance', AUTO_WARM_CLEARANCE, minval=0.)
+        self.warm_prespit = config.getfloat('warm_prespit', 0., minval=0., maxval=PRESPIT_MAX_S)
         position = config.get('warm_position', 'pass').strip().lower()
         if position in ('pass', 'sponge'):
             self.warm_position = position
@@ -934,7 +948,7 @@ class PolyDye:
 
     cmd_POLYDYE_PASS_help = ("Print one ink pass along pass_axis (the pass data must already be uploaded); with live "
                              "ink a cold head is warmed first, off the print (WARM seconds, WARM_PULSE, WARM_PERIOD_US "
-                             "ask for a warm-up, WARM=0 for none)")
+                             "ask for a warm-up, WARM=0 for none; PRESPIT seconds of stock-pattern spit after it)")
 
     def cmd_POLYDYE_PASS(self, gcmd):
         layer = gcmd.get_int('LAYER', minval=0, maxval=65535)
@@ -955,6 +969,10 @@ class PolyDye:
         warm = gcmd.get_float('WARM', None, minval=0., maxval=WARM_MAX_S)
         warm_words = gcmd.get_int('WARM_PULSE', None, minval=1)
         warm_period = gcmd.get_int('WARM_PERIOD_US', None, minval=1, maxval=65535)
+        prespit = gcmd.get_float('PRESPIT', None, minval=0., maxval=PRESPIT_MAX_S)
+        if prespit and 'stock' not in self.spit_patterns:
+            raise gcmd.error("POLYDYE_PASS: PRESPIT needs newer PolyDye board firmware (the stock pattern); update it "
+                             "from the PolyDye page (Board firmware: Update to bundled firmware)")
         if warm:
             if self.spit_run_cmd is None:
                 raise gcmd.error("POLYDYE_PASS: WARM needs newer PolyDye board firmware; update it from the PolyDye "
@@ -963,7 +981,8 @@ class PolyDye:
                 raise gcmd.error("POLYDYE_PASS: a warm-up lasts at most %g s with this board firmware%s"
                                  % (self.warm_max_s, "; newer firmware takes up to %g s (Board firmware: Update to "
                                     "bundled firmware)" % (WARM_MAX_S,) if self.warm_duty_ppm is None else ""))
-            self._warm_plan(gcmd, "POLYDYE_PASS", warm, warm_words, warm_period)
+            self._warm_plan(gcmd, "POLYDYE_PASS", warm,
+                            *pass_warm_settings(warm_words, warm_period, self.warm_pulse, self.warm_period_us))
 
         toolhead = self.printer.lookup_object('toolhead')
         gcode_move = self.printer.lookup_object('gcode_move')
@@ -988,7 +1007,7 @@ class PolyDye:
                                           (self.offset_x, self.offset_y), gcode_move.base_position,
                                           self.direction_trim)
         axis = 0 if self.pass_axis == 'x' else 1
-        live = self._auto_warm(gcmd, "POLYDYE_PASS", start, direction, warm, warm_words, warm_period)
+        live = self._auto_warm(gcmd, "POLYDYE_PASS", start, direction, warm, warm_words, warm_period, prespit)
 
         # Position (through any bed mesh transform), then stop, so the pass starts from rest at a known time.
         pos = list(gcode_move.last_position)
@@ -1026,12 +1045,14 @@ class PolyDye:
                      columns, self.pass_axis, t_first, clock_first, period_ticks + frac / 65536., t0, run_up,
                      first[0], first[1])
 
-    def _auto_warm(self, gcmd, cmd, start, direction, warm=None, words=None, period=None):
+    def _auto_warm(self, gcmd, cmd, start, direction, warm=None, words=None, period=None, prespit=None):
         """Before a pass whose run-up starts at toolhead `start` (going `direction` along pass_axis): warms the head
         (_warm_head()) for `warm` seconds if given (0: not at all), else automatically if the automatic warm-up is on
         and the head will be cold when the pass starts (head_cold() at the end of the moves already queued, the
-        earliest the pass can fire). Returns whether live ink is on, whatever the warm-up: a live pass keeps the head
-        warm, a dry-run pass fires nothing."""
+        earliest the pass can fire). A warm-up is followed by `prespit` seconds of pre-spit (None: warm_prespit).
+        Returns whether live ink is on, whatever the warm-up: a live pass keeps the head warm, a dry-run pass fires
+        nothing."""
+        prespit = self.warm_prespit if prespit is None else prespit
         st = self._fresh_status()
         if not st['live']:
             if warm:
@@ -1039,8 +1060,9 @@ class PolyDye:
             return False
         if warm is not None:
             if warm:
+                words, period = pass_warm_settings(words, period, self.warm_pulse, self.warm_period_us)
                 self._warm_head(gcmd, cmd, "a %g s head warm-up was asked for" % (warm,), warm, words, period, start,
-                                direction)
+                                direction, prespit)
             return True
         if not self.warm_seconds or self.spit_run_cmd is None or self.warm_duty_ppm is None:
             return True
@@ -1049,14 +1071,15 @@ class PolyDye:
         if head_cold(self.last_fire, now, self.warm_idle_time):
             why = ("the head hasn't fired since Klipper started" if self.last_fire is None else
                    "the head won't have fired for %.0f s when the pass starts" % (now - self.last_fire,))
-            self._warm_head(gcmd, cmd, why, self.warm_seconds, self.warm_pulse, self.warm_period_us, start, direction)
+            self._warm_head(gcmd, cmd, why, self.warm_seconds, self.warm_pulse, self.warm_period_us, start, direction,
+                            prespit)
         return True
 
-    def _warm_head(self, gcmd, cmd, why, seconds, words, period, start, direction):
+    def _warm_head(self, gcmd, cmd, why, seconds, words, period, start, direction, prespit=0.):
         """A warm-up right before a pass: once the moves and passes before it are done, `seconds` of every nozzle at
-        `words` every `period` us (None: the warm-up defaults, _warm_plan()), standing still at the warm spot
-        (_go_to_warm_spot()), in one board run with live ink left on. Raises, and the pass doesn't run, if the board
-        can't be seen idle afterwards."""
+        `words` every `period` us (None: the warm-up defaults, _warm_plan()), then `prespit` seconds of the stock
+        pattern (if any), standing still at the warm spot (_go_to_warm_spot()), in one board run with live ink left
+        on. Raises, and the pass doesn't run, if the board can't be seen idle afterwards."""
         toolhead = self.printer.lookup_object('toolhead')
         reactor = self.printer.get_reactor()
         toolhead.wait_moves()
@@ -1069,13 +1092,21 @@ class PolyDye:
                 raise gcmd.error("%s: the board is still busy with passes, so the head can't be warmed" % (cmd,))
             reactor.pause(reactor.monotonic() + 0.05)
         self._check_current_pulse(gcmd, cmd, st)
+        spit = int(round(prespit * 1e6 / STOCK_PERIOD_US)) if prespit else 0
+        if spit and (st.get('cartridge_template') or '').startswith('black'):
+            raise gcmd.error("%s: the pre-spit is the stock pattern, for a colour cartridge template, not %s"
+                             % (cmd, st['cartridge_template']))
         words, period, columns = self._warm_plan(gcmd, cmd, seconds, words, period)
         back, where = self._go_to_warm_spot(gcmd, cmd, start, direction)
-        gcmd.respond_info("PolyDye: %s, so a head %s comes first, %s" % (why, warm_text(columns, words, period), where))
+        gcmd.respond_info("PolyDye: %s, so a head %s%s comes first, %s" % (
+            why, warm_text(columns, words, period),
+            ", then a %g s pre-spit (%d stock-pattern columns every %d us)" % (prespit, spit, STOCK_PERIOD_US)
+            if spit else "", where))
         self.testing = True
         try:
-            self.spit_run_cmd.send([self.oid, 0, SPIT_PATTERNS['all'], 0, SPIT_PERIOD_US, columns, words, period])
-            deadline = reactor.monotonic() + columns * period / 1e6 + 5.
+            self.spit_run_cmd.send([self.oid, spit, SPIT_PATTERNS['stock' if spit else 'all'], 0,
+                                    STOCK_PERIOD_US if spit else SPIT_PERIOD_US, columns, words, period])
+            deadline = reactor.monotonic() + (columns * period + spit * STOCK_PERIOD_US) / 1e6 + 5.
             while True:
                 reactor.pause(reactor.monotonic() + 0.2)
                 if self.printer.is_shutdown():
@@ -1495,10 +1526,12 @@ class PolyDye:
                 raise gcmd.error("%s: a warm-up lasts at most %g s with this board firmware%s"
                                  % (cmd, self.warm_max_s, "; newer firmware takes up to %g s (Board firmware: Update "
                                     "to bundled firmware)" % (WARM_MAX_S,) if self.warm_duty_ppm is None else ""))
-            self._warm_plan(gcmd, cmd, warm, warm_words, warm_period)
-        pass_warm = (" WARM=%g%s%s" % (warm, " WARM_PULSE=%d" % (warm_words,) if warm_words else "",
-                                       " WARM_PERIOD_US=%d" % (warm_period,) if warm_period else "")
-                     if explicit_warm else "")
+            self._warm_plan(gcmd, cmd, warm,
+                            *pass_warm_settings(warm_words, warm_period, self.warm_pulse, self.warm_period_us))
+        prespit = gcmd.get_float('PRESPIT', None, minval=0., maxval=PRESPIT_MAX_S)
+        pass_warm = ((" WARM=%g%s%s" % (warm, " WARM_PULSE=%d" % (warm_words,) if warm_words else "",
+                                        " WARM_PERIOD_US=%d" % (warm_period,) if warm_period else "")
+                      if explicit_warm else "") + (" PRESPIT=%g" % (prespit,) if prespit is not None else ""))
         if not upload:
             info = self.query_pass_cmd.send([self.oid, layer, pass_num])
             if not info['present']:
@@ -1829,7 +1862,8 @@ class PolyDye:
                                'seconds': self.warm_seconds, 'pulse_words': self.warm_pulse,
                                'period_us': self.warm_period_us, 'idle_time': self.warm_idle_time,
                                'position': self.warm_position if isinstance(self.warm_position, str)
-                               else list(self.warm_position), 'clearance': self.warm_clearance},
+                               else list(self.warm_position), 'clearance': self.warm_clearance,
+                               'prespit': self.warm_prespit},
                     head_idle_s=None if self.last_fire is None else
                     round(max(0., self.mcu.estimated_print_time(eventtime) - self.last_fire), 1))
 

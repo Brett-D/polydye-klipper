@@ -251,6 +251,7 @@ offset_y: -8.7
 #warm_idle_time: 60   # s without firing after which the head counts as cold again
 #warm_position: pass  # where warm-ups run: pass (warm_clearance mm behind the pass's run-up), sponge, or X, Y
 #warm_clearance: 10   # mm behind the pass's run-up start, for warm_position: pass
+#warm_prespit: 0      # s of stock-pattern spit at the warm spot right after a warm-up (0: none; up to 5)
 #mcu: polydye
 #data_port:           # the board's data port; default: the [mcu polydye] serial path with -if02 instead of -if00
 ```
@@ -331,7 +332,7 @@ If anything would print a pass wrongly, Klipper stops with a readable reason, fo
 |---|---|
 | `POLYDYE_ENABLE [LIVE=1]` | Turns the board's boost on. `LIVE=1` (default) allows real ink; `LIVE=0` is a dry run: the bus runs with the fire lines held off |
 | `POLYDYE_DISABLE` | Waits for queued moves, then turns live output and the boost off |
-| `POLYDYE_PASS LAYER= PASS= X= Y= [DIR=1] [SPEED=] [WARM=] [WARM_PULSE=] [WARM_PERIOD_US=]` | Prints one pass (above), after an automatic head warm-up off the print if live ink is on and the head is cold; `WARM` asks for one (seconds), `WARM=0` for none (see "Automatic head warm-up") |
+| `POLYDYE_PASS LAYER= PASS= X= Y= [DIR=1] [SPEED=] [WARM=] [WARM_PULSE=] [WARM_PERIOD_US=] [PRESPIT=]` | Prints one pass (above), after an automatic head warm-up off the print if live ink is on and the head is cold; `WARM` asks for one (seconds), `WARM=0` for none, `PRESPIT` adds a stock-pattern pre-spit after it (see "Automatic head warm-up") |
 | `POLYDYE_CANCEL` | Drops passes that are scheduled but not started (for a cancel macro) |
 | `POLYDYE_STATUS` | Board status: boost, live, passes printed and queued, worst column lateness, faults, stored passes, cartridge template, fire pulse; and the offsets and direction trim in use |
 | `POLYDYE_NUDGE [X=] [Y=] [TRIM=]` | Moves where the ink lands by `X`, `Y` mm on the bed, and the ink of reverse passes by `TRIM` mm along the pass axis (each at most ±5 mm), from the next pass on. Changes `offset_x`/`offset_y` (in the opposite direction: the offset is where the cartridge is) and `direction_trim` until the next restart |
@@ -472,6 +473,11 @@ and `WARM=0` for none.
 
   For those two the toolhead rises by `POLYDYE_WIPE`'s `z_hop` (1 mm, no higher than the Z axis allows), travels
   there at `travel_speed`, warms, travels back at that height and comes down.
+- **Optional pre-spit (testing):** `warm_prespit` (or `POLYDYE_PASS PRESPIT=`, passed on by the fire test) adds that
+  many seconds of the stock pattern every 508 µs right after the warm-up, at the warm spot, in the same board run, for
+  testing whether cyan, which still missed the first 9–14 mm of some passes after a gentle warm-up, needs real
+  ejection first. It puts ink down there (on paper, `warm_clearance` behind the run-up). Off by default; colour
+  templates only.
 - **If a warm-up fails,** the board's run is cancelled, and the cartridge goes back (or the pass goes on) only once the
   board is seen idle; otherwise it stays over the warm spot and the pass doesn't run.
 - During a print it costs `warm_seconds` each time the head has been idle that long (between layers, typically), with

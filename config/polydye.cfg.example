@@ -35,6 +35,8 @@ offset_y: -8.7
 #warm_idle_time: 60
 #warm_position: pass
 #warm_clearance: 10
+# Seconds of stock-pattern spit at the warm spot right after a warm-up (0: none), for testing.
+#warm_prespit: 0
 
 # Where POLYDYE_WIPE meets the sponge (X, G-code coordinates; must be below the X axis maximum). Uncomment to
 # change the default of 245:
