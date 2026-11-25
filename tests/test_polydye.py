@@ -266,7 +266,7 @@ class TestCleanup(unittest.TestCase):
         pd.query_clock_cmd = pd.bus_hz_check = None
         pd.boost_idle_s = None  # board firmware that turns PolyDye off after a test
         pd.warm_seconds, pd.warm_pulse, pd.warm_period_us, pd.warm_idle_time = 10., 1, 254, 60.
-        pd.warm_position, pd.warm_clearance = 'pass', 10.
+        pd.warm_position, pd.warm_clearance, pd.warm_prespit = 'pass', 10., 0.
         pd.last_fire, pd.auto_warm_off = None, False
         pd.mcu = types.SimpleNamespace(estimated_print_time=lambda eventtime: board.print_time)
         board.print_time = 100.
@@ -713,6 +713,12 @@ class TestCleanup(unittest.TestCase):
                           "POLYDYE_PASS"])
         self.assertTrue(steps[2].endswith(" DIR=1 WARM=10 WARM_PULSE=8 WARM_PERIOD_US=508"))
         # WARM=0: each pass told not to warm; no WARM: the passes decide (the automatic warm-up).
+        pd, board = self.make(fail_on="NOTHING")
+        pd.spit_run_cmd = object()
+        self.newer_warm_up(pd)
+        pd.cmd_POLYDYE_FIRE_TEST(self.gcmd(STRIPES="color_b_late:6", PRESPIT=0.3, **self.FIRE))
+        self.assertTrue([s for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_PASS")][0].endswith(
+            " DIR=1 PRESPIT=0.3"))
         for warm, tail in ((0., " DIR=1 WARM=0"), (None, " DIR=1")):
             pd, board = self.make(fail_on="NOTHING")
             pd.spit_run_cmd = object()
@@ -887,7 +893,7 @@ class AutoWarm(unittest.TestCase):
     def make(self):
         pd, board = TestCleanup.make(TestCleanup(), fail_on="NOTHING")
         pd.warm_max_words, pd.warm_max_us, pd.warm_max_s, pd.warm_duty_ppm = 12, 2.9, 30., 5800
-        pd.offset_x, pd.offset_y, pd.pass_axis, pd.warm_clearance = 58.6, -8.7, 'y', 10.
+        pd.offset_x, pd.offset_y, pd.pass_axis, pd.warm_clearance, pd.warm_prespit = 58.6, -8.7, 'y', 10., 0.
         runs = []
         pd.spit_run_cmd = types.SimpleNamespace(send=runs.append)
         here = types.SimpleNamespace(x=10., y=20., z=0.3, e=0.)
@@ -974,6 +980,13 @@ class AutoWarm(unittest.TestCase):
         self.warm(pd, warm=2., words=8, period=508)
         self.assertEqual(runs, [[0, 0, 0, 0, polydye.SPIT_PERIOD_US, 3937, 8, 508]])
         self.assertIn("a 2 s head warm-up was asked for", self.said[0])
+        # WARM alone: polydye.cfg's pulse and period (the gentle recipe); a pulse alone: its fastest period.
+        self.warm(pd, warm=1.)
+        self.assertEqual(runs[-1], [0, 0, 0, 0, polydye.SPIT_PERIOD_US, 3937, 1, 254])
+        self.assertEqual(polydye.pass_warm_settings(None, None, 1, 254), (1, 254))
+        self.assertEqual(polydye.pass_warm_settings(8, None, 1, 254), (8, None))
+        self.assertEqual(polydye.pass_warm_settings(None, 400, 1, 254), (1, 400))
+        del runs[1:]
         # WARM=0: none, even on a cold head; it still counts as firing.
         pd.last_fire = None
         self.assertIs(self.warm(pd, warm=0.), True)
@@ -1078,6 +1091,23 @@ class AutoWarm(unittest.TestCase):
             pd.cmd_POLYDYE_PASS(TestCleanup.gcmd(self, LAYER=0, PASS=0, X=100., Y=40., WARM=20., WARM_PULSE=2,
                                                  WARM_PERIOD_US=508))
         self.assertEqual((runs, moves, self.travel), ([], [], []))
+
+    def test_an_optional_pre_spit_after_the_warm_up(self):
+        pd, board, runs, moves = self.make()
+        board.live, pd.warm_prespit = True, 0.2
+        self.warm(pd)
+        # In the same board run: the warm-up, then 0.2 s of the stock pattern every 508 us.
+        self.assertEqual(runs, [[0, 394, polydye.SPIT_PATTERNS['stock'], 0, 508, 39370, 1, 254]])
+        self.assertIn("then a 0.2 s pre-spit (394 stock-pattern columns every 508 us)", self.said[0])
+        # PRESPIT=0 on the pass turns it off; a black template has no stock pattern: refused before anything moves.
+        pd.last_fire = None
+        self.warm(pd, prespit=0.)
+        self.assertEqual(runs[-1][1:3], [0, polydye.SPIT_PATTERNS['all']])
+        pd.last_fire, board.template = None, 'black_b'
+        with self.assertRaisesRegex(RuntimeError, "pre-spit is the stock pattern, for a colour cartridge template, not "
+                                                  "black_b"):
+            self.warm(pd)
+        self.assertEqual((len(runs), len(self.travel)), (2, 2))
 
     def test_cancelled_passes_dont_count_as_firing(self):
         pd, board, runs, moves = self.make()
@@ -1187,7 +1217,7 @@ class BuildConfig(unittest.TestCase):
         pd.bus_hz_check = None
         pd.boost_idle_s = None
         pd.warm_seconds, pd.warm_pulse, pd.warm_period_us, pd.warm_idle_time, pd.warm_position = 10., 1, 254, 60., 'pass'
-        pd.warm_clearance = 10.
+        pd.warm_clearance, pd.warm_prespit = 10., 0.
         pd.last_fire = None
         pd.printer = types.SimpleNamespace(config_error=ConfigError)
         sent = []
@@ -1332,7 +1362,7 @@ class ConfigOptions(unittest.TestCase):
     def test_auto_warm_options(self):
         pd = self.load()
         self.assertEqual((pd.warm_seconds, pd.warm_pulse, pd.warm_period_us, pd.warm_idle_time, pd.warm_position,
-                          pd.warm_clearance), (10., 1, 254, 60., 'pass', 10.))
+                          pd.warm_clearance, pd.warm_prespit), (10., 1, 254, 60., 'pass', 10., 0.))
         pd = self.load(warm_seconds='0', warm_position=' 5, 200.5 ')
         self.assertEqual((pd.warm_seconds, pd.warm_position), (0., (5., 200.5)))
         self.assertEqual(self.load(warm_position='Sponge').warm_position, 'sponge')
