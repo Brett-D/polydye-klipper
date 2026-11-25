@@ -190,6 +190,19 @@ class PrintEnd(unittest.TestCase):
             "PolyDye: the print was cancelled", "PolyDye: the print stopped with an error",
             "PolyDye: the print finished with live ink still on", "PolyDye: the print stopped with an error"])
         self.assertIsNone(pd.last_fire)
+        # A print that turned live ink off itself leaves nothing to clean up.
+        state[0] = 'printing'
+        pd.cmd_POLYDYE_ENABLE(gcmd)
+        pd.cmd_POLYDYE_ENABLE(types.SimpleNamespace(get_int=lambda name, default, **kw: 0, respond_info=lambda m: None))
+        run((('complete', False, []),))
+        # A print that ended with live ink on, and a fire test enabling live ink before the next poll: the print is
+        # cleaned up first, then the test's live ink stays on.
+        state[0] = 'printing'
+        pd.cmd_POLYDYE_ENABLE(gcmd)
+        state[0], sent[:] = 'complete', []
+        pd.cmd_POLYDYE_ENABLE(gcmd)
+        self.assertEqual(sent, off + [('mode', 1, 1)])
+        run((('complete', False, []), ('standby', False, [])))
         # Older board firmware: the boost goes off too.
         pd.boost_idle_s, state[0] = None, 'printing'
         pd.cmd_POLYDYE_ENABLE(gcmd)
@@ -314,7 +327,7 @@ class TestCleanup(unittest.TestCase):
         pd.boost_idle_s = None  # board firmware that turns PolyDye off after a test
         pd.warm_seconds, pd.warm_pulse, pd.warm_period_us, pd.warm_idle_time = 10., 1, 254, 60.
         pd.warm_position, pd.warm_clearance, pd.warm_prespit = 'pass', 10., 0.
-        pd.last_fire, pd.auto_warm_off = None, False
+        pd.last_fire, pd.auto_warm_off, pd.print_live = None, False, False
         pd.mcu = types.SimpleNamespace(estimated_print_time=lambda eventtime: board.print_time)
         board.print_time = 100.
 

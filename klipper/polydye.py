@@ -1268,15 +1268,20 @@ class PolyDye:
 
     def cmd_POLYDYE_ENABLE(self, gcmd):
         live = gcmd.get_int('LIVE', 1, minval=0, maxval=1)
+        printing = self._printing(self.printer.get_reactor().monotonic())
+        if not printing:
+            # A print that turned live ink on has ended but the status poll hasn't cleaned up after it yet: do it now,
+            # so it can't come later and turn off what's enabled here (a fire test, say).
+            self._check_print_end(self.printer.get_reactor().monotonic())
         boost_was_on = True
         if live:
             st = self._fresh_status()
             self._check_current_pulse(gcmd, "POLYDYE_ENABLE", st)
             boost_was_on = st['boost']
         self.mode_cmd.send([self.oid, 1, live])
-        # Live ink turned on by a print: turned off again however the print ends (_check_print_end()).
-        if live and self._printing(self.printer.get_reactor().monotonic()):
-            self.print_live = True
+        # Live ink turned on by a print: turned off again however the print ends (_check_print_end()). Turned off, or
+        # on outside a print: not the print's.
+        self.print_live = bool(live and printing)
         if not boost_was_on:
             # The rails need a moment after the boost turns on, and the board refuses live ink that comes sooner:
             # keep the next moves (and so the next pass) far enough out.
@@ -1292,6 +1297,7 @@ class PolyDye:
     def cmd_POLYDYE_DISABLE(self, gcmd):
         self.printer.lookup_object('toolhead').wait_moves()
         self.mode_cmd.send([self.oid, 0, 0])
+        self.print_live = False
         gcmd.respond_info("PolyDye off")
 
     cmd_POLYDYE_CANCEL_help = "Drop PolyDye passes that are queued but not started"
@@ -1508,6 +1514,7 @@ class PolyDye:
         """Live ink off, and the boost too unless the board keeps it on between tests (boost_idle_s); then waits for
         that and for the board to go idle. Returns its status."""
         self.mode_cmd.send([self.oid, 0 if self.boost_idle_s is None else 1, 0])
+        self.print_live = False
         return self._wait_off_and_idle()
 
     cmd_POLYDYE_FIRE_TEST_help = ("LIVE INK on paper: one stripe per TEMPLATE:PULSE in STRIPES, side by side from X, "
