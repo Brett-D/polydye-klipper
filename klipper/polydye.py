@@ -92,16 +92,19 @@ TEMPLATE_WORDS, BASE_PULSE_WORDS, PACKETS, IDLE_WORDS, PERIOD_MARGIN_US = 27, 6,
 SPIT_PATTERNS = {'all': 0, 'stock': 3}
 # Automatic head warm-up before a live pass ([polydye] warm_seconds, warm_pulse, warm_period_us, warm_idle_time), when
 # the head hasn't fired (or been warmed by a POLYDYE_PREWARM burst) since Klipper started or not for 5 s: it warms in
-# about 10 s and is too cold to eject again in under 30 s (2026-11-25: 10 s of warm-up then 30 s idle printed almost
-# nothing; 60 s at a quarter of the rate printed worse than 10 s at the full rate right before). Every nozzle at
-# 1 word (0.35 us) every 254 us for 10 s. Brett's ladder on 48483ab (2026-11-25), each warm-up on a hot head 17 mm
+# about 4 s and is too cold to eject again in under 30 s (2026-11-25: 10 s of warm-up then 30 s idle printed almost
+# nothing; 60 s at a quarter of the rate printed worse than 10 s at the full rate right before; after 30 s idle a burst
+# of 1-3 s printed nothing to streaks, 4-5 s full magenta and cyan, 6-10 s every line full and solid). Every nozzle at
+# 1 word (0.35 us) every 254 us for 6 s (4 s and half again). Brett's ladder on 48483ab (2026-11-25), each warm-up on a
+# hot head 17 mm
 # before a cyan text pass: 0.35 us every 508 us lost the word's first 10 mm; 0.35 us every 254 us printed it complete
 # with no dot where it warmed (2 of 39,370 column times missed); 0.70 us every 508 us was complete but left a dot, and
 # every 192 us a blob; 2.80 us spat a puddle. The pulse width matters, not just the energy. No ink may land on the glass
 # bed (Brett, 2026-11-25), and the warm-up's spot (with any pre-spit) is often beyond the print: so it runs over the
 # wipe sponge at the X gantry's right end by default (warm_position: sponge); `pass` (AUTO_WARM_CLEARANCE mm behind the
 # pass's run-up start, warm_clearance) only suits a print with plastic there, such as a base under the part.
-AUTO_WARM_S, AUTO_WARM_WORDS, AUTO_WARM_PERIOD_US, AUTO_WARM_IDLE_S = 10., 1, 254, 5.
+AUTO_WARM_S, AUTO_WARM_WORDS, AUTO_WARM_PERIOD_US, AUTO_WARM_IDLE_S = 6., 1, 254, 5.
+AUTO_PREWARM_S = 6.  # POLYDYE_PREWARM's burst ([polydye] prewarm_seconds), the same recipe
 AUTO_WARM_CLEARANCE = 10.
 # An optional pre-spit right after a pass's warm-up, at the warm spot (the sponge by default), in the same board run
 # ([polydye] warm_prespit,
@@ -1117,6 +1120,13 @@ class PolyDye:
         if error:
             raise config.error("[polydye] %s" % (error,))
         self.warm_clearance = config.getfloat('warm_clearance', AUTO_WARM_CLEARANCE, minval=0.)
+        # POLYDYE_PREWARM's burst without SECONDS: a burst is at most WARM_MAX_COLUMNS columns of warm_period_us.
+        self.prewarm_seconds = config.getfloat('prewarm_seconds', AUTO_PREWARM_S, above=0., maxval=WARM_MAX_S)
+        if self.prewarm_seconds * 1e6 / self.warm_period_us > WARM_MAX_COLUMNS + 0.5:
+            raise config.error("[polydye] prewarm_seconds %g is too long: a burst is at most %d columns, %.1f s at "
+                               "warm_period_us %d" % (self.prewarm_seconds, WARM_MAX_COLUMNS,
+                                                      WARM_MAX_COLUMNS * self.warm_period_us / 1e6,
+                                                      self.warm_period_us))
         self.warm_prespit = config.getfloat('warm_prespit', 0., minval=0., maxval=PRESPIT_MAX_S)
         position = config.get('warm_position', 'sponge').strip().lower()
         if position in ('pass', 'sponge'):
@@ -1612,7 +1622,7 @@ class PolyDye:
         return self.prewarm_state
 
     cmd_POLYDYE_PREWARM_help = ("Warm the head in the background during the moves that follow, so it's hot for the "
-                                "next pass: SECONDS (warm_seconds, 10) of every nozzle at 1 word (0.35 us, which doesn't "
+                                "next pass: SECONDS (prewarm_seconds, 6) of every nozzle at 1 word (0.35 us, which doesn't "
                                 "eject) every warm_period_us, from where the moves before it end; turns live ink on. "
                                 "Passes never wait for it: one that comes first cuts it short, and needs no warm-up")
 
@@ -1621,7 +1631,7 @@ class PolyDye:
         if self.prewarm_cmd is None:
             raise gcmd.error("%s: needs newer PolyDye board firmware; update it from the PolyDye page (Board firmware: "
                              "Update to bundled firmware)" % (cmd,))
-        seconds = gcmd.get_float('SECONDS', self.warm_seconds or AUTO_WARM_S, above=0., maxval=self.warm_max_s)
+        seconds = gcmd.get_float('SECONDS', self.prewarm_seconds, above=0., maxval=self.warm_max_s)
         period = self.warm_period_us
         columns = warm_columns(seconds, period, self.warm_max_s)
         if columns > WARM_MAX_COLUMNS:
@@ -2916,7 +2926,7 @@ class PolyDye:
                                'period_us': self.warm_period_us, 'idle_time': self.warm_idle_time,
                                'position': self.warm_position if isinstance(self.warm_position, str)
                                else list(self.warm_position), 'clearance': self.warm_clearance,
-                               'prespit': self.warm_prespit},
+                               'prespit': self.warm_prespit, 'prewarm_seconds': self.prewarm_seconds},
                     head_idle_s=self._head_idle_s(eventtime),
                     prewarm=self._prewarm_status(),
                     nozzle_dpi=self.nozzle_dpi, cfg_saves=self.cfg_saves)

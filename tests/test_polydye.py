@@ -22,6 +22,7 @@ def bare_polydye():
     """A PolyDye without its __init__ (no Klipper), with the state every command needs."""
     pd = object.__new__(polydye.PolyDye)
     pd.prewarm_cmd = pd.query_prewarm_cmd = pd.prewarm_sent = pd.prewarm_state = pd.boost_ready = None
+    pd.prewarm_seconds = polydye.AUTO_PREWARM_S
     return pd
 
 
@@ -1302,11 +1303,12 @@ class Prewarm(unittest.TestCase):
         self.objects['toolhead'].dwell = lambda t: self.fail("no pause in the moves for the boost")
         pd.cmd_POLYDYE_PREWARM(self.gcmd())
         self.assertEqual((board.boost, board.live), (True, True))
-        # Sent once the moves before it are planned, for when they end: 10 s of 1-word pulses every 254 us.
+        # Sent once the moves before it are planned, for when they end: 6 s (prewarm_seconds) of 1-word pulses every
+        # 254 us.
         self.assertEqual(self.sent, [])
         self.callbacks[0](123.4)
-        self.assertEqual(self.sent, [([0, 1234000000, 39370, 254], 1234000000)])
-        self.assertEqual(pd.prewarm_sent['seconds'], 39370 * 254 / 1e6)
+        self.assertEqual(self.sent, [([0, 1234000000, 23622, 254], 1234000000)])
+        self.assertEqual(pd.prewarm_sent['seconds'], 23622 * 254 / 1e6)
         pd.cmd_POLYDYE_PREWARM(self.gcmd(SECONDS=3.))
         self.callbacks[1](500.)  # the clock wraps at 32 bits
         self.assertEqual(self.sent[-1], ([0, 5000000000 & 0xffffffff, 11811, 254], 5000000000))
@@ -1609,13 +1611,17 @@ class ConfigOptions(unittest.TestCase):
     def test_auto_warm_options(self):
         pd = self.load()
         self.assertEqual((pd.warm_seconds, pd.warm_pulse, pd.warm_period_us, pd.warm_idle_time, pd.warm_position,
-                          pd.warm_clearance, pd.warm_prespit), (10., 1, 254, 5., 'sponge', 10., 0.))
+                          pd.warm_clearance, pd.warm_prespit), (6., 1, 254, 5., 'sponge', 10., 0.))
         pd = self.load(warm_seconds='0', warm_position=' 5, 200.5 ')
         self.assertEqual((pd.warm_seconds, pd.warm_position), (0., (5., 200.5)))
         self.assertEqual(self.load(warm_position='Pass').warm_position, 'pass')
         self.assertIn("warm_position must be sponge (the default), X, Y", self.load(warm_position='here'))
         self.assertIn("heater duty", self.load(warm_pulse='8', warm_period_us='400'))
         self.assertIn("warm_position must be sponge (the default), X, Y", self.load(warm_position='5'))
+        # A burst is at most 65535 columns: 16.6 s at 254 us.
+        self.assertIn("prewarm_seconds 17 is too long: a burst is at most 65535 columns, 16.6 s at warm_period_us 254",
+                      self.load(prewarm_seconds='17'))
+        self.assertEqual(self.load(prewarm_seconds='16.5').prewarm_seconds, 16.5)
 
 
 
