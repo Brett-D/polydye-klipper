@@ -31,7 +31,8 @@ def bare_polydye():
     pd.prewarm_cmd = pd.query_prewarm_cmd = pd.prewarm_sent = pd.prewarm_state = pd.boost_ready = None
     pd.prewarm_seconds, pd.prewarm_gen, pd.prime_seconds = polydye.AUTO_PREWARM_S, 0, polydye.PRIME_S
     pd.clean_seconds = polydye.CLEAN_S
-    pd.set_fire_gap_cmd = pd.query_fire_gap_cmd = pd.fire_gap_max = None
+    pd.set_fire_gap_cmd = pd.query_fire_gap_cmd = pd.fire_gap_max = pd.restore_pending = None
+    pd.last_status = {}
     return pd
 
 
@@ -458,6 +459,29 @@ class TestCleanup(unittest.TestCase):
         pd.fire_gap_max, pd.dpi, pd.pass_speed = polydye.FIRE_GAP_MAX, 847., 59.5
         pd.set_fire_gap_cmd = types.SimpleNamespace(send=send)
         pd.query_fire_gap_cmd = types.SimpleNamespace(send=lambda args: {'words': board.gap})
+
+    def test_settings_a_failed_cleanup_left_are_put_back_once_the_board_is_idle(self):
+        pd, board = self.make(fail_on="NOTHING")
+        self.with_gap(pd, board, 20)
+        board.live = True
+        mode = pd.mode_cmd
+        pd.mode_cmd = types.SimpleNamespace(send=lambda args: (_ for _ in ()).throw(RuntimeError("timeout")))
+        with self.assertLogs(level='ERROR'):
+            pd._restore_after_test(('color_b_late', 6, 0))
+        self.assertEqual((pd.live_off_pending, pd.restore_pending, board.gap), (True, ('color_b_late', 6, 0), 20))
+        # Not while live ink may still be on.
+        pd.last_status = board.status()
+        pd._retry_restore()
+        self.assertEqual(board.gap, 20)
+        # The status poll turns live ink off, then puts the settings back.
+        said = []
+        pd.mode_cmd, pd.cancel_cmd = mode, types.SimpleNamespace(send=lambda args: None)
+        pd.printer.lookup_object('gcode').respond_info = said.append
+        pd._check_print_end(0.)
+        pd.last_status = board.status()
+        pd._retry_restore()
+        self.assertEqual((board.gap, board.live, pd.restore_pending, board.violations), (0, False, None, []))
+        self.assertEqual(said[-1], "PolyDye: the cartridge settings are back as before the last test")
 
     def test_cartridge_sets_the_fire_gap(self):
         pd, board = self.make(fail_on="NOTHING")
@@ -1308,6 +1332,17 @@ class AutoWarm(unittest.TestCase):
                                                  WARM_PERIOD_US=508))
         self.assertEqual((runs, moves, self.travel), ([], [], []))
 
+    def test_a_pass_too_fast_for_the_fire_gaps_column_is_refused_before_anything_moves(self):
+        pd, board, runs, moves = self.make()
+        pd.query_pass_cmd = types.SimpleNamespace(send=lambda args: {'present': 1, 'columns': 600, 'cart': 0})
+        pd.dpi, pd.pass_speed = 847., 59.5
+        pd.last_status = {'pulse_words': 6, 'fire_gap_words': 48}
+        with self.assertRaisesRegex(RuntimeError, "POLYDYE_PASS: SPEED 75: a 16.80 us fire gap with a pulse of 6 words "
+                                                  "makes the column 407 us on the bus, more than the 400 us pass "
+                                                  "column period"):
+            pd.cmd_POLYDYE_PASS(TestCleanup.gcmd(self, LAYER=0, PASS=0, X=100., Y=40., SPEED=75.))
+        self.assertEqual((runs, moves, self.travel), ([], [], []))
+
     def test_an_optional_pre_spit_after_the_warm_up(self):
         pd, board, runs, moves = self.make()
         board.live, pd.warm_prespit = True, 0.2
@@ -1968,8 +2003,11 @@ class ConfigOptions(unittest.TestCase):
         self.assertEqual(self.load(fire_gap_us='17'), "[polydye] fire_gap_us: 17 us is more than the longest fire "
                                                       "gap, 16.80 us (48 bus words)")
         self.assertIn("[polydye] fire_gap_us: a 16.80 us fire gap with a pulse of 8 words makes the column 427 us on "
-                      "the bus, more than the 400 us pass column period (dpi 847, pass_speed 75)",
+                      "the bus, more than the 400 us pass column period (dpi 847, 75 mm/s)",
                       self.load(fire_gap_us='16.8', pulse_words='8', pass_speed='75'))
+        # Unset, the board keeps its own pulse, maybe 8 words: checked as the longest.
+        self.assertIn("with a pulse of 8 words makes the column 427 us", self.load(fire_gap_us='16.8', pass_speed='75'))
+        self.assertEqual(self.load(fire_gap_us='16.8').fire_gap, 16.8)
 
     def test_auto_warm_options(self):
         pd = self.load()
@@ -2598,6 +2636,16 @@ class CalibrationPrints(unittest.TestCase):
         self.assertEqual((board.gap, board.violations, board.live), (0, [], False))
         self.assertEqual([s[1] for s in board.sent if isinstance(s, tuple) and s[0] == 'gap'], [20, 0])
 
+    def test_a_fire_gap_test_whose_gap_isnt_back_says_so(self):
+        pd, board = self.make()
+        pd.spit_run_cmd, pd.warm_duty_ppm, pd.warm_max_s = object(), 5800, 30.
+        TestCleanup.with_gap(pd, board, 0)
+        pd._restore_after_test = lambda before: setattr(pd, 'restore_pending', before)  # its cleanup failed
+        with self.assertRaisesRegex(RuntimeError, "POLYDYE_FIRE_GAP_TEST: printed, but the fire gap couldn't be put "
+                                                  "back yet"):
+            pd.cmd_POLYDYE_FIRE_GAP_TEST(self.gcmd(X=120., Y=100.))
+        self.assertEqual(pd.restore_pending[2], 0)
+
     def test_fire_gap_test_refused_before_anything_is_sent(self):
         for setup, params, error in (
                 (lambda pd, board: setattr(pd, 'set_fire_gap_cmd', None), {},
@@ -3183,6 +3231,24 @@ class InkJobs(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "an ink job is loaded"):
             pd.cmd_POLYDYE_CARTRIDGE(self.gcmd(GAP=0.))
         self.assertEqual(board.gap, 20)
+
+    def test_a_job_puts_a_failed_tests_settings_back_first(self):
+        two = bar(0, 120, 28, 82) + bar(2, 120, 28, 82)
+        pd, board = self.make([(0, 0, 'A', 120., 100., 1, 120, two)])
+        TestCleanup.with_gap(pd, board, 20)
+        pd.restore_pending = ('color_b_late', 6, 0)
+        board.live = True
+        with self.assertRaisesRegex(RuntimeError, "the last test couldn't put the cartridge settings back yet"):
+            pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
+        self.assertIsNone(pd.job)
+        # Idle with live ink off: put back, then the job loads at the stock timing (split by fire line).
+        board.live = False
+        pd.printer.lookup_object('gcode').respond_info = self.said.append
+        pd._query_status = lambda: setattr(pd, 'last_status', board.status()) or pd.last_status
+        pd._fresh_status = pd._query_status
+        pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
+        self.assertEqual((board.gap, pd.restore_pending), (0, None))
+        self.wait_for(lambda: len(self.puts()) == 2)
 
     def test_an_excluded_objects_passes_are_skipped_and_deleted(self):
         pd, board = self.make()

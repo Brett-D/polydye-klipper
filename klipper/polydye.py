@@ -477,7 +477,7 @@ def fire_gap_fit_error(gap, pulse, dpi, pass_speed):
     if need <= period:
         return None
     return ("a %.2f us fire gap with a pulse of %d words makes the column %d us on the bus, more than the %.0f us "
-            "pass column period (dpi %g, pass_speed %g) less the board's %d us margin"
+            "pass column period (dpi %g, %g mm/s) less the board's %d us margin"
             % (fire_gap_us(gap), pulse, column_us(pulse, gap), period, dpi, pass_speed, PERIOD_MARGIN_US))
 
 
@@ -1826,6 +1826,9 @@ class PolyDye:
         self.prewarm_gen = 0
         self.print_live = False  # a print turned live ink on and hasn't been seen to end yet (_check_print_end())
         self.live_off_pending = False  # a test's cleanup failed: live ink may be on (_check_print_end() retries)
+        # ...and its template, pulse and fire gap to put back (_send_cartridge()'s), once the board is idle with live
+        # ink off (_retry_restore()); a job won't load before (its heater cap follows the fire gap).
+        self.restore_pending = None
         self.dpi = config.getfloat('dpi', 847., above=0.)
         self.pass_speed = config.getfloat('pass_speed', 59.5, above=0.)
         self.travel_speed = config.getfloat('travel_speed', 150., above=0.)
@@ -1842,8 +1845,8 @@ class PolyDye:
             if words > FIRE_GAP_MAX:
                 raise config.error("[polydye] fire_gap_us: %g us is more than the longest fire gap, %.2f us (%d bus "
                                    "words)" % (self.fire_gap, fire_gap_us(FIRE_GAP_MAX), FIRE_GAP_MAX))
-            error = words and fire_gap_fit_error(words, self.pulse_words or BASE_PULSE_WORDS, self.dpi,
-                                                 self.pass_speed)
+            # Unset, the board keeps its own pulse (maybe a longer one set before a RESTART): the longest, to be safe.
+            error = words and fire_gap_fit_error(words, self.pulse_words or PULSE_MAX, self.dpi, self.pass_speed)
             if error:
                 raise config.error("[polydye] fire_gap_us: %s" % (error,))
         self.query_pass_cmd = self.query_cmd = None
@@ -2091,9 +2094,27 @@ class PolyDye:
                 if not self.printer.is_shutdown() and not self.query_failing:
                     logging.exception("polydye: status query failed (not logged again until one succeeds)")
                 self.query_failing = True
+            if self.restore_pending is not None and not self.query_failing:
+                try:
+                    self._retry_restore()
+                except Exception:
+                    logging.warning("polydye: putting the cartridge settings back failed again; retrying")
         if self.printer.is_shutdown():
             return self.printer.get_reactor().NEVER
         return eventtime + STATUS_INTERVAL
+
+    def _retry_restore(self):
+        """Puts back the cartridge settings a test's cleanup couldn't (restore_pending), once the board is seen idle
+        with live ink off (the last status), and says so."""
+        st = self.last_status
+        if (not st or self.live_off_pending or st.get('live') or st.get('running') or st.get('queued')
+                or (st.get('boost') and self.boost_idle_s is None)):
+            return
+        self._send_cartridge(st, *self.restore_pending)
+        self.restore_pending = None
+        msg = "PolyDye: the cartridge settings are back as before the last test"
+        logging.info("polydye: %s", msg)
+        self.printer.lookup_object('gcode').respond_info(msg)
 
     def _printing(self, eventtime):
         """Whether a print is running or paused (virtual_sdcard, print_stats)."""
@@ -2221,12 +2242,20 @@ class PolyDye:
             self._warm_plan(gcmd, "POLYDYE_PASS", warm,
                             *pass_warm_settings(warm_words, warm_period, self.warm_pulse, self.warm_period_us))
 
+        speed = gcmd.get_float('SPEED', self.pass_speed, above=0.)
+        # With a fire gap the column is longer: a faster pass than pass_speed may not fit it (the board would shut
+        # down). The status as last seen: the gap only changes through this add-on, which reads it back.
+        gap = self.last_status.get('fire_gap_words')
+        if gap:
+            error = fire_gap_fit_error(gap, self.last_status.get('pulse_words') or PULSE_MAX, self.dpi, speed)
+            if error:
+                raise gcmd.error("POLYDYE_PASS: SPEED %g: %s" % (speed, error))
+
         toolhead = self.printer.lookup_object('toolhead')
         gcode_move = self.printer.lookup_object('gcode_move')
         eventtime = self.printer.get_reactor().monotonic()
         th_status = toolhead.get_status(eventtime)
         accel = th_status['max_accel']
-        speed = gcmd.get_float('SPEED', self.pass_speed, above=0.)
         if speed > th_status['max_velocity']:
             raise gcmd.error("POLYDYE_PASS: SPEED %.1f exceeds max_velocity %.1f"
                              % (speed, th_status['max_velocity']))
@@ -3322,8 +3351,13 @@ class PolyDye:
                 self._live_off()
                 self.set_fire_gap_cmd.send([self.oid, starts[i]])
                 board['gap'] = starts[i]
+                self.last_status = dict(self.last_status, fire_gap_words=starts[i])  # for POLYDYE_PASS's check
                 run("POLYDYE_ENABLE LIVE=1")
         self._run_cal(gcmd, cmd, st, prints, sponge, z=z, warm=(warm, prime), ink_motion=True, before_pass=row_gap)
+        if self.restore_pending is not None:
+            raise gcmd.error("%s: printed, but the fire gap couldn't be put back yet (%s): PolyDye puts it back once "
+                             "the board is idle with live ink off, and no ink job loads before"
+                             % (cmd, cartridge_text(self.last_status)))
         gcmd.respond_info(
             "PolyDye fire gap test done; %s. Front to back: %s. In each square the left half (towards -X) is fire "
             "line F5, the right half F3. The stock timing's F5 half streaky where the control's is solid but lighter: "
@@ -3459,6 +3493,14 @@ class PolyDye:
         except (JobError, OSError) as e:
             raise gcmd.error("%s: %s" % (cmd, e))
         self._check_job(gcmd, cmd, header, records)
+        # A test's settings not put back yet: now, if the board is idle with live ink off. The job's heater cap follows
+        # the fire gap.
+        if self.restore_pending is not None:
+            self._fresh_status()
+            self._retry_restore()
+            if self.restore_pending is not None:
+                raise gcmd.error("%s: the last test couldn't put the cartridge settings back yet (the board isn't "
+                                 "idle with live ink off); try again in a moment" % (cmd,))
         # The G-code's bursts and primes: refused now rather than in the middle of the print.
         if header['prewarms'] and self.prewarm_cmd is None:
             raise gcmd.error("%s: the job's prewarm bursts (POLYDYE_PREWARM) need newer PolyDye board firmware; update "
@@ -4283,8 +4325,10 @@ class PolyDye:
             self._send_cartridge(self._live_off(), *before)
             self._query_status()
         except Exception:
-            # Live ink may still be on: the status poll keeps trying to turn it off (_check_print_end()).
+            # Live ink may still be on: the status poll keeps trying to turn it off (_check_print_end()), then puts
+            # the settings back (_retry_restore()).
             self.live_off_pending = True
+            self.restore_pending = before
             logging.exception("polydye: test cleanup failed; live ink goes off at the next status poll")
 
     def _head_idle_s(self, eventtime):
