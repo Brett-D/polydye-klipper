@@ -1128,6 +1128,16 @@ class AutoWarm(unittest.TestCase):
                                                   "black_b"):
             self.warm(pd)
         self.assertEqual((len(runs), len(self.travel)), (2, 2))
+        # Board firmware without the stock pattern: a planned pre-spit is refused before anything moves; with no
+        # warm-up (WARM=0, a dry run) there's none, so nothing is refused.
+        pd.last_fire, board.template, pd.spit_patterns = None, 'color_b_late', ('all',)
+        with self.assertRaisesRegex(RuntimeError, "the pre-spit needs newer PolyDye board firmware"):
+            self.warm(pd)
+        self.assertEqual((len(runs), len(self.travel)), (2, 2))
+        self.assertIs(self.warm(pd, warm=0.), True)
+        board.live = False
+        self.assertIs(self.warm(pd), False)
+        self.assertEqual(len(runs), 2)
 
     def test_cancelled_passes_dont_count_as_firing(self):
         pd, board, runs, moves = self.make()

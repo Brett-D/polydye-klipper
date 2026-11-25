@@ -973,10 +973,8 @@ class PolyDye:
         warm = gcmd.get_float('WARM', None, minval=0., maxval=WARM_MAX_S)
         warm_words = gcmd.get_int('WARM_PULSE', None, minval=1)
         warm_period = gcmd.get_int('WARM_PERIOD_US', None, minval=1, maxval=65535)
+        # Checked against the board when a pre-spit is planned (_warm_head()): with no warm-up there's none.
         prespit = gcmd.get_float('PRESPIT', None, minval=0., maxval=PRESPIT_MAX_S)
-        if prespit and 'stock' not in self.spit_patterns:
-            raise gcmd.error("POLYDYE_PASS: PRESPIT needs newer PolyDye board firmware (the stock pattern); update it "
-                             "from the PolyDye page (Board firmware: Update to bundled firmware)")
         if warm:
             if self.spit_run_cmd is None:
                 raise gcmd.error("POLYDYE_PASS: WARM needs newer PolyDye board firmware; update it from the PolyDye "
@@ -1097,6 +1095,10 @@ class PolyDye:
             reactor.pause(reactor.monotonic() + 0.05)
         self._check_current_pulse(gcmd, cmd, st)
         spit = int(round(prespit * 1e6 / STOCK_PERIOD_US)) if prespit else 0
+        if spit and 'stock' not in self.spit_patterns:
+            raise gcmd.error("%s: the pre-spit needs newer PolyDye board firmware (the stock pattern); update it from "
+                             "the PolyDye page (Board firmware: Update to bundled firmware), or set PRESPIT=0"
+                             % (cmd,))
         if spit and (st.get('cartridge_template') or '').startswith('black'):
             raise gcmd.error("%s: the pre-spit is the stock pattern, for a colour cartridge template, not %s"
                              % (cmd, st['cartridge_template']))
