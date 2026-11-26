@@ -689,7 +689,9 @@ class InkTrips(unittest.TestCase):
         dots, summary = face_dots(False)
         self.assertEqual(dots, [])
         self.assertIn("WARNING: --edge-margin 0.5 mm left out", summary)
-        self.assertIn("slice with a brim (or stand the model on a base) at least 0.6 mm wide", summary)
+        # The margin's box (10 rows by 7 columns: 0.60 by 0.59 mm) reaches 0.84 mm across a wall at 45 degrees, plus a
+        # cell's snapping.
+        self.assertIn("slice with a brim (or stand the model on a base) at least 0.9 mm wide", summary)
         # Not what --inset leaves out: a brim wouldn't bring that back.
         out, summary = run(block_gcode(layers=3), "--edge-margin", "0", "--inset", "1")
         self.assertIsNotNone(out)

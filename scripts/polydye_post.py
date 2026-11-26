@@ -722,6 +722,15 @@ class Shell:
         return out
 
 
+def margin_cells(opts, grid):
+    """--edge-margin in cells, (rows, columns): the box the plastic so far is eroded by for where ink may go. Snapped
+    to cells, the plastic can reach half a cell diagonal past its lines: the margin allows for that."""
+    if not opts.edge_margin:
+        return 0, 0
+    margin = opts.edge_margin + math.hypot(grid.sx, grid.sy) / 2.
+    return int(math.ceil(margin / grid.sy)), int(math.ceil(margin / grid.sx))
+
+
 def layer_passes(layer, grid, support, tools, objects, opts, pitch, shell=None, stats=None):
     """The ink passes for `layer`, in printing order, with their directions; `support` (a Support: plastic so far, all
     layers up to this one) is updated with the layer; `shell` (a Shell, with --depth) keeps the ink near the
@@ -730,9 +739,7 @@ def layer_passes(layer, grid, support, tools, objects, opts, pitch, shell=None, 
     segs = np.array([s[3:] for s in layer.segs], float).reshape(-1, 5)
     meta = np.array([s[:3] for s in layer.segs], int).reshape(-1, 3)
     support.add(segs, meta)
-    # Snapped to cells, the support can reach half a cell diagonal past the lines: the margin allows for that.
-    margin = opts.edge_margin + math.hypot(grid.sx, grid.sy) / 2. if opts.edge_margin else 0.
-    hy, hx = int(math.ceil(margin / grid.sy)), int(math.ceil(margin / grid.sx))
+    hy, hx = margin_cells(opts, grid)
     # The model's surface: its cells (snapped like the ink's) eroded by --inset, at least a cell where it's set.
     iy, ix = ((int(math.ceil(opts.inset / grid.sy)), int(math.ceil(opts.inset / grid.sx))) if opts.inset else (0, 0))
     p_lo, p_hi = opts.positions
@@ -984,10 +991,13 @@ def process(lines, opts):
             plan.append((layer, passes))
     passes = [p for _, ps in plan for p in ps]
     lost = stats.get('lost', 0) / float(stats['coloured']) if stats.get('coloured') else 0.
+    # The brim that leaves the surface all its ink: the margin's box reaches furthest across a wall at a slant (its
+    # corner), plus half a cell diagonal for the brim's own snapping.
+    hy, hx = margin_cells(opts, grid)
+    brim = math.ceil((math.hypot(hy * sy, hx * sx) + math.hypot(sx, sy) / 2.) * 10. - 1e-9) / 10.
     warning = ("WARNING: --edge-margin %g mm left out %.0f %% of the colour at the surface, where no plastic is within "
                "that far beyond it: slice with a brim (or stand the model on a base) at least %g mm wide"
-               % (opts.edge_margin, lost * 100, math.ceil((opts.edge_margin + 0.1) * 10) / 10.)
-               if lost > EDGE_LOST_WARN else "")
+               % (opts.edge_margin, lost * 100, brim) if lost > EDGE_LOST_WARN else "")
     if not passes:
         return None, "no ink lands on plastic (--edge-margin %g mm): the G-code is unchanged%s" % (
             opts.edge_margin, ". " + warning if warning else "")
