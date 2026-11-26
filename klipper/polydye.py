@@ -4466,6 +4466,8 @@ class PolyDye:
                 if reactor.monotonic() > end:
                     raise gcmd.error("%s: the board didn't finish the %s" % (cmd, what))
             self.last_fire = self.mcu.estimated_print_time(reactor.monotonic())
+            if warm_columns:  # a warm-up heats the head (a job's warm-ups count from it); a spit alone hardly
+                self.last_heat = self.last_fire
         finally:
             self.testing = False
             self._restore_after_test(before)

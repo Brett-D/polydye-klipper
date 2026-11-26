@@ -848,10 +848,16 @@ class TestCleanup(unittest.TestCase):
         self.assertEqual(sent, [('run', 1000, 0, 0, 1000, 2000, 1, 500)])
 
     def test_warm_up_on_its_own(self):
-        board, replies, sent = self.spit(command='cmd_POLYDYE_WARM', SECONDS=5.)
+        pd, board = self.make(fail_on="NOTHING")
+        board, replies, sent = self.spit(pd, board, command='cmd_POLYDYE_WARM', SECONDS=5.)
         self.assertEqual(sent, [('run', 0, 0, 0, 1000, 26042, 2, 192)])
         self.assertIn("warm-up 5.0 s: 26042 all-nozzle columns every 192 us", replies[0])
         self.assertEqual(replies[-1], "PolyDye warm-up done (faults=0)")
+        # It heats the head (an ink job's warm-ups count from it); a spit alone only fires it.
+        self.assertEqual((pd.last_fire, pd.last_heat), (100., 100.))
+        pd.last_heat = None
+        self.spit(pd, board, SECONDS=1., PATTERN='all')
+        self.assertEqual((pd.last_fire, pd.last_heat), (100., None))
         self.assertFalse([s for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_CARTRIDGE")])
         pd, board = self.make(fail_on="NOTHING")
         pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append('spit'))
