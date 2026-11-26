@@ -865,14 +865,26 @@ class WarmAndPrime(unittest.TestCase):
         # at the add-on's warm_position.
         self.assertEqual(sorted(spots), [0, 1, 2, 3])
         self.assertTrue(firsts[4].endswith("at warm_position (no room over the part)"), firsts[4])
-        # Every nozzle (positions 0-111: 50 pitches along +X of the spot to 61 along -X, and 1.5 mm either way along
-        # Y) at least --edge-margin + --warm-margin (1.5 mm) inside the block's plastic (X 90-120, Y 90-110), to
+        # Every nozzle (positions 0-111: 50 pitches along +X of the spot to 61 along -X; along Y the colour rows,
+        # 1.2 mm either way, and up to 0.2 pitches more per position from position 50, the most nozzle_skew the add-on
+        # takes) at least --edge-margin + --warm-margin (1.5 mm) inside the block's plastic (X 90-120, Y 90-110), to
         # within a cell's snapping.
+        half_y = 1.2 + 0.2 * 61 * SX
         for x, y in spots.values():
             self.assertGreaterEqual(x - 61 * SX - 1.5, 90. - 0.06)
             self.assertLessEqual(x + 50 * SX + 1.5, 120. + 0.06)
-            self.assertGreaterEqual(y - 1.5 - 1.5, 90. - 0.06)
-            self.assertLessEqual(y + 1.5 + 1.5, 110. + 0.06)
+            self.assertGreaterEqual(y - half_y - 1.5, 90. - 0.06)
+            self.assertLessEqual(y + half_y + 1.5, 110. + 0.06)
+        # With no margins at all, still every nozzle inside it, the cartridge yawed as far as the add-on allows.
+        _, records = block_firsts(run(big_block(), "--edge-margin", "0", "--warm-margin", "0", "--prime-idle", "0")[0])
+        bare = [tuple(map(float, re.search(r"warm_x=([\d.]+) warm_y=([\d.]+)", r).groups()))
+                for r in records.values() if "warm_x" in r]
+        self.assertEqual(len(bare), 4)
+        for x, y in bare:
+            self.assertGreaterEqual(x - 61 * SX, 90. - 0.06)
+            self.assertLessEqual(x + 50 * SX, 120. + 0.06)
+            self.assertGreaterEqual(y - half_y, 90. - 0.06)
+            self.assertLessEqual(y + half_y, 110. + 0.06)
         self.assertRegex(summary, r"; 5 warm-ups \(4 over the part, 0 with a prime, 1 at warm_position; about "
                                   r"[\d.]+ s\)")
         # The add-on reads the spot with the pass.

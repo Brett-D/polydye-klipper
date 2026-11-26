@@ -127,10 +127,11 @@ INK_MOVES_S, PRIME_TRIP_S, RUN_UP_MM = 1., 3., 3.
 # warm-up runs standing still, the cartridge over the layer's own plastic, right before its first pass (with its prime
 # at the sponge if that pass primes), as long as the head needs (warm_seconds()). It fires every nozzle: Sprite_tm's
 # colour positions HEAD_POSITIONS (position p lands REF_POSITION - p nozzle pitches along +X from a pass's x), the
-# colour rows within HEAD_HALF_Y_MM of it along the pass (Brett's cartridge: cyan 1.0 mm, yellow 0.8 mm from magenta).
-# WARM_STOP_S: a warm-up's stop besides its seconds (the board run starting, the add-on seeing it end). At most
-# PREWARM_MAX_S: 65535 columns at warm_period_us 254.
-HEAD_POSITIONS, HEAD_HALF_Y_MM = (0, 111), 1.5
+# colour rows within HEAD_ROWS_MM of it along the pass (the cartridge's: Brett's has cyan 1.0 mm, yellow 0.8 mm from
+# magenta), and each position up to SKEW_MAX x |p - REF_POSITION| nozzle pitches further along it, the most
+# nozzle_skew the add-on takes (the cartridge's yaw: 0.03 measured). WARM_STOP_S: a warm-up's stop besides its seconds
+# (the board run starting, the add-on seeing it end). At most PREWARM_MAX_S: 65535 columns at warm_period_us 254.
+HEAD_POSITIONS, HEAD_ROWS_MM, SKEW_MAX = (0, 111), 1.2, 0.2
 WARM_STOP_S = 0.5
 PREWARM_MAX_S = 16.
 # The ink and surface defaults. DEPTH (--depth, mm): on the test tile (2026-11-26) ink 0.3, 0.6 and 1.2 mm deep read
@@ -640,7 +641,8 @@ def layer_body(layer, k, grid, window):
 
 def warm_spot(layers, layer, k, grid, window, opts, near, cache, below):
     """Where `layer`'s warm-up can run: the bed X, Y (a pass's x: where nozzle position REF_POSITION is) nearest `near`
-    with every nozzle it fires (HEAD_POSITIONS, HEAD_HALF_Y_MM along the pass) at least --edge-margin plus
+    with every nozzle it fires (HEAD_POSITIONS; along the pass the colour rows, HEAD_ROWS_MM, and the most yaw the
+    add-on takes, SKEW_MAX) at least --edge-margin plus
     --warm-margin inside object k's plastic in this layer and in the object's next layer, so whatever lands is inside
     the part, and over `below` (over `window`: plastic laid down so far, this layer's and the ones under it), so a
     drop through a gap in sparse infill still lands on plastic, never the glass; None if there's no such place (it
@@ -658,7 +660,8 @@ def warm_spot(layers, layer, k, grid, window, opts, near, cache, below):
             cache[(k, one.index)] = layer_body(one, k, grid, window)
         room &= cache[(k, one.index)]
     m = opts.edge_margin + opts.warm_margin + math.hypot(grid.sx, grid.sy) / 2.  # snapped to cells: half a diagonal
-    mx, my = int(math.ceil(m / grid.sx)), int(math.ceil((HEAD_HALF_Y_MM + m) / grid.sy))
+    half_y = HEAD_ROWS_MM + SKEW_MAX * max(REF_POSITION - HEAD_POSITIONS[0], HEAD_POSITIONS[1] - REF_POSITION) * grid.sx
+    mx, my = int(math.ceil(m / grid.sx)), int(math.ceil((half_y + m) / grid.sy))
     # Positions go towards -X: HEAD_POSITIONS[1] is furthest along -X, [0] along +X.
     room = erode_span(room, HEAD_POSITIONS[1] - REF_POSITION + mx, REF_POSITION - HEAD_POSITIONS[0] + mx, 1)
     room = erode_span(room, my, my, 0)

@@ -417,7 +417,8 @@ ink, one object at a time.
   layers of a cancelled object, count): none if it fired `--prewarm-hot` s (5) or less before, all of `--prewarm` s
   (6) after `--prewarm-cold` s (30: it's cold in under 30 s), in proportion between (2 s on the owl's 17 s layers);
   the job carries the three. The spot is where every nozzle the warm-up fires (positions 0–111, 9.4 mm across, and
-  1.5 mm either way along the pass for the colour rows) lies `--edge-margin` plus `--warm-margin` (1 mm, for the
+  2.2 mm either way along the pass: the colour rows, and the cartridge's yaw as far as `nozzle_skew` goes) lies
+  `--edge-margin` plus `--warm-margin` (1 mm, for the
   offset's error) inside both this layer's plastic and the next layer's, so whatever lands is inside the part, and over
   plastic laid down so far, so a drop through a gap in sparse infill lands on plastic below (a part with no solid
   bottom gets none); the one nearest the first pass. Where there's no such place (a small or thin layer, the top
