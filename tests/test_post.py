@@ -627,6 +627,12 @@ class InkTrips(unittest.TestCase):
         # M107 and M106 without S and with P (Klipper's part fan either way) are followed.
         lines = with_line(block_gcode(layers=3), "START_PRINT", "M106 P1")
         self.assertIn("M106 S255", ink_blocks(run(lines, "--edge-margin", "0")[0])[0])
+        # The G-code's speed exactly, however small.
+        for speed in ("127.5", "0.4"):
+            block = ink_blocks(run(with_line(block_gcode(layers=3), "START_PRINT", "M106 S" + speed),
+                                   "--edge-margin", "0")[0])[0]
+            self.assertTrue(block.index("M106 S0 ; part fan for the ink (off: its air blew the drops off course)")
+                            < block.index("POLYDYE_ENABLE LIVE=0") < block.index("M106 S" + speed), block)
         lines = with_line(with_line(block_gcode(layers=3), "START_PRINT", "M107"), "START_PRINT", "M106 S80")
         self.assertFalse([ln for b in ink_blocks(run(lines, "--edge-margin", "0")[0]) for ln in b
                           if ln.startswith(("M106", "M107"))])

@@ -894,7 +894,7 @@ def ink_block(layer, passes, opts, inside, primes=(), trip_s=0.):
     if inside:
         g.append("EXCLUDE_OBJECT_END NAME=%s" % (inside,))
     g += ["SAVE_GCODE_STATE NAME=polydye_ink", "G90", "M83"]
-    fan, was = ink_fan(opts), int(round(layer.fan or 0.))
+    fan, was = ink_fan(opts), layer.fan or 0.  # was: exactly as the G-code set it
     if fan is not None and fan != was:
         g.append("M106 S%d ; part fan for the ink (off: its air blew the drops off course)" % (fan,))
     wipe = wipe_path(layer, opts.wipe) if opts.wipe else []
@@ -923,7 +923,7 @@ def ink_block(layer, passes, opts, inside, primes=(), trip_s=0.):
             p.n, p.layer, p.number, p.coat, p.colours, p.x, p.y, p.dir))
     g += ["M400", "POLYDYE_ENABLE LIVE=0"]
     if fan is not None and fan != was:
-        g.append("M106 S%d" % (was,) if was else "M107")  # back on for the drying and the print
+        g.append("M106 S%g" % (was,) if was else "M107")  # back on for the drying and the print
     if opts.ink_accel:
         g.append("POLYDYE_INK_MOTION RESTORE=1")
     if standby:
