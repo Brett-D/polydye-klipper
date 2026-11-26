@@ -241,8 +241,6 @@ def parse(lines):
             except ValueError:
                 pass
             flush = True
-        elif cmd in ('M400', 'M109', 'M190', 'TEMPERATURE_WAIT', 'BED_MESH_CALIBRATE', 'G28', 'G29'):
-            flush = True
         elif cmd in ('M104', 'M109'):
             p = dict((w[0].upper(), w[1:]) for w in words[1:] if w)
             try:
@@ -250,6 +248,9 @@ def parse(lines):
                     temp = float(p['S']) or None
             except ValueError:
                 pass
+            flush = flush or cmd == 'M109'
+        elif cmd in ('M400', 'M190', 'TEMPERATURE_WAIT', 'BED_MESH_CALIBRATE', 'G28', 'G29'):
+            flush = True
         elif cmd == 'SET_HEATER_TEMPERATURE':
             p = dict(w.upper().split('=', 1) for w in words[1:] if '=' in w)
             if p.get('HEATER') == 'EXTRUDER':
@@ -724,8 +725,8 @@ class Shell:
 def layer_passes(layer, grid, support, tools, objects, opts, pitch, shell=None, stats=None):
     """The ink passes for `layer`, in printing order, with their directions; `support` (a Support: plastic so far, all
     layers up to this one) is updated with the layer; `shell` (a Shell, with --depth) keeps the ink near the
-    surface. `stats` counts the cells with colour near the surface ('coloured') and those --edge-margin left out
-    ('lost')."""
+    surface. `stats` counts the cells with colour near the surface within --inset ('coloured') and those of them
+    --edge-margin left out ('lost')."""
     segs = np.array([s[3:] for s in layer.segs], float).reshape(-1, 5)
     meta = np.array([s[:3] for s in layer.segs], int).reshape(-1, 3)
     support.add(segs, meta)
@@ -754,6 +755,7 @@ def layer_passes(layer, grid, support, tools, objects, opts, pitch, shell=None, 
                         hy, hx)
         allowed = allowed[r0 - wr0:, g0 - wg0:][:r1 - r0, :g1 - g0]
         shape = (r1 - r0, g1 - g0)
+        on_plastic, inside = allowed, np.ones(shape, bool)  # by --edge-margin, by --inset
         if iy or ix:
             # In a window wider than the ink's, so its edge isn't taken for the surface.
             br0, bg0 = max(0, r0 - iy - 2), max(0, g0 - ix - 2)
@@ -761,7 +763,8 @@ def layer_passes(layer, grid, support, tools, objects, opts, pitch, shell=None, 
             body = np.zeros((br1 - br0, bg1 - bg0), bool)
             stamp(body, br0, bg0, grid, segs[(meta[:, 2] == obj) & (meta[:, 1] != OTHER)])
             body = erode(close(body), iy, ix)
-            allowed &= body[r0 - br0:r0 - br0 + shape[0], g0 - bg0:g0 - bg0 + shape[1]]
+            inside = body[r0 - br0:r0 - br0 + shape[0], g0 - bg0:g0 - bg0 + shape[1]]
+            allowed = on_plastic & inside
         coats = []  # per tool: (coverage, cells and how many coats each)
         coloured = np.zeros(shape, bool)  # where the filaments' colour is, --edge-margin or not
         for t in inked:
@@ -779,10 +782,10 @@ def layer_passes(layer, grid, support, tools, objects, opts, pitch, shell=None, 
         if shell is not None and coats:
             near = shell.near(layer, obj, r0, g0, coloured)
             coats = [(cov, np.where(near, n, 0)) for cov, n in coats]
-        if stats is not None:
-            surface = coloured if near is None else coloured & near
+        if stats is not None:  # among the cells --inset leaves
+            surface = (coloured if near is None else coloured & near) & inside
             stats['coloured'] = stats.get('coloured', 0) + int(surface.sum())
-            stats['lost'] = stats.get('lost', 0) + int((surface & ~allowed).sum())
+            stats['lost'] = stats.get('lost', 0) + int((surface & ~on_plastic).sum())
         name = objects[obj]
         for coat in range(1, max(opts.top_coats, opts.wall_coats) + 1):
             level = np.zeros((3,) + shape, np.float32)
@@ -980,8 +983,14 @@ def process(lines, opts):
         if passes:
             plan.append((layer, passes))
     passes = [p for _, ps in plan for p in ps]
+    lost = stats.get('lost', 0) / float(stats['coloured']) if stats.get('coloured') else 0.
+    warning = ("WARNING: --edge-margin %g mm left out %.0f %% of the colour at the surface, where no plastic is within "
+               "that far beyond it: slice with a brim (or stand the model on a base) at least %g mm wide"
+               % (opts.edge_margin, lost * 100, math.ceil((opts.edge_margin + 0.1) * 10) / 10.)
+               if lost > EDGE_LOST_WARN else "")
     if not passes:
-        return None, "no ink lands on plastic (--edge-margin %g mm): the G-code is unchanged" % (opts.edge_margin,)
+        return None, "no ink lands on plastic (--edge-margin %g mm): the G-code is unchanged%s" % (
+            opts.edge_margin, ". " + warning if warning else "")
     for n, p in enumerate(passes):
         p.n = n
     before, primes = warm_and_prime(lines, layers, plan, config, timing, opts)
@@ -998,11 +1007,8 @@ def process(lines, opts):
                % (len(passes), len(plan), size / 1e6, opts.dpi, opts.nozzle_dpi,
                   *(round(v * 100, 2) for v in opts.ink_limits), ", stock tone" if opts.tone == 'stock' else "",
                   ", depth %g mm" % (opts.depth,) if opts.depth else "", len(before), count))
-    lost = stats.get('lost', 0) / float(stats['coloured']) if stats.get('coloured') else 0.
-    if lost > EDGE_LOST_WARN:
-        summary += (". WARNING: --edge-margin %g mm left out %.0f %% of the colour at the surface, where no plastic "
-                    "is within that far beyond it: slice with a brim (or stand the model on a base) at least %g mm "
-                    "wide" % (opts.edge_margin, lost * 100, math.ceil((opts.edge_margin + 0.1) * 10) / 10.))
+    if warning:
+        summary += ". " + warning
     insert = {}
     for layer, ps in plan:
         # The trip's expected time, for --standby-after: its moves, passes, primes and the drying pause.

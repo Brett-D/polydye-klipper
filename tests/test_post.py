@@ -594,6 +594,9 @@ class InkLimits(unittest.TestCase):
             self.assertAlmostEqual(post.tone(level, post.TONE_STOCK), out, 6)
         for got, want in zip(post.coverage('#4040FF', (1., 1., 1.), post.TONE_STOCK), (.6, .6, 0.)):  # 75 %
             self.assertAlmostEqual(got, want, 2)
+
+    @unittest.skipIf(post.np is None, "needs numpy")
+    def test_the_summary_names_the_stock_tone(self):
         out, summary = run(block_gcode(layers=2, config={'filament_colour': '#FFFFFF;#808080'}), "--tone", "stock",
                            "--edge-margin", "0")
         self.assertIn("stock tone", summary)
@@ -662,6 +665,12 @@ class InkTrips(unittest.TestCase):
         lines = [ln for ln in block_gcode(layers=3) if not ln.startswith("M104")]
         out, _ = run(lines, "--edge-margin", "0", "--standby-drop", "15", "--standby-after", "0")
         self.assertFalse([ln for b in ink_blocks(out) for ln in b if ln.startswith(("M104", "M109"))])
+        # The temperature an M109 waits for counts too.
+        lines = [x for ln in block_gcode(layers=3)
+                 for x in (["M104 S150\n", "M109 S205\n"] if ln.startswith("M104") else [ln])]
+        block = ink_blocks(run(lines, "--edge-margin", "0", "--standby-drop", "15", "--standby-after", "0")[0])[0]
+        cool = next(k for k, ln in enumerate(block) if ln.startswith("M104 S190 ; standby while the ink prints"))
+        self.assertTrue(cool < block.index("M104 S205") < block.index("M109 S205"), block)
 
     def test_a_straight_wall_needs_plastic_beyond_its_face_for_the_edge_margin(self):
         # At depth 0.3 (inset 0, edge margin 0.5) the coloured side of a straight block (its -Y face) gets ink within
@@ -681,6 +690,15 @@ class InkTrips(unittest.TestCase):
         self.assertEqual(dots, [])
         self.assertIn("WARNING: --edge-margin 0.5 mm left out", summary)
         self.assertIn("slice with a brim (or stand the model on a base) at least 0.6 mm wide", summary)
+        # Not what --inset leaves out: a brim wouldn't bring that back.
+        out, summary = run(block_gcode(layers=3), "--edge-margin", "0", "--inset", "1")
+        self.assertIsNotNone(out)
+        self.assertNotIn("WARNING", summary)
+        # Said too when the margin leaves no ink at all.
+        out, summary = run(block_gcode(layers=3), "--edge-margin", "5")
+        self.assertIsNone(out)
+        self.assertIn("no ink lands on plastic (--edge-margin 5 mm): the G-code is unchanged. WARNING: --edge-margin "
+                      "5 mm left out 100 % of the colour", summary)
 
 
 @unittest.skipIf(post.np is None, "needs numpy")
