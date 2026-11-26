@@ -338,9 +338,12 @@ after the layer's last extrusion, `--gap` mm (1) above it, so the next layer sea
    at 100 % bonded fine); `--depth` then keeps the ink to the part of it near the surface (see below). How deep the ink
    should go is being measured: on the first full-colour box (natural PLA) 2–2.5 mm deep walls looked stronger than
    1.2–1.6 mm, but on the first 3D wall, also natural PLA, ink 0.05–2.3 mm in from the face read blurred and darker
-   (orange came out red: yellow and magenta stacked through 2.3 mm of clear plastic). A **brim** is recommended: ink
-   is only put where a drop that lands up to `--edge-margin` (0.5 mm) off still lands on plastic, so without one the
-   first layers' colours stop short of the model's edge.
+   (orange came out red: yellow and magenta stacked through 2.3 mm of clear plastic); on the white dome (dome v2)
+   0.25–0.3 mm deep read solid. A **brim** is recommended: ink is only put where a drop that lands up to
+   `--edge-margin` (0.5 mm) off still lands on plastic printed so far, so without one the first layers' colours stop
+   short of the model's edge, and with `--depth` a straight wall's colour all lies within that depth of its face, so
+   with nothing beyond the face (no brim or base) the wall gets none. The summary warns when the edge margin leaves
+   out more than 10 % of the colour at the surface.
 5. Others > Post-processing Scripts: `"C:\path\to\python.exe" "C:\path\to\polydye_post.py";` (add options before
    the `;`, e.g. `--prime-idle 60`).
 
@@ -370,8 +373,24 @@ ink, one object at a time.
 - **Gentle moves while the ink prints:** `POLYDYE_INK_MOTION ACCEL=1000 SCV=1` before the passes (acceleration and
   square corner velocity at most that), `POLYDYE_INK_MOTION RESTORE=1` after them puts the print's limits back
   (`--ink-accel`, `--ink-scv`; 0: the print's own).
+- **Part fan off while the ink prints** (`--ink-fan 0`; a percentage, or `keep` to leave it): `M106 S0` before the
+  passes (it spins down on the way up; no wait is added), and the G-code's own speed back after them (`M106` with
+  its exact value, or `M107`), before the `--dry` pause, so the air helps the ink dry. On the dome the side the fan
+  blew across came out much paler than the opposite one at the same settings: the air moved the drops.
 - **Solid colours fire every dot of their inks, in one coat** (`--ink-limit 100`, `--wall-coats 1`, `--top-coats 1`):
   on paper 100 % in one coat was the cleanest and most vivid; 60 % in two coats came close, 35 % was pale and grainy.
+  On 3D prints lighter ink may be better (on the white dome magenta and yellow at 25 % read nearly as strong as at
+  100 %, and the stock firmware fires about 25 %), while cyan read weak (black came out maroon, green teal-yellow,
+  blue purple): the defaults are to be set from a test tile. Per ink: `--ink-limit C,M,Y`, or `--ink-limit-c`, `-m`,
+  `-y` (these win); `--cyan-boost` multiplies a single `--ink-limit` for cyan (at most 100 %). `--tone stock` puts
+  each colour through the stock PolySlice's lightening curve before the dither (75 % → 60, 50 → 29, 25 → 4).
+- **The ink trip's return** (where the nozzle resumes after the ink it can leave a slit, blobs or strings): the
+  filament is retracted `--retract` mm (1.5) for the trip and pushed back by that plus `--refill` mm (0) on return.
+  `--wipe` mm (0: off) moves the nozzle back along the layer's last line while it retracts, leaving the ooze on the
+  line. `--standby-drop` °C (0: off) cools the hotend by that much during a trip expected to take at least
+  `--standby-after` s (20; its moves, passes, primes and the dry pause), heats it again during the dry pause and
+  waits for the temperature (`M109`) before it returns. All but the retraction are off until a test tile shows which
+  helps.
 - **Partial tones** (a colour's ink between 0 and 100 %) are an ordered dither (an 8 × 8 Bayer matrix fixed on the
   plate), decided per pair of columns: every nozzle fires at least two columns running, because a fire on its own
   doesn't eject. Cyan, magenta and yellow read the matrix shifted, so up to 25 % each they fall on different dots.
@@ -399,14 +418,16 @@ ink, one object at a time.
   recalibration needs no re-slice (the registration and skew can't change while a job is loaded: its passes are
   made with them); `dpi` and `nozzle_dpi` must match (the job is refused otherwise). It needs `data_port`.
 
-**Options** (all optional): `--ink-limit` %, `--wall-coats`, `--top-coats`, `--gap` mm, `--dry` s (5: the ink dries
-before the next layer), `--retract` mm (1.5), `--travel` mm/s (150), `--edge-margin` mm (0.5), `--inset` mm (0.05: the ink stops that far
-inside the model's surface, so none lands on a base or brim below it; 0: right to it), `--depth` mm (0: off; see
-above), `--positions` (28-82: two groups of positions
-on each fire line, with room for the colour registration), `--feather` (6; 0: side by side), `--ink-accel` mm/s²
-(1000), `--ink-scv` mm/s (1), `--one-direction`, `--prewarm` s (6; 0: none), `--prime-idle` s (90; 0: never),
-`--dpi`, `--nozzle-dpi`, `--pass-speed` (polydye.cfg's), and `--accel`, `--scv`, `--max-velocity` for
-the timing (default: the profile's). `--dry-run` runs the passes with live ink off, and without bursts or primes.
+**Options** (all optional): `--ink-limit` % or C,M,Y (100), `--ink-limit-c`, `--ink-limit-m`, `--ink-limit-y` %,
+`--cyan-boost` (1), `--tone linear|stock` (linear), `--ink-fan` % or `keep` (0), `--wall-coats`, `--top-coats`,
+`--gap` mm, `--dry` s (5: the ink dries before the next layer), `--retract` mm (1.5), `--refill` mm (0), `--wipe` mm
+(0), `--standby-drop` °C (0), `--standby-after` s (20), `--travel` mm/s (150), `--edge-margin` mm (0.5), `--inset` mm
+(0.05: the ink stops that far inside the model's surface, so none lands on a base or brim below it; 0: right to it;
+on the dome 0.15–0.3 read faint, 0 strong), `--depth` mm (0: off; see above), `--positions` (28-82: two groups of
+positions on each fire line, with room for the colour registration), `--feather` (6; 0: side by side), `--ink-accel`
+mm/s² (1000), `--ink-scv` mm/s (1), `--one-direction`, `--prewarm` s (6; 0: none), `--prime-idle` s (90; 0: never),
+`--dpi`, `--nozzle-dpi`, `--pass-speed` (polydye.cfg's), and `--accel`, `--scv`, `--max-velocity` for the timing
+(default: the profile's). `--dry-run` runs the passes with live ink off, and without bursts or primes.
 
 It refuses G-code it can't ink safely, leaving the file unchanged: a prime tower, a Change filament G-code, differing
 filament temperatures, print by object, spiral vase, arcs, or a file already processed. Not tested yet: how well wet
