@@ -3687,6 +3687,23 @@ class PolyDye:
                 raise gcmd.error("%s: the job's warm-ups are up to %g s, longer than the board takes at warm_period_us "
                                  "%d (%.1f s): slice again with --prewarm %g or less"
                                  % (cmd, seconds, period, longest, math.floor(longest * 10) / 10))
+            # They run with polydye.cfg's warm_pulse and warm_period_us: ones the board can't take are refused now.
+            self._warm_plan(gcmd, "%s: the job's warm-ups (polydye.cfg's warm_pulse and warm_period_us)" % (cmd,),
+                            seconds, self.warm_pulse, self.warm_period_us)
+            # And where there's no room over the part (or its object is excluded), at warm_position, whatever the
+            # automatic warm-up's settings.
+            if self.warm_position == 'sponge':
+                self._sponge_spot(gcmd, cmd, "the job's warm-ups without room over the part run over the wipe sponge")
+            elif isinstance(self.warm_position, tuple):
+                th = self.printer.lookup_object('toolhead').get_status(self.printer.get_reactor().monotonic())
+                base = self.printer.lookup_object('gcode_move').base_position
+                low, high = th['axis_minimum'], th['axis_maximum']
+                px = self.warm_position[0] - self.offset_x + base[0]
+                py = self.warm_position[1] - self.offset_y + base[1]
+                if not ((high.x <= low.x or low.x <= px <= high.x) and (high.y <= low.y or low.y <= py <= high.y)):
+                    raise gcmd.error("%s: warm_position X=%.1f Y=%.1f, where the job's warm-ups without room over the "
+                                     "part run, would take the toolhead to X=%.1f Y=%.1f, beyond the axis limits"
+                                     % ((cmd,) + self.warm_position + (px, py)))
         if header['firmware_retract'] and self.printer.lookup_object('firmware_retraction', None) is None:
             raise gcmd.error("%s: the job's ink blocks retract with G10 and G11 (--retract firmware), but there's no "
                              "[firmware_retraction] in printer.cfg: add it (README, \"Colour prints from "

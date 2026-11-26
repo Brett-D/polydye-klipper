@@ -3829,6 +3829,22 @@ class InkJobs(unittest.TestCase):
                  r"the job's G-code has prewarm bursts \(POLYDYE_PREWARM, from an older polydye_post.py\), which fire "
                  r"wherever the cartridge is, over the glass bed too: slice it again"),
                 (None, dict(warms=1), None, "the job's warm-ups need newer PolyDye board firmware"),
+                # Checked as they'll run: polydye.cfg's pulse on this (older) board firmware, and warm_position (the
+                # sponge, needed even with the automatic warm-up off, or a bed spot within reach).
+                (None, dict(warms=1), lambda pd: (setattr(pd, 'spit_run_cmd', object()), setattr(pd, 'warm_pulse', 8),
+                                                  setattr(pd, 'warm_period_us', 508)),
+                 r"the job's warm-ups \(polydye.cfg's warm_pulse and warm_period_us\): WARM_PULSE=8 \(2.80 us\) needs "
+                 r"newer PolyDye board firmware"),
+                (None, dict(warms=1), lambda pd: (setattr(pd, 'spit_run_cmd', object()),
+                                                  setattr(pd, 'warm_seconds', 0.),
+                                                  setattr(pd, 'warm_position', 'sponge'),
+                                                  self.objects.pop('gcode_macro POLYDYE_WIPE')),
+                 "the job's warm-ups without room over the part run over the wipe sponge, but there's no POLYDYE_WIPE "
+                 "macro"),
+                (None, dict(warms=1), lambda pd: (setattr(pd, 'spit_run_cmd', object()),
+                                                  setattr(pd, 'warm_position', (300., 100.))),
+                 r"warm_position X=300.0 Y=100.0, where the job's warm-ups without room over the part run, would take "
+                 r"the toolhead to X=300.0 Y=100.0, beyond the axis limits"),
                 (None, dict(warms=1, warm={0: (300., 100.)}),
                  lambda pd: setattr(pd, 'spit_run_cmd', object()),
                  r"layer 0's warm-up over X=300.0 Y=100.0 would take the toolhead to X=300.0 Y=100.0, beyond the "
