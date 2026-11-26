@@ -1308,8 +1308,8 @@ def cfg_with(text, values):
 # JOB_AHEAD_BYTES / JOB_AHEAD_PASSES on the board unprinted), each stored to be deleted once printed
 # (PASSSTORE_FLAG_ONCE); after each layer POLYDYE_JOB_PASS N=n prints pass n with POLYDYE_PASS. The passes are drawn
 # without colour registration: it's applied here, from polydye.cfg, so a recalibration needs no re-slice.
-JOB_VERSION = 2
-JOB_VERSIONS = (1, 2)  # 2: POLYDYE_INK_MOTION in its ink blocks
+JOB_VERSION = 3
+JOB_VERSIONS = (1, 2, 3)  # 2: POLYDYE_INK_MOTION in its ink blocks; 3: G10 and G11 there (retract=firmware)
 JOB_BEGIN, JOB_END = b"; POLYDYE_JOB_BEGIN", b"; POLYDYE_JOB_END"
 JOB_NOZZLES = (STOCK_RANDOM['first'], STOCK_RANDOM['last'])  # the positions the stock firmware fires, 14-85
 JOB_AHEAD_BYTES, JOB_AHEAD_PASSES = 3 * 1024 * 1024, 256
@@ -1363,8 +1363,9 @@ def _job_fields(line):
 def job_load(path):
     """Reads a job's index: (header, records). header has version, dpi, nozzle_dpi, pass_axis, positions (lo, hi),
     passes, layers, how many POLYDYE_PREWARM and POLYDYE_PRIME its G-code has (prewarms, primes), the lowest
-    acceleration its G-code sets for an ink block (ink_accel, 0: none), the highest Z an ink block goes to (ink_z) and
-    its bursts' SECONDS (prewarm_s, 0: none given);
+    acceleration its G-code sets for an ink block (ink_accel, 0: none), the highest Z an ink block goes to (ink_z),
+    its bursts' SECONDS (prewarm_s, 0: none given) and whether its ink blocks retract with G10 and G11
+    (firmware_retract);
     each record n, layer, pass, coat, object, dir, x, y, columns, colours, size (nozzle data bytes, at most) and
     where its data lines are (start, end)."""
     with open(path, 'rb') as f:
@@ -1397,7 +1398,8 @@ def job_load(path):
                   'pass_axis': header.get('pass_axis', 'y'), 'positions': (lo, hi), 'passes': int(header['passes']),
                   'layers': int(header.get('layers', 0)), 'prewarms': int(header.get('prewarms', 0)),
                   'primes': int(header.get('primes', 0)), 'ink_accel': float(header.get('ink_accel', 0)),
-                  'ink_z': float(header.get('ink_z', 0)), 'prewarm_s': float(header.get('prewarm_s', 0))}
+                  'ink_z': float(header.get('ink_z', 0)), 'prewarm_s': float(header.get('prewarm_s', 0)),
+                  'firmware_retract': header.get('retract') == 'firmware'}
         for n, rec in enumerate(records):
             for key in ('n', 'layer', 'pass', 'coat', 'dir', 'columns'):
                 rec[key] = int(rec[key])
@@ -3601,6 +3603,10 @@ class PolyDye:
                 raise gcmd.error("%s: the job's prewarm bursts are %g s, longer than the board takes at "
                                  "warm_period_us %d (%.1f s): slice again with --prewarm %g or less"
                                  % (cmd, seconds, period, longest, math.floor(longest * 10) / 10))
+        if header['firmware_retract'] and self.printer.lookup_object('firmware_retraction', None) is None:
+            raise gcmd.error("%s: the job's ink blocks retract with G10 and G11 (--retract firmware), but there's no "
+                             "[firmware_retraction] in printer.cfg: add it (README, \"Colour prints from "
+                             "OrcaSlicer\"), or slice again with --retract MM" % (cmd,))
         if header['primes']:
             if self.spit_run_cmd is None or 'stock' not in self.spit_patterns:
                 raise gcmd.error("%s: the job's primes (POLYDYE_PRIME) need newer PolyDye board firmware; update it "

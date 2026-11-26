@@ -335,12 +335,15 @@ after the layer's last extrusion, `--gap` mm (1) above it, so the next layer sea
    colour becomes cyan, magenta and yellow (`1 − R`, `1 − G`, `1 − B`).
 4. Process: **Prime tower off**; **Arc fitting off** (Quality > Precision); Print sequence **By layer**; no spiral vase;
    Multimaterial > *Maximum width of a segmented region* **2.5 mm**, so painted colours are a shell that deep (2.5 mm
-   at 100 % bonded fine); `--depth` then keeps the ink to the part of it near the surface (see below). How deep the ink
-   should go is being measured: on the first full-colour box (natural PLA) 2–2.5 mm deep walls looked stronger than
-   1.2–1.6 mm, but on the first 3D wall, also natural PLA, ink 0.05–2.3 mm in from the face read blurred and darker
-   (orange came out red: yellow and magenta stacked through 2.3 mm of clear plastic). A **brim** is recommended: ink
-   is only put where a drop that lands up to `--edge-margin` (0.5 mm) off still lands on plastic, so without one the
-   first layers' colours stop short of the model's edge.
+   at 100 % bonded fine); `--depth` (0.6 mm) then keeps the ink to the part of it near the surface (see below). On the
+   first full-colour box (natural PLA) 2–2.5 mm deep walls looked stronger than 1.2–1.6 mm, but on the first 3D wall,
+   also natural PLA, ink 0.05–2.3 mm in from the face read blurred and darker (orange came out red: yellow and magenta
+   stacked through 2.3 mm of clear plastic); on white PLA 0.25–0.3 mm deep read solid (dome v2), and 0.3, 0.6 and
+   1.2 mm read the same at 35 % (the test tile). A **brim** is recommended: ink is only put where a drop that lands
+   up to `--edge-margin` (0.5 mm) off still lands on plastic printed so far, so without one the first layers' colours
+   stop short of the model's edge, and with `--depth` a straight wall's colour all lies within that depth of its
+   face, so with nothing beyond the face (no brim or base) the wall gets none. The summary warns when the edge margin
+   leaves out more than 10 % of the colour at the surface.
 5. Others > Post-processing Scripts: `"C:\path\to\python.exe" "C:\path\to\polydye_post.py";` (add options before
    the `;`, e.g. `--prime-idle 60`).
 
@@ -351,13 +354,14 @@ another way.
 
 **What the post-processor does:** the tool changes go; per layer, where each coloured filament's lines are becomes
 ink, one object at a time.
-- **Ink near the surface** (`--depth`, mm; 0, the default: off): a dot is inked only where it lies at most that
-  far under the model's surface: beside it, or under a top face or over a bottom face, so the colour sits at the
-  surface however deep Orca's coloured shell goes. The depth is measured from the dot's cell, half-way up its layer,
-  to the nearest place outside the object, in its own layer or the ones above and below. Each layer counts as solid
-  where its lines are, with the gaps in its sparse infill filled in, but holes in the model (enclosed by walls alone)
-  are surfaces too. A wall's ink then all lies within `--depth` of its face, so it needs plastic beyond the face (a
-  brim, or the base it stands on): otherwise `--edge-margin` keeps the outer 0.5 mm clear and the wall gets none.
+- **Ink near the surface** (`--depth`, mm; 0.6 by default; 0: off, wherever Orca's colour is): a dot is inked only
+  where it lies at most that far under the model's surface: beside it, or under a top face or over a bottom face, so
+  the colour sits at the surface however deep Orca's coloured shell goes. The depth is measured from the dot's cell,
+  half-way up its layer, to the nearest place outside the object, in its own layer or the ones above and below. Each
+  layer counts as solid where its lines are, with the gaps in its sparse infill filled in, but holes in the model
+  (enclosed by walls alone) are surfaces too. A wall's ink then all lies within `--depth` of its face, so it needs
+  plastic beyond the face (a brim, or the base it stands on): otherwise `--edge-margin` keeps the outer 0.5 mm clear
+  and the wall gets none.
 - **Long sweeps:** each object's ink in a layer is printed as sweeps along Y over its whole footprint, every colour in
   each, about 4.2 mm apart (55 nozzle positions, 28–82), in alternating directions, each trimmed to its first and
   last ink. The sweep grid shifts every layer (by multiples of the golden ratio over the spare width), so the seams
@@ -370,8 +374,27 @@ ink, one object at a time.
 - **Gentle moves while the ink prints:** `POLYDYE_INK_MOTION ACCEL=1000 SCV=1` before the passes (acceleration and
   square corner velocity at most that), `POLYDYE_INK_MOTION RESTORE=1` after them puts the print's limits back
   (`--ink-accel`, `--ink-scv`; 0: the print's own).
+- **The part fan** stays as the G-code has it while the ink prints (`--ink-fan keep`, the default). `--ink-fan` %
+  sets it for the passes (`M106` before them; it spins down on the way up, no wait is added), with the G-code's own
+  speed back after them (`M106` with its exact value, or `M107`), before the `--dry` pause. With the fan off (the
+  test tile, 2026-11-26) the nozzle ran hotter and oozed much more than with it on (dome v2): long strings dragged
+  back onto the part, and a pile of drips on the bed under where the hotend waits during the passes. With it on, the
+  side the fan blew across came out paler on the dome: the air moves the drops.
 - **Solid colours fire every dot of their inks, in one coat** (`--ink-limit 100`, `--wall-coats 1`, `--top-coats 1`):
   on paper 100 % in one coat was the cleanest and most vivid; 60 % in two coats came close, 35 % was pale and grainy.
+  On 3D prints lighter ink may be better (on the white dome magenta and yellow at 25 % read nearly as strong as at
+  100 %, and the stock firmware fires about 25 %), while cyan read weak (black came out maroon, green teal-yellow,
+  blue purple): the defaults are to be set from a test tile. Per ink: `--ink-limit C,M,Y`, or `--ink-limit-c`, `-m`,
+  `-y` (these win); `--cyan-boost` multiplies a single `--ink-limit` for cyan (at most 100 %). `--tone stock` puts
+  each colour through the stock PolySlice's lightening curve before the dither (75 % → 60, 50 → 29, 25 → 4).
+- **The ink trip's return** (where the nozzle resumes after the ink it can leave a slit, blobs or strings): the
+  filament is retracted `--retract` mm (1.5) for the trip and pushed back by that plus `--refill` mm (0) on return.
+  `--retract firmware` uses `G10` and `G11` instead, with `[firmware_retraction]`'s lengths (below), so they can be
+  tuned during a print; `POLYDYE_JOB` refuses such a print on a printer without `[firmware_retraction]`. `--wipe` mm
+  (0: off) moves the nozzle back along the layer's last line while it retracts, leaving the ooze on the line (in the
+  object's `EXCLUDE_OBJECT` region: a cancelled object's is skipped, the nozzle being elsewhere). The nozzle oozes
+  while it waits above the layer for the ink to dry, so `--dry` is short (2 s). Cooling the hotend during the trip
+  was worse: on the test tile waiting for it to heat back up held the print 58 s.
 - **Partial tones** (a colour's ink between 0 and 100 %) are an ordered dither (an 8 × 8 Bayer matrix fixed on the
   plate), decided per pair of columns: every nozzle fires at least two columns running, because a fire on its own
   doesn't eject. Cyan, magenta and yellow read the matrix shifted, so up to 25 % each they fall on different dots.
@@ -399,14 +422,29 @@ ink, one object at a time.
   recalibration needs no re-slice (the registration and skew can't change while a job is loaded: its passes are
   made with them); `dpi` and `nozzle_dpi` must match (the job is refused otherwise). It needs `data_port`.
 
-**Options** (all optional): `--ink-limit` %, `--wall-coats`, `--top-coats`, `--gap` mm, `--dry` s (5: the ink dries
-before the next layer), `--retract` mm (1.5), `--travel` mm/s (150), `--edge-margin` mm (0.5), `--inset` mm (0.05: the ink stops that far
-inside the model's surface, so none lands on a base or brim below it; 0: right to it), `--depth` mm (0: off; see
-above), `--positions` (28-82: two groups of positions
-on each fire line, with room for the colour registration), `--feather` (6; 0: side by side), `--ink-accel` mm/s²
-(1000), `--ink-scv` mm/s (1), `--one-direction`, `--prewarm` s (6; 0: none), `--prime-idle` s (90; 0: never),
-`--dpi`, `--nozzle-dpi`, `--pass-speed` (polydye.cfg's), and `--accel`, `--scv`, `--max-velocity` for
-the timing (default: the profile's). `--dry-run` runs the passes with live ink off, and without bursts or primes.
+**Options** (all optional): `--ink-limit` % or C,M,Y (100), `--ink-limit-c`, `--ink-limit-m`, `--ink-limit-y` %,
+`--cyan-boost` (1), `--tone linear|stock` (linear), `--ink-fan` % or `keep` (keep), `--wall-coats`, `--top-coats`,
+`--gap` mm, `--dry` s (2: the ink dries before the next layer), `--retract` mm or `firmware` (1.5), `--refill` mm
+(0), `--wipe` mm (0), `--travel` mm/s (150), `--edge-margin` mm (0.5), `--inset` mm (0.05: the ink stops that far
+inside the model's surface, so none lands on a base or brim below it; 0: right to it; on the dome 0.15–0.3 read
+faint, 0 strong), `--depth` mm (0.6; 0: off; see above), `--positions` (28-82: two groups of
+positions on each fire line, with room for the colour registration), `--feather` (6; 0: side by side), `--ink-accel`
+mm/s² (1000), `--ink-scv` mm/s (1), `--one-direction`, `--prewarm` s (6; 0: none), `--prime-idle` s (90; 0: never),
+`--dpi`, `--nozzle-dpi`, `--pass-speed` (polydye.cfg's), and `--accel`, `--scv`, `--max-velocity` for the timing
+(default: the profile's). `--dry-run` runs the passes with live ink off, and without bursts or primes.
+
+**Firmware retraction** (`--retract firmware`): add to `printer.cfg`, starting points for the Sprite:
+
+```ini
+[firmware_retraction]
+retract_length: 3
+retract_speed: 40
+unretract_extra_length: 0.2
+```
+
+`SET_RETRACTION RETRACT_LENGTH=2.5` (or Mainsail's retraction settings) then changes it during the print, from the
+next ink trip. Orca keeps its own retraction (`G1 E` moves) unless its printer profile has *Use firmware retraction*
+on.
 
 It refuses G-code it can't ink safely, leaving the file unchanged: a prime tower, a Change filament G-code, differing
 filament temperatures, print by object, spiral vase, arcs, or a file already processed. Not tested yet: how well wet
@@ -451,7 +489,7 @@ If anything would print a pass wrongly, Klipper stops with a readable reason, fo
 | `POLYDYE_PREWARM [SECONDS=6]` | Warms the head in the background while the moves after it run, so it's hot for the next pass (see "Prewarm bursts"): `SECONDS` (default `prewarm_seconds`, 6) of every nozzle at 1 word (0.35 µs, which doesn't eject) every `warm_period_us`, from where the moves before it end, without stopping them. Turns live ink on. A pass never waits for it: one that comes first cuts it short, and needs no warm-up of its own. At most 16.6 s at 254 µs. Needs this add-on's bundled board firmware |
 | `POLYDYE_PRIME [SECONDS=0.3]` | Primes the nozzles over the wipe sponge before an ink layer whose colours have been idle (see "Priming"): waits for the passes before it, turns live ink on, goes up by `POLYDYE_WIPE`'s `z_hop` and over the sponge, spits `SECONDS` (default `prime_seconds`, 0.3; up to 5) of the stock pattern in every colour, then comes back. Allowed during a print, no `CONFIRM`. Colour templates only; needs the `POLYDYE_WIPE` macro and this add-on's bundled board firmware |
 | `POLYDYE_CLEAN [WARM=6] [SECONDS=1.5] [STROKES=3]` | Cleans the nozzles over the wipe sponge (see "Cleaning the head"): waits for the passes before it (refused if they're still running 5 s later), turns live ink on, goes up by `POLYDYE_WIPE`'s `z_hop` and over the sponge, warms the head for `WARM` s (default `prewarm_seconds`; 0: none), spits `SECONDS` (default `clean_seconds`, 1.5; up to 5) of the stock pattern in every colour, wipes with `POLYDYE_WIPE`'s strokes there (`STROKES`, default its `strokes`; 0: none), then comes back. Live ink is afterwards as it was before. Allowed during a print, no `CONFIRM`. Colour templates only; needs the `POLYDYE_WIPE` macro and this add-on's bundled board firmware. Doesn't home (`PD_CLEAN` does) |
-| `POLYDYE_JOB [FILE=]` | At the start of a print sliced with `polydye_post.py` (it puts it there): loads the print's ink job and uploads its passes to the board as the print runs (see "Colour prints from OrcaSlicer"). Refuses, before anything moves, a job sliced for another `dpi` or `nozzle_dpi`, one the colour registration would move off nozzle positions 14–85, ink beyond the axis limits (each pass's run-up at the acceleration the G-code sets for the ink) or above the Z axis (`--gap` over the top layer), or bursts and primes the board or macros can't run. While it's loaded the colour registration and `nozzle_skew` can't change. Needs `data_port` |
+| `POLYDYE_JOB [FILE=]` | At the start of a print sliced with `polydye_post.py` (it puts it there): loads the print's ink job and uploads its passes to the board as the print runs (see "Colour prints from OrcaSlicer"). Refuses, before anything moves, a job sliced for another `dpi` or `nozzle_dpi`, one the colour registration would move off nozzle positions 14–85, ink beyond the axis limits (each pass's run-up at the acceleration the G-code sets for the ink) or above the Z axis (`--gap` over the top layer), bursts and primes the board or macros can't run, or `G10`/`G11` retraction (`--retract firmware`) without `[firmware_retraction]`. While it's loaded the colour registration and `nozzle_skew` can't change. Needs `data_port` |
 | `POLYDYE_JOB_PASS N=` | Prints the job's pass `N` with `POLYDYE_PASS` once it's on the board (waits for it): one board pass, or two over the same ground where it's split by fire line (see "Colour prints from OrcaSlicer"); skipped if its object is excluded |
 | `POLYDYE_INK_MOTION [ACCEL=1000] [SCV=1] [RESTORE=1]` | Gentler moves for an ink block: acceleration and square corner velocity at most `ACCEL`, `SCV` (never raised), until `RESTORE=1` puts back the limits from before; a print that ends inside an ink block gets them back too. `polydye_post.py` puts it around each layer's ink |
 | `POLYDYE_JOB_END` | Stops the job's uploads and says what was printed (also done when the print ends, however it ends) |

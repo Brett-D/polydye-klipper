@@ -17,7 +17,9 @@ post-processing script, this then rewrites the G-code:
 - each layer's ink moves gently (POLYDYE_INK_MOTION: --ink-accel 1000, --ink-scv 1), the print's limits put back
   after it;
 - after each layer's last extrusion, POLYDYE_JOB_PASS prints those passes --gap mm above it, so the next layer seals the
-  ink in, in --wall-coats and --top-coats coats (1);
+  ink in, in --wall-coats and --top-coats coats (1), the part fan as the G-code has it (or at --ink-fan, the G-code's
+  back for the --dry pause); the trip retracts --retract mm (1.5; firmware: G10 and G11), and can wipe (--wipe) and
+  push back more (--refill);
 - the head is hot and its nozzles primed when the ink comes: POLYDYE_PREWARM about --prewarm s (6) of moves before each
   ink layer's end warms it during the plastic, and POLYDYE_PRIME spits at the wipe sponge before the first ink pass and
   any pass using a colour that hasn't ejected for --prime-idle s (90), by the print time estimated here (Klipper's
@@ -58,7 +60,8 @@ except ImportError:  # reported by main(), so the module still imports for its t
 #   ; POLYDYE_JOB_BEGIN
 #   ;PDJ version=1 dpi=847 nozzle_dpi=300 pass_axis=y positions=16-83 passes=N layers=M prewarms=B primes=P
 #        ink_accel=A ink_z=Z prewarm_s=S ...   (the lowest acceleration in force at an ink block, 0 if the G-code
-#        sets none, the highest Z an ink block goes to, and each burst's SECONDS, so POLYDYE_JOB can check them)
+#        sets none, the highest Z an ink block goes to, and each burst's SECONDS, so POLYDYE_JOB can check them;
+#        retract=firmware, in version 3, when the ink blocks retract with G10 and G11)
 #   ;PDP n=0 layer=3 pass=0 coat=1 object=NAME dir=1 x=112.3456 y=95.12345 columns=812 colours=cm
 #   ;PDD <base64>   (one or more: the pass's data, zlib-compressed)
 #   ...
@@ -68,6 +71,7 @@ except ImportError:  # reported by main(), so the module still imports for its t
 # nozzle_dpi (positions go towards -X; POLYDYE_PASS's X names where position 50 lands), column i at Y = y + i * 25.4 /
 # dpi before colour registration. object is the EXCLUDE_OBJECT name the ink belongs to ("-": none).
 JOB_VERSION = 2  # 2: POLYDYE_INK_MOTION in the ink blocks (an older add-on refuses the job before the print starts)
+JOB_VERSION_FIRMWARE_RETRACT = 3  # G10 and G11 in the ink blocks: an older add-on can't check for [firmware_retraction]
 COLOR_BYTES = 14
 # The nozzle positions the stock firmware fires (its random pattern's, 14-85); the job draws on DEFAULT_POSITIONS,
 # leaving 2 positions each way for the colour registration across the pass.
@@ -110,6 +114,18 @@ CHANNEL_SHIFT = ((0, 0), (1, 0), (0, 1))  # (rows, positions) per colour
 # time from a layer's last extrusion to its first pass's first column (when no prime comes first), and a pass's run-ups.
 INK_MOVES_S, PRIME_TRIP_S, PREWARM_LEAD_S, RUN_UP_MM = 1., 3., 1., 3.
 PREWARM_MAX_S = 16.
+# The ink and surface defaults. DEPTH (--depth, mm): on the test tile (2026-11-26) ink 0.3, 0.6 and 1.2 mm deep read
+# the same at 35 %. Still to be set from it: INK_LIMIT (% of each ink a fully coloured filament fires), CYAN_BOOST
+# (cyan's limit is INK_LIMIT times this, at most 100 %, unless set) and INSET (--inset, mm). The dome v2 print
+# (2026-11-25) points to lighter ink (on white PLA magenta and yellow at 25 % read nearly as strong as at 100 %; the
+# stock firmware fires about 25 %), more cyan than the others (it read weak: black came out maroon, green teal-yellow,
+# blue purple), and ink right up to the surface (an inset of 0.15-0.3 mm read faint, 0 strong).
+INK_LIMIT, CYAN_BOOST, DEPTH, INSET = 100., 1., 0.6, 0.05
+# --tone stock: the stock PolySlice's lightening of a colour before its dither, ink fraction against the colour's
+# (from its compositor's two lift/gamma/gain stages, read off the PolySlice.blend by the coordinator, 2026-11-25).
+TONE_STOCK = ((0., 0.), (.25, .04), (.5, .29), (.75, .60), (1., 1.))
+# The summary warns when --edge-margin leaves out more than this fraction of the colour at the surface: no brim.
+EDGE_LOST_WARN = 0.1
 
 
 class PostError(Exception):
@@ -127,6 +143,7 @@ class Layer:
         self.end = None  # (x, y, z) after it
         self.end_object = None  # the EXCLUDE_OBJECT name it was in, or None
         self.accel = None  # the acceleration the G-code set (if any) at its last extrusion: its ink block's
+        self.fan = 0.  # the part fan's speed then (M106 S, 0-255), as the ink block finds it
 
 
 def parse(lines):
@@ -144,6 +161,7 @@ def parse(lines):
     objects = {}
     moves, dwells = [], []
     speed, accel, scv, flush = 25., None, None, True
+    fan = 0.
     for n, line in enumerate(lines):
         if line.startswith(';'):
             s = line.rstrip()
@@ -212,6 +230,7 @@ def parse(lines):
                 cur.segs.append((tool, kind, index, x, y, nx, ny, width))
                 cur.seg_heights.append(height)
                 cur.last_line, cur.end, cur.end_object, cur.accel = n, (nx, ny, nz), obj, accel
+                cur.fan = fan
             if de or nx != x or ny != y or nz != z:
                 moves.append((n, nx - x, ny - y, nz - z, de, speed, accel, scv, flush))
                 flush = False
@@ -225,6 +244,14 @@ def parse(lines):
             flush = True
         elif cmd in ('M400', 'M109', 'M190', 'TEMPERATURE_WAIT', 'BED_MESH_CALIBRATE', 'G28', 'G29'):
             flush = True
+        elif cmd == 'M106':  # Klipper's part fan, whatever P says
+            p = dict((w[0].upper(), w[1:]) for w in words[1:] if w)
+            try:
+                fan = min(255., max(0., float(p.get('S', 255.))))
+            except ValueError:
+                pass
+        elif cmd == 'M107':
+            fan = 0.
         elif cmd == 'M204':
             p = dict((w[0].upper(), w[1:]) for w in words[1:] if w)
             try:
@@ -344,15 +371,28 @@ def check_config(config):
     return [c.strip() for c in config['filament_colour'].split(';')]
 
 
-def coverage(colour, limit):
-    """Fraction of dots of cyan, magenta and yellow for an sRGB '#RRGGBB' filament colour: 1 - R, 1 - G, 1 - B, times
-    the ink limit. White is no ink."""
+def tone(level, curve):
+    """`level` (0-1) through a tone curve: points (in, out), linear between them; None: unchanged."""
+    if curve is None:
+        return level
+    for (a, fa), (b, fb) in zip(curve, curve[1:]):
+        if level <= b:
+            return fa + (fb - fa) * (level - a) / (b - a)
+    return curve[-1][1]
+
+
+def coverage(colour, limit, curve=None):
+    """Fraction of dots of cyan, magenta and yellow for an sRGB '#RRGGBB' filament colour: 1 - R, 1 - G, 1 - B
+    (through the tone `curve`, if any), times the ink limit (one for all three, or (cyan, magenta, yellow)). White is
+    no ink."""
     m = re.match(r'^#?([0-9a-fA-F]{6})', colour or '')
     if not m:
         raise PostError("filament colour %r isn't #RRGGBB" % (colour,))
     rgb = [int(m.group(1)[i:i + 2], 16) / 255. for i in (0, 2, 4)]
-    cov = tuple(round((1. - v) * limit, 4) for v in rgb)
-    return cov if max(cov) > 0.01 * limit else (0., 0., 0.)
+    if max(1. - v for v in rgb) <= 0.01:
+        return (0., 0., 0.)
+    limits = limit if isinstance(limit, (tuple, list)) else (limit,) * 3
+    return tuple(round(tone(1. - v, curve) * lim, 4) for v, lim in zip(rgb, limits))
 
 
 class Grid:
@@ -668,16 +708,24 @@ class Shell:
         return out
 
 
-def layer_passes(layer, grid, support, tools, objects, opts, pitch, shell=None):
+def margin_cells(opts, grid):
+    """--edge-margin in cells, (rows, columns): the box the plastic so far is eroded by for where ink may go. Snapped
+    to cells, the plastic can reach half a cell diagonal past its lines: the margin allows for that."""
+    if not opts.edge_margin:
+        return 0, 0
+    margin = opts.edge_margin + math.hypot(grid.sx, grid.sy) / 2.
+    return int(math.ceil(margin / grid.sy)), int(math.ceil(margin / grid.sx))
+
+
+def layer_passes(layer, grid, support, tools, objects, opts, pitch, shell=None, stats=None):
     """The ink passes for `layer`, in printing order, with their directions; `support` (a Support: plastic so far, all
     layers up to this one) is updated with the layer; `shell` (a Shell, with --depth) keeps the ink near the
-    surface."""
+    surface. `stats` counts the cells with colour near the surface within --inset ('coloured') and those of them
+    --edge-margin left out ('lost')."""
     segs = np.array([s[3:] for s in layer.segs], float).reshape(-1, 5)
     meta = np.array([s[:3] for s in layer.segs], int).reshape(-1, 3)
     support.add(segs, meta)
-    # Snapped to cells, the support can reach half a cell diagonal past the lines: the margin allows for that.
-    margin = opts.edge_margin + math.hypot(grid.sx, grid.sy) / 2. if opts.edge_margin else 0.
-    hy, hx = int(math.ceil(margin / grid.sy)), int(math.ceil(margin / grid.sx))
+    hy, hx = margin_cells(opts, grid)
     # The model's surface: its cells (snapped like the ink's) eroded by --inset, at least a cell where it's set.
     iy, ix = ((int(math.ceil(opts.inset / grid.sy)), int(math.ceil(opts.inset / grid.sx))) if opts.inset else (0, 0))
     p_lo, p_hi = opts.positions
@@ -700,6 +748,7 @@ def layer_passes(layer, grid, support, tools, objects, opts, pitch, shell=None):
                         hy, hx)
         allowed = allowed[r0 - wr0:, g0 - wg0:][:r1 - r0, :g1 - g0]
         shape = (r1 - r0, g1 - g0)
+        on_plastic, inside = allowed, np.ones(shape, bool)  # by --edge-margin, by --inset
         if iy or ix:
             # In a window wider than the ink's, so its edge isn't taken for the surface.
             br0, bg0 = max(0, r0 - iy - 2), max(0, g0 - ix - 2)
@@ -707,20 +756,29 @@ def layer_passes(layer, grid, support, tools, objects, opts, pitch, shell=None):
             body = np.zeros((br1 - br0, bg1 - bg0), bool)
             stamp(body, br0, bg0, grid, segs[(meta[:, 2] == obj) & (meta[:, 1] != OTHER)])
             body = erode(close(body), iy, ix)
-            allowed &= body[r0 - br0:r0 - br0 + shape[0], g0 - bg0:g0 - bg0 + shape[1]]
+            inside = body[r0 - br0:r0 - br0 + shape[0], g0 - bg0:g0 - bg0 + shape[1]]
+            allowed = on_plastic & inside
         coats = []  # per tool: (coverage, cells and how many coats each)
+        coloured = np.zeros(shape, bool)  # where the filaments' colour is, --edge-margin or not
         for t in inked:
             here = (meta[:, 2] == obj) & (meta[:, 0] == t)
             cells = np.zeros(shape, bool)
             stamp(cells, r0, g0, grid, segs[here & (meta[:, 1] != OTHER)])
             top = np.zeros(shape, bool)
             stamp(top, r0, g0, grid, segs[here & (meta[:, 1] == TOP)])
-            cells, top = close(cells) & allowed, close(top)
+            cells, top = close(cells), close(top)
+            coloured |= cells
+            cells &= allowed
             n = np.where(top & cells, opts.top_coats, np.where(cells, opts.wall_coats, 0))
             coats.append((tools[t], n))
+        near = None
         if shell is not None and coats:
-            near = shell.near(layer, obj, r0, g0, np.logical_or.reduce([n > 0 for _, n in coats]))
+            near = shell.near(layer, obj, r0, g0, coloured)
             coats = [(cov, np.where(near, n, 0)) for cov, n in coats]
+        if stats is not None:  # among the cells --inset leaves
+            surface = (coloured if near is None else coloured & near) & inside
+            stats['coloured'] = stats.get('coloured', 0) + int(surface.sum())
+            stats['lost'] = stats.get('lost', 0) + int((surface & ~on_plastic).sum())
         name = objects[obj]
         for coat in range(1, max(opts.top_coats, opts.wall_coats) + 1):
             level = np.zeros((3,) + shape, np.float32)
@@ -788,17 +846,58 @@ def layer_passes(layer, grid, support, tools, objects, opts, pitch, shell=None):
     return out
 
 
+def wipe_path(layer, length):
+    """Points back along `layer`'s last extruded lines from its end, `length` mm in all (less if they're shorter)."""
+    out, pos, left = [], layer.end[:2], length
+    for s in reversed(layer.segs):
+        if left <= 1e-6 or math.hypot(s[5] - pos[0], s[6] - pos[1]) > 1e-3:
+            break  # done, or not the same line
+        d = math.hypot(s[5] - s[3], s[6] - s[4])
+        if d <= 1e-9:
+            continue
+        t = min(1., left / d)
+        pos = (s[5] + (s[3] - s[5]) * t, s[6] + (s[4] - s[6]) * t)
+        out.append((pos, d * t))
+        left -= d * t
+    return out
+
+
+def ink_fan(opts):
+    """The part fan's speed (M106 S, 0-255) while the ink prints, or None to leave it as the G-code has it."""
+    return None if opts.ink_fan is None else int(round(opts.ink_fan * 2.55))
+
+
 def ink_block(layer, passes, opts, inside, primes=()):
-    """G-code that inks `passes` after `layer`'s last extrusion and comes back: out of the object it's in (`inside`),
-    retracted, up by --gap, the passes with live ink (a prime at the sponge before each pass whose index is in
-    `primes`), a pause for the ink to dry, back and down."""
+    """G-code that inks `passes` after `layer`'s last extrusion and comes back: retracted (--retract mm, or G10 with
+    --retract firmware; wiping back along its last line, with --wipe), out of the object it's in (`inside`), up by
+    --gap, the part fan at --ink-fan if set, the passes with live ink (a prime at the sponge before each pass whose
+    index is in `primes`), the fan back as the G-code had it, a pause for the ink to dry, back and down, the filament
+    pushed back (the retraction, or G11, plus --refill)."""
     x, y, z = layer.end
     g = ["; PolyDye ink: layer %d (Z %.3f), %d pass%s" % (layer.index, z, len(passes), "" if len(passes) == 1 else
-                                                         "es")]
+                                                         "es"),
+         "SAVE_GCODE_STATE NAME=polydye_ink", "G90", "M83"]
+    fan, was = ink_fan(opts), layer.fan or 0.  # was: exactly as the G-code set it
+    if fan is not None and fan != was:
+        g.append("M106 S%d ; part fan for the ink (--ink-fan)" % (fan,))
+    wipe = wipe_path(layer, opts.wipe) if opts.wipe else []
+    # The wipe goes before EXCLUDE_OBJECT_END, in the object's region with its lines: if the object was cancelled,
+    # Klipper skips it with them (the nozzle isn't at the layer's end then: the wipe's first move would cross the plate
+    # at the layer's height) and makes up for its retraction when the filament is pushed back.
+    if wipe and opts.firmware_retract:
+        g.append("G10")
+    if wipe:
+        total = sum(d for _, d in wipe)
+        # The retraction spread over the wipe at about the speed of a plain one (45 mm/s of filament).
+        f = min(60., max(5., total * 45. / opts.retract if opts.retract else 30.))
+        for (wx, wy), d in wipe:
+            g.append("G1 X%.3f Y%.3f%s F%d" % (wx, wy, " E-%.4f" % (opts.retract * d / total,) if opts.retract
+                                               else "", f * 60))
     if inside:
         g.append("EXCLUDE_OBJECT_END NAME=%s" % (inside,))
-    g += ["SAVE_GCODE_STATE NAME=polydye_ink", "G90", "M83"]
-    if opts.retract:
+    if not wipe and opts.firmware_retract:
+        g.append("G10")
+    elif not wipe and opts.retract:
         g.append("G1 E-%.2f F2700" % (opts.retract,))
     g.append("G1 Z%.3f F600" % (z + opts.gap,))
     if opts.ink_accel:
@@ -811,13 +910,17 @@ def ink_block(layer, passes, opts, inside, primes=()):
         g.append("POLYDYE_JOB_PASS N=%d ; layer %d pass %d, coat %d, %s, X=%.3f Y=%.3f DIR=%d" % (
             p.n, p.layer, p.number, p.coat, p.colours, p.x, p.y, p.dir))
     g += ["M400", "POLYDYE_ENABLE LIVE=0"]
+    if fan is not None and fan != was:
+        g.append("M106 S%g" % (was,) if was else "M107")  # back for the drying and the print
     if opts.ink_accel:
         g.append("POLYDYE_INK_MOTION RESTORE=1")
     if opts.dry > 0:
         g.append("G4 P%d" % (int(round(opts.dry * 1000)),))
     g += ["G1 X%.3f Y%.3f F%d" % (x, y, opts.travel * 60), "G1 Z%.3f F600" % (z,)]
-    if opts.retract:
-        g.append("G1 E%.2f F2400" % (opts.retract,))
+    if opts.firmware_retract:
+        g.append("G11")
+    if opts.retract or opts.refill:
+        g.append("G1 E%.2f F2400" % (opts.retract + opts.refill,))
     g.append("RESTORE_GCODE_STATE NAME=polydye_ink")
     if inside:
         g.append("EXCLUDE_OBJECT_START NAME=%s" % (inside,))
@@ -831,9 +934,11 @@ def job_block(passes, opts, layers, prewarms=0, primes=0, ink_accel=0., ink_z=0.
     against the axes."""
     out = ["; POLYDYE_JOB_BEGIN",
            ";PDJ version=%d dpi=%g nozzle_dpi=%g pass_axis=y positions=%d-%d passes=%d layers=%d prewarms=%d primes=%d "
-           "ink_accel=%g ink_z=%.3f prewarm_s=%g generator=%s" % (
-               JOB_VERSION, opts.dpi, opts.nozzle_dpi, opts.positions[0], opts.positions[1], len(passes), layers,
-               prewarms, primes, ink_accel, ink_z, prewarm_s, os.path.basename(__file__))]
+           "ink_accel=%g ink_z=%.3f prewarm_s=%g%s generator=%s" % (
+               JOB_VERSION_FIRMWARE_RETRACT if opts.firmware_retract else JOB_VERSION, opts.dpi,
+               opts.nozzle_dpi, opts.positions[0], opts.positions[1], len(passes), layers,
+               prewarms, primes, ink_accel, ink_z, prewarm_s, " retract=firmware" if opts.firmware_retract else "",
+               os.path.basename(__file__))]
     for p in passes:
         out.append(";PDP n=%d layer=%d pass=%d coat=%d object=%s dir=%d x=%.4f y=%.5f columns=%d colours=%s" % (
             p.n, p.layer, p.number, p.coat, p.obj or '-', p.dir, p.x, p.y, p.columns, p.colours))
@@ -849,7 +954,7 @@ def process(lines, opts):
         raise PostError("needs numpy: pip install numpy")
     layers, config, tool_lines, markers, objects, timing = parse(lines)
     filaments = check_config(config)
-    tools = [coverage(c, opts.ink_limit) for c in filaments]
+    tools = [coverage(c, opts.ink_limits, TONE_STOCK if opts.tone == 'stock' else None) for c in filaments]
     if len(layers) >= MAX_LAYERS:
         raise PostError("%d layers: PolyDye jobs take at most %d" % (len(layers), MAX_LAYERS - 1))
     used = set(s[0] for layer in layers for s in layer.segs)
@@ -865,15 +970,25 @@ def process(lines, opts):
     support = Support(grid, layers, objects, pad)
     shell = Shell(grid, layers, support, opts.depth) if opts.depth else None
     plan = []  # (layer, passes)
+    stats = {}
     for layer in layers:
         if not layer.segs:
             continue
-        passes = layer_passes(layer, grid, support, tools, objects, opts, pitch, shell)
+        passes = layer_passes(layer, grid, support, tools, objects, opts, pitch, shell, stats)
         if passes:
             plan.append((layer, passes))
     passes = [p for _, ps in plan for p in ps]
+    lost = stats.get('lost', 0) / float(stats['coloured']) if stats.get('coloured') else 0.
+    # The brim that leaves the surface all its ink: the margin's box reaches furthest across a wall at a slant (its
+    # corner), plus half a cell diagonal for the brim's own snapping.
+    hy, hx = margin_cells(opts, grid)
+    brim = math.ceil((math.hypot(hy * sy, hx * sx) + math.hypot(sx, sy) / 2.) * 10. - 1e-9) / 10.
+    warning = ("WARNING: --edge-margin %g mm left out %.0f %% of the colour at the surface, where no plastic is within "
+               "that far beyond it: slice with a brim (or stand the model on a base) at least %g mm wide"
+               % (opts.edge_margin, lost * 100, brim) if lost > EDGE_LOST_WARN else "")
     if not passes:
-        return None, "no ink lands on plastic (--edge-margin %g mm): the G-code is unchanged" % (opts.edge_margin,)
+        return None, "no ink lands on plastic (--edge-margin %g mm): the G-code is unchanged%s" % (
+            opts.edge_margin, ". " + warning if warning else "")
     for n, p in enumerate(passes):
         p.n = n
     before, primes = warm_and_prime(lines, layers, plan, config, timing, opts)
@@ -885,10 +1000,13 @@ def process(lines, opts):
     job = job_block(passes, opts, len(plan), len(before), count, ink_accel, ink_z,
                     opts.prewarm if before else 0.)
     size = sum(len(p.data) for p in passes)
-    summary = ("PolyDye ink job: %d passes on %d layers, %.2f MB; dpi %g, nozzle_dpi %g, ink limit %g %%%s; %d "
-               "prewarm bursts, %d primes" % (len(passes), len(plan), size / 1e6, opts.dpi, opts.nozzle_dpi,
-                                              opts.ink_limit * 100, ", depth %g mm" % (opts.depth,) if opts.depth
-                                              else "", len(before), count))
+    summary = ("PolyDye ink job: %d passes on %d layers, %.2f MB; dpi %g, nozzle_dpi %g, ink limit C %g %% M %g %% "
+               "Y %g %%%s%s; %d prewarm bursts, %d primes"
+               % (len(passes), len(plan), size / 1e6, opts.dpi, opts.nozzle_dpi,
+                  *(round(v * 100, 2) for v in opts.ink_limits), ", stock tone" if opts.tone == 'stock' else "",
+                  ", depth %g mm" % (opts.depth,) if opts.depth else "", len(before), count))
+    if warning:
+        summary += ". " + warning
     insert = {}
     for layer, ps in plan:
         insert.setdefault(layer.last_line, []).extend(ink_block(layer, ps, opts, layer.end_object,
@@ -989,6 +1107,42 @@ def positions(text):
     return lo, hi
 
 
+def ink_limits(text):
+    """--ink-limit: one percentage for every ink, or C,M,Y."""
+    try:
+        values = [float(v) for v in text.split(',')]
+    except ValueError:
+        values = []
+    if len(values) not in (1, 3) or not all(0. <= v <= 100. for v in values):
+        raise argparse.ArgumentTypeError("--ink-limit is a percentage (0-100), or three: cyan, magenta, yellow")
+    return values
+
+
+def retract_length(text):
+    """--retract: mm, or firmware (G10 and G11)."""
+    if text.strip().lower() == 'firmware':
+        return 'firmware'
+    try:
+        v = float(text)
+    except ValueError:
+        v = -1.
+    if not v >= 0.:
+        raise argparse.ArgumentTypeError("--retract is mm (0 or more), or firmware")
+    return v
+
+
+def fan_percent(text):
+    if text.strip().lower() == 'keep':
+        return None
+    try:
+        v = float(text)
+    except ValueError:
+        v = -1.
+    if not 0. <= v <= 100.:
+        raise argparse.ArgumentTypeError("--ink-fan is a percentage (0-100), or keep")
+    return v
+
+
 def options(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("gcode", help="the G-code file, rewritten in place (Orca adds it)")
@@ -996,21 +1150,40 @@ def options(argv=None):
                     "(default 847)")
     ap.add_argument("--nozzle-dpi", type=float, default=300., help="nozzle positions per inch across the pass: "
                     "polydye.cfg's nozzle_dpi (default 300)")
-    ap.add_argument("--ink-limit", type=float, default=100., help="%% of the dots of each ink colour a fully coloured "
-                    "filament fires, per coat (default 100: solid colours printed cleanest in one coat at 100 %%)")
+    ap.add_argument("--ink-limit", type=ink_limits, default=[INK_LIMIT], help="%%%% of the dots of each ink a fully "
+                    "coloured filament fires, per coat; or C,M,Y, one per ink (default %g)" % (INK_LIMIT,))
+    for ch, name in zip(CHANNELS, ('cyan', 'magenta', 'yellow')):
+        ap.add_argument("--ink-limit-" + ch, type=float, default=None, help="%%%% for %s alone (default: --ink-limit%s)"
+                        % (name, ", times --cyan-boost" if ch == 'c' else ""))
+    ap.add_argument("--cyan-boost", type=float, default=CYAN_BOOST, help="cyan's limit is a single --ink-limit "
+                    "times this, at most 100 %%%%, unless --ink-limit-c sets it (default %g)" % (CYAN_BOOST,))
+    ap.add_argument("--tone", choices=('linear', 'stock'), default='linear', help="stock: a colour's ink through the "
+                    "stock PolySlice's lightening curve before its dither (75 %% -> 60, 50 -> 29, 25 -> 4) (default "
+                    "linear)")
+    ap.add_argument("--ink-fan", type=fan_percent, default=None, help="part fan %% while the ink prints, the "
+                    "G-code's own back before the drying pause; keep: as the G-code has it (default keep: with the "
+                    "fan off the nozzle oozed more during the ink)")
     ap.add_argument("--wall-coats", type=int, default=1, help="coats on the model's sides and inside (default 1)")
     ap.add_argument("--top-coats", type=int, default=1, help="coats on top surfaces (default 1)")
     ap.add_argument("--gap", type=float, default=1., help="mm above the layer the nozzle goes for the ink (default 1)")
-    ap.add_argument("--dry", type=float, default=5., help="seconds the ink dries before the next layer (default 5)")
-    ap.add_argument("--retract", type=float, default=1.5, help="mm of filament retracted while inking (default 1.5)")
+    ap.add_argument("--dry", type=float, default=2., help="seconds the ink dries before the next layer, the nozzle "
+                    "waiting above it (default 2)")
+    ap.add_argument("--retract", type=retract_length, default=1.5, help="mm of filament retracted while inking; "
+                    "firmware: G10 and G11, with [firmware_retraction]'s lengths (SET_RETRACTION tunes them during "
+                    "the print) (default 1.5)")
+    ap.add_argument("--wipe", type=float, default=0., help="mm the nozzle moves back along the layer's last line while "
+                    "it retracts, leaving the ooze on the line (default 0: none)")
+    ap.add_argument("--refill", type=float, default=0., help="mm of filament pushed back after the ink beyond the "
+                    "retraction, for what oozed out meanwhile (default 0)")
     ap.add_argument("--travel", type=float, default=150., help="mm/s back to the layer after the ink (default 150)")
     ap.add_argument("--edge-margin", type=float, default=0.5, help="mm a drop may land off and still be on plastic "
-                    "printed so far; ink nearer the edge than that is left out, so none reaches the bed (default 0.5)")
-    ap.add_argument("--inset", type=float, default=0.05, help="mm inside the model's surface the ink stops, so none "
-                    "lands beyond it on what's below (default 0.05)")
-    ap.add_argument("--depth", type=float, default=0., help="mm: ink only where a dot is at most this far under the "
+                    "printed so far; ink nearer the edge than that is left out, so none reaches the bed: slice with a "
+                    "brim or a base wider than this (default 0.5)")
+    ap.add_argument("--inset", type=float, default=INSET, help="mm inside the model's surface the ink stops, so none "
+                    "lands beyond it on what's below (default %g)" % (INSET,))
+    ap.add_argument("--depth", type=float, default=DEPTH, help="mm: ink only where a dot is at most this far under the "
                     "model's surface (beside, above or below it), however deep Orca's colour goes; 0: wherever the "
-                    "colour is (default 0)")
+                    "colour is (default %g)" % (DEPTH,))
     ap.add_argument("--positions", type=positions, default=DEFAULT_POSITIONS, help="nozzle positions a pass draws on, "
                     "FIRST-LAST (default 28-82: two groups of 14 on each fire line, cyan's 29-83 with its "
                     "registration, so two inks want exactly 4 heaters per fire pulse)")
@@ -1038,15 +1211,17 @@ def options(argv=None):
     ap.add_argument("--max-velocity", type=float, default=0., help="Klipper's max_velocity, mm/s, for the timing "
                     "(default: the profile's maximum X speed)")
     opts = ap.parse_args(argv)
-    for name, lo in (('dpi', 1.), ('nozzle_dpi', 1.), ('ink_limit', 0.), ('gap', 0.), ('dry', 0.), ('retract', 0.),
+    for name, lo in (('dpi', 1.), ('nozzle_dpi', 1.), ('gap', 0.), ('dry', 0.),
                      ('travel', 1.), ('edge_margin', 0.), ('inset', 0.), ('depth', 0.), ('prewarm', 0.),
-                     ('prime_idle', 0.),
+                     ('prime_idle', 0.), ('wipe', 0.), ('refill', 0.), ('cyan_boost', 0.),
                      ('pass_speed', 1.), ('accel', 0.), ('scv', 0.), ('max_velocity', 0.), ('ink_accel', 0.),
                      ('ink_scv', 0.)):
         if getattr(opts, name) < lo:
             ap.error("--%s must be at least %g" % (name.replace('_', '-'), lo))
-    if opts.ink_limit > 100.:
-        ap.error("--ink-limit is a percentage, at most 100")
+    for ch in CHANNELS:
+        v = getattr(opts, 'ink_limit_' + ch)
+        if v is not None and not 0. <= v <= 100.:
+            ap.error("--ink-limit-%s is a percentage (0-100)" % (ch,))
     if not 0 <= opts.feather <= (opts.positions[1] - opts.positions[0] + 1) // 2:
         ap.error("--feather must be 0 to half a sweep's width")
     if opts.prewarm > PREWARM_MAX_S:
@@ -1054,7 +1229,16 @@ def options(argv=None):
                  % (PREWARM_MAX_S,))
     if opts.wall_coats < 0 or opts.top_coats < 0:
         ap.error("coats can't be negative")
-    opts.ink_limit /= 100.
+    opts.firmware_retract = opts.retract == 'firmware'
+    if opts.firmware_retract:
+        opts.retract = 0.  # the G-code's own E moves take none back
+    # Per ink: --ink-limit-c/m/y, else C,M,Y, else the one --ink-limit (cyan's times --cyan-boost, at most 100).
+    one = len(opts.ink_limit) == 1
+    base = opts.ink_limit * 3 if one else opts.ink_limit
+    if one:
+        base[0] = min(100., base[0] * opts.cyan_boost)
+    opts.ink_limits = tuple((base[k] if getattr(opts, 'ink_limit_' + ch) is None else getattr(opts, 'ink_limit_' + ch))
+                            / 100. for k, ch in enumerate(CHANNELS))
     return opts
 
 

@@ -4,6 +4,8 @@ the add-on's own job reader (klipper/polydye.py), so the two agree on the format
 
 This file is part of polydye-klipper (GPLv3).
 """
+import contextlib
+import io
 import math
 import os
 import re
@@ -115,8 +117,12 @@ def xlines(x0, x1, ys):
     return [[(x0, y), (x1, y)] for y in ys]
 
 
+# The defaults the tests were made with (their own options come after, so they win): no --depth, 5 s to dry.
+TEST_DEFAULTS = ("--depth", "0", "--dry", "5")
+
+
 def run(lines, *args):
-    opts = post.options(list(args) + ["x.gcode"])
+    opts = post.options(list(TEST_DEFAULTS + args) + ["x.gcode"])
     return post.process(lines, opts)
 
 
@@ -177,7 +183,7 @@ class Structure(unittest.TestCase):
         block = text.split("; PolyDye ink: layer 2")[1].split(";TYPE:Custom")[0].split("\n")[1:]
         x, y = re.match(r"G1 X([\d.]+) Y([\d.]+) E", out[blocks[-1] - 1]).groups()
         # Gentler moves while the ink prints (POLYDYE_INK_MOTION), the limits put back right after it.
-        self.assertEqual(block[:8], ["EXCLUDE_OBJECT_END NAME=cube", "SAVE_GCODE_STATE NAME=polydye_ink", "G90", "M83",
+        self.assertEqual(block[:8], ["SAVE_GCODE_STATE NAME=polydye_ink", "G90", "M83", "EXCLUDE_OBJECT_END NAME=cube",
                                      "G1 E-1.50 F2700", "G1 Z1.600 F600", "POLYDYE_INK_MOTION ACCEL=1000 SCV=1",
                                      "POLYDYE_ENABLE LIVE=1"])
         passes = [ln for ln in block if ln.startswith("POLYDYE_JOB_PASS")]
@@ -542,6 +548,174 @@ class Depth(unittest.TestCase):
         self.assertEqual(run(src, *self.ARGS)[0], run(src, *(self.ARGS + ("--depth", "0")))[0])
         with self.assertRaises(SystemExit):
             post.options(["--depth", "-0.1", "x.gcode"])
+
+
+def ink_blocks(out):
+    """The ink blocks of post-processed lines: [[line, ...]] from '; PolyDye ink:' to RESTORE_GCODE_STATE."""
+    blocks, cur = [], None
+    for line in out:
+        if line.startswith("; PolyDye ink: layer"):
+            cur = []
+            blocks.append(cur)
+        if cur is not None:
+            cur.append(line.strip())
+            if line.startswith("RESTORE_GCODE_STATE"):
+                cur = None
+    return blocks
+
+
+def with_line(lines, after, new):
+    """`lines` with `new` after the first line starting with `after`."""
+    k = next(n for n, line in enumerate(lines) if line.startswith(after))
+    return lines[:k + 1] + [new + "\n"] + lines[k + 1:]
+
+
+class InkLimits(unittest.TestCase):
+    def test_ink_limits_per_colour(self):
+        limits = lambda *args: post.options(list(args) + ["x.gcode"]).ink_limits
+        self.assertEqual(limits("--ink-limit", "50"), (.5, .5, .5))
+        self.assertEqual(limits("--ink-limit", "50", "--cyan-boost", "2"), (1., .5, .5))  # at most 100 %
+        self.assertEqual(limits("--ink-limit", "50", "--cyan-boost", "1.5"), (.75, .5, .5))
+        self.assertEqual(limits("--ink-limit", "60,30,20", "--cyan-boost", "2"), (.6, .3, .2))  # three: as given
+        self.assertEqual(limits("--ink-limit", "40", "--ink-limit-c", "45", "--ink-limit-y", "0"), (.45, .4, 0.))
+        for bad in (("--ink-limit", "120"), ("--ink-limit", "30,40"), ("--ink-limit", "x"), ("--ink-limit-m", "-1"),
+                    ("--ink-fan", "150"), ("--tone", "dark"), ("--retract", "-1"), ("--retract", "fw")):
+            with self.assertRaises(SystemExit, msg=bad), contextlib.redirect_stderr(io.StringIO()):
+                post.options(list(bad) + ["x.gcode"])
+        # The help's percentages survive argparse's own % formatting.
+        text = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(text):
+            post.options(["--help"])
+        self.assertIn("% of the dots of each ink", text.getvalue())
+        self.assertIn("at most 100 %, unless --ink-limit-c", " ".join(text.getvalue().split()))
+
+    def test_coverage_per_colour_and_through_the_stock_tone(self):
+        self.assertEqual(post.coverage('#00FFFF', (.7, .35, .35)), (.7, 0., 0.))  # cyan
+        self.assertEqual(post.coverage('#000000', (.7, .35, .35)), (.7, .35, .35))  # black
+        self.assertEqual(post.coverage('#FFFFFF', (.7, .35, .35)), (0., 0., 0.))
+        # The stock PolySlice's lightening: 75 -> 60 %, 50 -> 29, 25 -> 4, linear between.
+        for level, out in ((1., 1.), (.75, .6), (.5, .29), (.25, .04), (0., 0.), (.375, .165)):
+            self.assertAlmostEqual(post.tone(level, post.TONE_STOCK), out, 6)
+        for got, want in zip(post.coverage('#4040FF', (1., 1., 1.), post.TONE_STOCK), (.6, .6, 0.)):  # 75 %
+            self.assertAlmostEqual(got, want, 2)
+
+    @unittest.skipIf(post.np is None, "needs numpy")
+    def test_the_summary_names_the_stock_tone(self):
+        out, summary = run(block_gcode(layers=2, config={'filament_colour': '#FFFFFF;#808080'}), "--tone", "stock",
+                           "--edge-margin", "0")
+        self.assertIn("stock tone", summary)
+
+
+@unittest.skipIf(post.np is None, "needs numpy")
+class InkTrips(unittest.TestCase):
+    """The ink block's part fan and return (--ink-fan, --retract, --wipe, --refill)."""
+
+    def test_the_part_fan_for_the_ink_and_back_for_the_drying(self):
+        # By default the fan stays as the G-code has it (with it off the nozzle oozed more).
+        lines = with_line(block_gcode(layers=3), "START_PRINT", "M106 S153")
+        out, _ = run(lines, "--edge-margin", "0")
+        self.assertFalse([ln for b in ink_blocks(out) for ln in b if ln.startswith(("M106", "M107"))])
+        out, _ = run(lines, "--edge-margin", "0", "--ink-fan", "0")
+        for block in ink_blocks(out):
+            off, live = block.index("M106 S0 ; part fan for the ink (--ink-fan)"), block.index("POLYDYE_ENABLE LIVE=1")
+            back, dry = block.index("M106 S153"), block.index("G4 P5000")
+            self.assertTrue(off < live < block.index("POLYDYE_ENABLE LIVE=0") < back < dry, block)
+        # A fan already at the ink's speed isn't touched; one the G-code had off comes back as M107.
+        out, _ = run(block_gcode(layers=3), "--edge-margin", "0", "--ink-fan", "0")
+        self.assertFalse([ln for b in ink_blocks(out) for ln in b if ln.startswith(("M106", "M107"))])
+        out, _ = run(block_gcode(layers=3), "--edge-margin", "0", "--ink-fan", "30")
+        block = ink_blocks(out)[0]
+        self.assertTrue(block.index("M106 S76 ; part fan for the ink (--ink-fan)")
+                        < block.index("POLYDYE_ENABLE LIVE=1") < block.index("M107") < block.index("G4 P5000"))
+        # M107 and M106 without S and with P (Klipper's part fan either way) are followed.
+        lines = with_line(block_gcode(layers=3), "START_PRINT", "M106 P1")
+        self.assertIn("M106 S255", ink_blocks(run(lines, "--edge-margin", "0", "--ink-fan", "0")[0])[0])
+        # The G-code's speed exactly, however small.
+        for speed in ("127.5", "0.4"):
+            block = ink_blocks(run(with_line(block_gcode(layers=3), "START_PRINT", "M106 S" + speed),
+                                   "--edge-margin", "0", "--ink-fan", "0")[0])[0]
+            self.assertTrue(block.index("M106 S0 ; part fan for the ink (--ink-fan)")
+                            < block.index("POLYDYE_ENABLE LIVE=0") < block.index("M106 S" + speed), block)
+        lines = with_line(with_line(block_gcode(layers=3), "START_PRINT", "M107"), "START_PRINT", "M106 S80")
+        self.assertFalse([ln for b in ink_blocks(run(lines, "--edge-margin", "0", "--ink-fan", "0")[0]) for ln in b
+                          if ln.startswith(("M106", "M107"))])
+
+    def test_retract_wipe_and_refill(self):
+        out, _ = run(block_gcode(layers=3), "--edge-margin", "0")
+        block = ink_blocks(out)[0]
+        self.assertTrue(block.index("EXCLUDE_OBJECT_END NAME=cube") < block.index("G1 E-1.50 F2700")
+                        < block.index("G1 E1.50 F2400"), block)
+        self.assertFalse([ln for ln in block if ln in ("G10", "G11")])
+        # Wiping 2 mm back along the layer's last line (its coloured lines run along X, the last to X 95.2 or
+        # 104.8), the retraction spread over it, in the object's region (a cancelled object's is skipped with its
+        # lines: the nozzle isn't there); a refill of 0.4 mm more after.
+        out, _ = run(block_gcode(layers=3), "--edge-margin", "0", "--wipe", "2", "--refill", "0.4", "--retract", "2")
+        for layer, block in zip(post.parse(block_gcode(layers=3))[0], ink_blocks(out)):
+            x, y, _ = layer.end
+            wipes = [ln for ln in block if ln.startswith("G1 X") and " E-" in ln]
+            self.assertEqual(len(wipes), 1, block)
+            self.assertLess(block.index(wipes[0]), block.index("EXCLUDE_OBJECT_END NAME=cube"))
+            w = wipes[0].split()
+            wx, wy = float(w[1][1:]), float(w[2][1:])
+            self.assertAlmostEqual(abs(wx - x), 2., 3)
+            self.assertAlmostEqual(wy, y, 3)
+            self.assertTrue(95.2 <= wx <= 104.8)
+            self.assertEqual(w[3], "E-2.0000")
+            self.assertIn("G1 E2.40 F2400", block)
+            self.assertNotIn("G1 E-2.00 F2700", block)
+        # Firmware retraction: G10 out of the object before the nozzle goes up, G11 (and the refill) once it's back;
+        # no E moves of its own.
+        out, _ = run(block_gcode(layers=3), "--edge-margin", "0", "--retract", "firmware", "--refill", "0.2")
+        block = ink_blocks(out)[0]
+        up = next(k for k, ln in enumerate(block) if ln.startswith("G1 Z"))
+        self.assertTrue(block.index("EXCLUDE_OBJECT_END NAME=cube") < block.index("G10") < up, block)
+        self.assertTrue(block.index("G4 P5000") < block.index("G11") < block.index("G1 E0.20 F2400")
+                        < block.index("RESTORE_GCODE_STATE NAME=polydye_ink"), block)
+        self.assertFalse([ln for ln in block if ln.startswith("G1") and " E-" in ln], block)
+        text = "".join(out)
+        self.assertIn(";PDJ version=3 ", text)
+        self.assertIn(" retract=firmware ", text)
+        # With a wipe: G10, then the wipe without E, both in the object's region.
+        out, _ = run(block_gcode(layers=3), "--edge-margin", "0", "--retract", "firmware", "--wipe", "2")
+        block = ink_blocks(out)[0]
+        end = block.index("EXCLUDE_OBJECT_END NAME=cube")
+        wipes = [k for k, ln in enumerate(block) if ln.startswith("G1 X") and k < end]
+        self.assertEqual(len(wipes), 1, block)
+        self.assertTrue(block.index("G10") < wipes[0] < end, block)
+        self.assertNotIn(" E", block[wipes[0]])
+        self.assertIn("G11", block)
+        self.assertFalse([ln for ln in block if ln.startswith("G1 E")], block)
+        self.assertIn(";PDJ version=2 ", "".join(run(block_gcode(layers=3), "--edge-margin", "0")[0]))
+
+    def test_a_straight_wall_needs_plastic_beyond_its_face_for_the_edge_margin(self):
+        # At depth 0.3 (inset 0, edge margin 0.5) the coloured side of a straight block (its -Y face) gets ink within
+        # 0.3 mm of the face with a brim; without one, none: no margin of 0.2 mm or more leaves any, and less would let
+        # a drop that far off reach the bed. The summary says so.
+        def face_dots(brim):
+            opts = post.options(["--depth", "0.3", "--inset", "0", "x.gcode"])
+            out, summary = post.process(block_gcode(layers=8, brim=brim, band=1.6), opts)
+            if out is None:
+                return [], summary
+            _, _, dots = job_dots(out)
+            return [d for d in dots if d[0]['layer'] >= 3 and d[4] < 95.35], summary
+        dots, summary = face_dots(True)
+        self.assertTrue(dots)
+        self.assertNotIn("WARNING", summary)
+        dots, summary = face_dots(False)
+        self.assertEqual(dots, [])
+        self.assertIn("WARNING: --edge-margin 0.5 mm left out", summary)
+        # The margin's box (10 rows by 7 columns: 0.60 by 0.59 mm) reaches 0.84 mm across a wall at 45 degrees, plus a
+        # cell's snapping.
+        self.assertIn("slice with a brim (or stand the model on a base) at least 0.9 mm wide", summary)
+        # Not what --inset leaves out: a brim wouldn't bring that back.
+        out, summary = run(block_gcode(layers=3), "--edge-margin", "0", "--inset", "1")
+        self.assertIsNotNone(out)
+        self.assertNotIn("WARNING", summary)
+        # Said too when the margin leaves no ink at all.
+        out, summary = run(block_gcode(layers=3), "--edge-margin", "5")
+        self.assertIsNone(out)
+        self.assertIn("no ink lands on plastic (--edge-margin 5 mm): the G-code is unchanged. WARNING: --edge-margin "
+                      "5 mm left out 100 % of the colour", summary)
 
 
 @unittest.skipIf(post.np is None, "needs numpy")
