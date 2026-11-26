@@ -17,9 +17,9 @@ post-processing script, this then rewrites the G-code:
 - each layer's ink moves gently (POLYDYE_INK_MOTION: --ink-accel 1000, --ink-scv 1), the print's limits put back
   after it;
 - after each layer's last extrusion, POLYDYE_JOB_PASS prints those passes --gap mm above it, so the next layer seals the
-  ink in, in --wall-coats and --top-coats coats (1); the part fan off meanwhile (--ink-fan 0), back at the G-code's
-  speed for the --dry pause; the trip retracts --retract mm (1.5), and can wipe (--wipe), push back more (--refill)
-  and cool the hotend (--standby-drop) for it;
+  ink in, in --wall-coats and --top-coats coats (1), the part fan as the G-code has it (or at --ink-fan, the G-code's
+  back for the --dry pause); the trip retracts --retract mm (1.5; firmware: G10 and G11), and can wipe (--wipe) and
+  push back more (--refill);
 - the head is hot and its nozzles primed when the ink comes: POLYDYE_PREWARM about --prewarm s (6) of moves before each
   ink layer's end warms it during the plastic, and POLYDYE_PRIME spits at the wipe sponge before the first ink pass and
   any pass using a colour that hasn't ejected for --prime-idle s (90), by the print time estimated here (Klipper's
@@ -60,7 +60,8 @@ except ImportError:  # reported by main(), so the module still imports for its t
 #   ; POLYDYE_JOB_BEGIN
 #   ;PDJ version=1 dpi=847 nozzle_dpi=300 pass_axis=y positions=16-83 passes=N layers=M prewarms=B primes=P
 #        ink_accel=A ink_z=Z prewarm_s=S ...   (the lowest acceleration in force at an ink block, 0 if the G-code
-#        sets none, the highest Z an ink block goes to, and each burst's SECONDS, so POLYDYE_JOB can check them)
+#        sets none, the highest Z an ink block goes to, and each burst's SECONDS, so POLYDYE_JOB can check them;
+#        retract=firmware, in version 3, when the ink blocks retract with G10 and G11)
 #   ;PDP n=0 layer=3 pass=0 coat=1 object=NAME dir=1 x=112.3456 y=95.12345 columns=812 colours=cm
 #   ;PDD <base64>   (one or more: the pass's data, zlib-compressed)
 #   ...
@@ -70,6 +71,7 @@ except ImportError:  # reported by main(), so the module still imports for its t
 # nozzle_dpi (positions go towards -X; POLYDYE_PASS's X names where position 50 lands), column i at Y = y + i * 25.4 /
 # dpi before colour registration. object is the EXCLUDE_OBJECT name the ink belongs to ("-": none).
 JOB_VERSION = 2  # 2: POLYDYE_INK_MOTION in the ink blocks (an older add-on refuses the job before the print starts)
+JOB_VERSION_FIRMWARE_RETRACT = 3  # G10 and G11 in the ink blocks: an older add-on can't check for [firmware_retraction]
 COLOR_BYTES = 14
 # The nozzle positions the stock firmware fires (its random pattern's, 14-85); the job draws on DEFAULT_POSITIONS,
 # leaving 2 positions each way for the colour registration across the pass.
@@ -112,13 +114,13 @@ CHANNEL_SHIFT = ((0, 0), (1, 0), (0, 1))  # (rows, positions) per colour
 # time from a layer's last extrusion to its first pass's first column (when no prime comes first), and a pass's run-ups.
 INK_MOVES_S, PRIME_TRIP_S, PREWARM_LEAD_S, RUN_UP_MM = 1., 3., 1., 3.
 PREWARM_MAX_S = 16.
-# The ink and surface defaults, to be set from a test tile. The dome v2 print (2026-11-25) points to lighter ink (on
-# white PLA magenta and yellow at 25 % read nearly as strong as at 100 %; the stock firmware fires about 25 %), more
-# cyan than the others (it read weak: black came out maroon, green teal-yellow, blue purple), and ink within
-# 0.25-0.3 mm of the surface, right up to it (an inset of 0.15-0.3 mm read faint, 0 strong).
-# - INK_LIMIT %: of each ink a fully coloured filament fires; CYAN_BOOST: cyan's is INK_LIMIT times this (at most
-#   100 %) unless set; DEPTH, INSET mm: --depth, --inset.
-INK_LIMIT, CYAN_BOOST, DEPTH, INSET = 100., 1., 0., 0.05
+# The ink and surface defaults. DEPTH (--depth, mm): on the test tile (2026-11-26) ink 0.3, 0.6 and 1.2 mm deep read
+# the same at 35 %. Still to be set from it: INK_LIMIT (% of each ink a fully coloured filament fires), CYAN_BOOST
+# (cyan's limit is INK_LIMIT times this, at most 100 %, unless set) and INSET (--inset, mm). The dome v2 print
+# (2026-11-25) points to lighter ink (on white PLA magenta and yellow at 25 % read nearly as strong as at 100 %; the
+# stock firmware fires about 25 %), more cyan than the others (it read weak: black came out maroon, green teal-yellow,
+# blue purple), and ink right up to the surface (an inset of 0.15-0.3 mm read faint, 0 strong).
+INK_LIMIT, CYAN_BOOST, DEPTH, INSET = 100., 1., 0.6, 0.05
 # --tone stock: the stock PolySlice's lightening of a colour before its dither, ink fraction against the colour's
 # (from its compositor's two lift/gamma/gain stages, read off the PolySlice.blend by the coordinator, 2026-11-25).
 TONE_STOCK = ((0., 0.), (.25, .04), (.5, .29), (.75, .60), (1., 1.))
@@ -141,7 +143,6 @@ class Layer:
         self.end = None  # (x, y, z) after it
         self.end_object = None  # the EXCLUDE_OBJECT name it was in, or None
         self.accel = None  # the acceleration the G-code set (if any) at its last extrusion: its ink block's
-        self.temp = None  # the hotend's target then (M104/M109), None if the G-code hasn't set one
         self.fan = 0.  # the part fan's speed then (M106 S, 0-255), as the ink block finds it
 
 
@@ -160,7 +161,7 @@ def parse(lines):
     objects = {}
     moves, dwells = [], []
     speed, accel, scv, flush = 25., None, None, True
-    temp, fan = None, 0.
+    fan = 0.
     for n, line in enumerate(lines):
         if line.startswith(';'):
             s = line.rstrip()
@@ -229,7 +230,7 @@ def parse(lines):
                 cur.segs.append((tool, kind, index, x, y, nx, ny, width))
                 cur.seg_heights.append(height)
                 cur.last_line, cur.end, cur.end_object, cur.accel = n, (nx, ny, nz), obj, accel
-                cur.temp, cur.fan = temp, fan
+                cur.fan = fan
             if de or nx != x or ny != y or nz != z:
                 moves.append((n, nx - x, ny - y, nz - z, de, speed, accel, scv, flush))
                 flush = False
@@ -241,23 +242,8 @@ def parse(lines):
             except ValueError:
                 pass
             flush = True
-        elif cmd in ('M104', 'M109'):
-            p = dict((w[0].upper(), w[1:]) for w in words[1:] if w)
-            try:
-                if 'S' in p and p.get('T', '0') == '0':
-                    temp = float(p['S']) or None
-            except ValueError:
-                pass
-            flush = flush or cmd == 'M109'
-        elif cmd in ('M400', 'M190', 'TEMPERATURE_WAIT', 'BED_MESH_CALIBRATE', 'G28', 'G29'):
+        elif cmd in ('M400', 'M109', 'M190', 'TEMPERATURE_WAIT', 'BED_MESH_CALIBRATE', 'G28', 'G29'):
             flush = True
-        elif cmd == 'SET_HEATER_TEMPERATURE':
-            p = dict(w.upper().split('=', 1) for w in words[1:] if '=' in w)
-            if p.get('HEATER') == 'EXTRUDER':
-                try:
-                    temp = float(p.get('TARGET', 0)) or None
-                except ValueError:
-                    pass
         elif cmd == 'M106':  # Klipper's part fan, whatever P says
             p = dict((w[0].upper(), w[1:]) for w in words[1:] if w)
             try:
@@ -881,23 +867,25 @@ def ink_fan(opts):
     return None if opts.ink_fan is None else int(round(opts.ink_fan * 2.55))
 
 
-def ink_block(layer, passes, opts, inside, primes=(), trip_s=0.):
-    """G-code that inks `passes` after `layer`'s last extrusion and comes back: out of the object it's in (`inside`),
-    retracted (wiping back along its last line, with --wipe), up by --gap, the part fan at --ink-fan, the passes with
-    live ink (a prime at the sponge before each pass whose index is in `primes`), the fan back as it was, a pause for
-    the ink to dry, back and down, refilled (--retract plus --refill). With --standby-drop, for a trip expected to take
-    `trip_s` >= --standby-after s, the hotend waits that much cooler (less ooze) and is back at temperature before it
-    returns."""
+def ink_block(layer, passes, opts, inside, primes=()):
+    """G-code that inks `passes` after `layer`'s last extrusion and comes back: retracted (--retract mm, or G10 with
+    --retract firmware; wiping back along its last line, with --wipe), out of the object it's in (`inside`), up by
+    --gap, the part fan at --ink-fan if set, the passes with live ink (a prime at the sponge before each pass whose
+    index is in `primes`), the fan back as the G-code had it, a pause for the ink to dry, back and down, the filament
+    pushed back (the retraction, or G11, plus --refill)."""
     x, y, z = layer.end
     g = ["; PolyDye ink: layer %d (Z %.3f), %d pass%s" % (layer.index, z, len(passes), "" if len(passes) == 1 else
-                                                         "es")]
-    if inside:
-        g.append("EXCLUDE_OBJECT_END NAME=%s" % (inside,))
-    g += ["SAVE_GCODE_STATE NAME=polydye_ink", "G90", "M83"]
+                                                         "es"),
+         "SAVE_GCODE_STATE NAME=polydye_ink", "G90", "M83"]
     fan, was = ink_fan(opts), layer.fan or 0.  # was: exactly as the G-code set it
     if fan is not None and fan != was:
-        g.append("M106 S%d ; part fan for the ink (off: its air blew the drops off course)" % (fan,))
+        g.append("M106 S%d ; part fan for the ink (--ink-fan)" % (fan,))
     wipe = wipe_path(layer, opts.wipe) if opts.wipe else []
+    # The wipe goes before EXCLUDE_OBJECT_END, in the object's region with its lines: if the object was cancelled,
+    # Klipper skips it with them (the nozzle isn't at the layer's end then: the wipe's first move would cross the plate
+    # at the layer's height) and makes up for its retraction when the filament is pushed back.
+    if wipe and opts.firmware_retract:
+        g.append("G10")
     if wipe:
         total = sum(d for _, d in wipe)
         # The retraction spread over the wipe at about the speed of a plain one (45 mm/s of filament).
@@ -905,12 +893,12 @@ def ink_block(layer, passes, opts, inside, primes=(), trip_s=0.):
         for (wx, wy), d in wipe:
             g.append("G1 X%.3f Y%.3f%s F%d" % (wx, wy, " E-%.4f" % (opts.retract * d / total,) if opts.retract
                                                else "", f * 60))
-    elif opts.retract:
+    if inside:
+        g.append("EXCLUDE_OBJECT_END NAME=%s" % (inside,))
+    if not wipe and opts.firmware_retract:
+        g.append("G10")
+    elif not wipe and opts.retract:
         g.append("G1 E-%.2f F2700" % (opts.retract,))
-    standby = bool(opts.standby_drop and layer.temp and trip_s >= opts.standby_after)
-    if standby:
-        g.append("M104 S%g ; standby while the ink prints (about %.0f s)" % (max(0., layer.temp - opts.standby_drop),
-                                                                            trip_s))
     g.append("G1 Z%.3f F600" % (z + opts.gap,))
     if opts.ink_accel:
         g.append("POLYDYE_INK_MOTION ACCEL=%g SCV=%g" % (opts.ink_accel, opts.ink_scv))
@@ -923,16 +911,14 @@ def ink_block(layer, passes, opts, inside, primes=(), trip_s=0.):
             p.n, p.layer, p.number, p.coat, p.colours, p.x, p.y, p.dir))
     g += ["M400", "POLYDYE_ENABLE LIVE=0"]
     if fan is not None and fan != was:
-        g.append("M106 S%g" % (was,) if was else "M107")  # back on for the drying and the print
+        g.append("M106 S%g" % (was,) if was else "M107")  # back for the drying and the print
     if opts.ink_accel:
         g.append("POLYDYE_INK_MOTION RESTORE=1")
-    if standby:
-        g.append("M104 S%g" % (layer.temp,))  # heating while the ink dries
     if opts.dry > 0:
         g.append("G4 P%d" % (int(round(opts.dry * 1000)),))
-    if standby:
-        g.append("M109 S%g" % (layer.temp,))
     g += ["G1 X%.3f Y%.3f F%d" % (x, y, opts.travel * 60), "G1 Z%.3f F600" % (z,)]
+    if opts.firmware_retract:
+        g.append("G11")
     if opts.retract or opts.refill:
         g.append("G1 E%.2f F2400" % (opts.retract + opts.refill,))
     g.append("RESTORE_GCODE_STATE NAME=polydye_ink")
@@ -948,9 +934,11 @@ def job_block(passes, opts, layers, prewarms=0, primes=0, ink_accel=0., ink_z=0.
     against the axes."""
     out = ["; POLYDYE_JOB_BEGIN",
            ";PDJ version=%d dpi=%g nozzle_dpi=%g pass_axis=y positions=%d-%d passes=%d layers=%d prewarms=%d primes=%d "
-           "ink_accel=%g ink_z=%.3f prewarm_s=%g generator=%s" % (
-               JOB_VERSION, opts.dpi, opts.nozzle_dpi, opts.positions[0], opts.positions[1], len(passes), layers,
-               prewarms, primes, ink_accel, ink_z, prewarm_s, os.path.basename(__file__))]
+           "ink_accel=%g ink_z=%.3f prewarm_s=%g%s generator=%s" % (
+               JOB_VERSION_FIRMWARE_RETRACT if opts.firmware_retract else JOB_VERSION, opts.dpi,
+               opts.nozzle_dpi, opts.positions[0], opts.positions[1], len(passes), layers,
+               prewarms, primes, ink_accel, ink_z, prewarm_s, " retract=firmware" if opts.firmware_retract else "",
+               os.path.basename(__file__))]
     for p in passes:
         out.append(";PDP n=%d layer=%d pass=%d coat=%d object=%s dir=%d x=%.4f y=%.5f columns=%d colours=%s" % (
             p.n, p.layer, p.number, p.coat, p.obj or '-', p.dir, p.x, p.y, p.columns, p.colours))
@@ -1021,11 +1009,8 @@ def process(lines, opts):
         summary += ". " + warning
     insert = {}
     for layer, ps in plan:
-        # The trip's expected time, for --standby-after: its moves, passes, primes and the drying pause.
-        trip = (INK_MOVES_S + sum(pass_seconds(p, opts) for p in ps) + PRIME_TRIP_S * len(primes.get(layer.index, ()))
-                + opts.dry)
         insert.setdefault(layer.last_line, []).extend(ink_block(layer, ps, opts, layer.end_object,
-                                                                primes.get(layer.index, ()), trip))
+                                                                primes.get(layer.index, ())))
     insert[plan[-1][0].last_line].append("POLYDYE_JOB_END")
     drop = set(tool_lines)
     out = []
@@ -1071,6 +1056,7 @@ def warm_and_prime(lines, layers, plan, config, timing, opts):
     vmax = opts.max_velocity or first_value(config.get('machine_max_speed_x'), 0.) or 500.
     durations = line_times(len(lines), timing, accel, opts.scv, vmax)
     at = np.concatenate([[0.], np.cumsum(durations)])  # at[n]: when line n starts
+    pitch = 25.4 / opts.dpi
     last_eject, ink_time = {}, 0.  # colour: when it last ejected; the ink so far (not in the lines)
     bound = layers[0].start_line
     for k, (layer, passes) in enumerate(plan):
@@ -1085,7 +1071,9 @@ def warm_and_prime(lines, layers, plan, config, timing, opts):
                 primes.setdefault(layer.index, []).append(j)
                 now += PRIME_TRIP_S
                 last_eject = dict.fromkeys(CHANNELS, now)
-            now += pass_seconds(p, opts)
+            # Two inks or more may go as two board passes, one per fire line (the add-on decides).
+            sweeps = 2 if len(p.colours) > 1 else 1
+            now += sweeps * ((p.columns * pitch + 2 * RUN_UP_MM) / opts.pass_speed + 60. / opts.travel)
             last_eject.update(dict.fromkeys(p.colours, now))
         prime = 0 in primes.get(layer.index, ())
         if opts.prewarm > 0:
@@ -1098,13 +1086,6 @@ def warm_and_prime(lines, layers, plan, config, timing, opts):
         # The ink dries after its last pass, then the moves back.
         ink_time = now + opts.dry + INK_MOVES_S / 2. - at[e + 1]
     return before, primes
-
-
-def pass_seconds(p, opts):
-    """About how long a pass takes, its run-ups and the travel to it included. Two inks or more may go as two board
-    passes, one per fire line (the add-on decides): counted as two."""
-    sweeps = 2 if len(p.colours) > 1 else 1
-    return sweeps * ((p.columns * 25.4 / opts.dpi + 2 * RUN_UP_MM) / opts.pass_speed + 60. / opts.travel)
 
 
 def first_value(text, default):
@@ -1137,6 +1118,19 @@ def ink_limits(text):
     return values
 
 
+def retract_length(text):
+    """--retract: mm, or firmware (G10 and G11)."""
+    if text.strip().lower() == 'firmware':
+        return 'firmware'
+    try:
+        v = float(text)
+    except ValueError:
+        v = -1.
+    if not v >= 0.:
+        raise argparse.ArgumentTypeError("--retract is mm (0 or more), or firmware")
+    return v
+
+
 def fan_percent(text):
     if text.strip().lower() == 'keep':
         return None
@@ -1166,23 +1160,21 @@ def options(argv=None):
     ap.add_argument("--tone", choices=('linear', 'stock'), default='linear', help="stock: a colour's ink through the "
                     "stock PolySlice's lightening curve before its dither (75 %% -> 60, 50 -> 29, 25 -> 4) (default "
                     "linear)")
-    ap.add_argument("--ink-fan", type=fan_percent, default=0., help="part fan %% while the ink prints, the G-code's "
-                    "own back before the drying pause; keep: leave it (default 0: its air blew the drops off "
-                    "course)")
+    ap.add_argument("--ink-fan", type=fan_percent, default=None, help="part fan %% while the ink prints, the "
+                    "G-code's own back before the drying pause; keep: as the G-code has it (default keep: with the "
+                    "fan off the nozzle oozed more during the ink)")
     ap.add_argument("--wall-coats", type=int, default=1, help="coats on the model's sides and inside (default 1)")
     ap.add_argument("--top-coats", type=int, default=1, help="coats on top surfaces (default 1)")
     ap.add_argument("--gap", type=float, default=1., help="mm above the layer the nozzle goes for the ink (default 1)")
-    ap.add_argument("--dry", type=float, default=5., help="seconds the ink dries before the next layer (default 5)")
-    ap.add_argument("--retract", type=float, default=1.5, help="mm of filament retracted while inking (default 1.5)")
+    ap.add_argument("--dry", type=float, default=2., help="seconds the ink dries before the next layer, the nozzle "
+                    "waiting above it (default 2)")
+    ap.add_argument("--retract", type=retract_length, default=1.5, help="mm of filament retracted while inking; "
+                    "firmware: G10 and G11, with [firmware_retraction]'s lengths (SET_RETRACTION tunes them during "
+                    "the print) (default 1.5)")
     ap.add_argument("--wipe", type=float, default=0., help="mm the nozzle moves back along the layer's last line while "
                     "it retracts, leaving the ooze on the line (default 0: none)")
     ap.add_argument("--refill", type=float, default=0., help="mm of filament pushed back after the ink beyond the "
                     "retraction, for what oozed out meanwhile (default 0)")
-    ap.add_argument("--standby-drop", type=float, default=0., help="degrees C the hotend cools by during an ink trip "
-                    "of --standby-after s or more, back to temperature (waited for) before it returns (default 0: "
-                    "off)")
-    ap.add_argument("--standby-after", type=float, default=20., help="seconds an ink trip must take for "
-                    "--standby-drop (default 20)")
     ap.add_argument("--travel", type=float, default=150., help="mm/s back to the layer after the ink (default 150)")
     ap.add_argument("--edge-margin", type=float, default=0.5, help="mm a drop may land off and still be on plastic "
                     "printed so far; ink nearer the edge than that is left out, so none reaches the bed: slice with a "
@@ -1219,10 +1211,9 @@ def options(argv=None):
     ap.add_argument("--max-velocity", type=float, default=0., help="Klipper's max_velocity, mm/s, for the timing "
                     "(default: the profile's maximum X speed)")
     opts = ap.parse_args(argv)
-    for name, lo in (('dpi', 1.), ('nozzle_dpi', 1.), ('gap', 0.), ('dry', 0.), ('retract', 0.),
+    for name, lo in (('dpi', 1.), ('nozzle_dpi', 1.), ('gap', 0.), ('dry', 0.),
                      ('travel', 1.), ('edge_margin', 0.), ('inset', 0.), ('depth', 0.), ('prewarm', 0.),
-                     ('prime_idle', 0.), ('wipe', 0.), ('refill', 0.), ('standby_drop', 0.), ('standby_after', 0.),
-                     ('cyan_boost', 0.),
+                     ('prime_idle', 0.), ('wipe', 0.), ('refill', 0.), ('cyan_boost', 0.),
                      ('pass_speed', 1.), ('accel', 0.), ('scv', 0.), ('max_velocity', 0.), ('ink_accel', 0.),
                      ('ink_scv', 0.)):
         if getattr(opts, name) < lo:
@@ -1238,6 +1229,9 @@ def options(argv=None):
                  % (PREWARM_MAX_S,))
     if opts.wall_coats < 0 or opts.top_coats < 0:
         ap.error("coats can't be negative")
+    opts.firmware_retract = opts.retract == 'firmware'
+    if opts.firmware_retract:
+        opts.retract = 0.  # the G-code's own E moves take none back
     # Per ink: --ink-limit-c/m/y, else C,M,Y, else the one --ink-limit (cyan's times --cyan-boost, at most 100).
     one = len(opts.ink_limit) == 1
     base = opts.ink_limit * 3 if one else opts.ink_limit
