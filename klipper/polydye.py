@@ -792,7 +792,18 @@ OFFSET_MARGIN = 6.5
 OFFSET_PLAQUE = (3.3 + OFFSET_MARGIN, 9.9 + OFFSET_MARGIN, 14.1 + OFFSET_MARGIN, 10.5 + OFFSET_MARGIN)
 OFFSET_SLOT_END = (7.35, 9.3)
 OFFSET_Y_SCALE_X = 6.5
+# Where the labels go, read from the front (-Y, +X to the right), all within the ink's span above (2026-11-25: Brett
+# read the first print from a photo turned 180 degrees, and only the plaque's margins told which scale was which):
+# "+X>" after the X scale's numbers, "+Y" under an up arrow OFFSET_Y_LABEL mm above the Y scale's centre, and FRONT
+# with its top OFFSET_FRONT mm below it, under the Y scale.
+OFFSET_Y_LABEL, OFFSET_FRONT = 3.2, -3.5
 PLAQUE_RETRACT, PLAQUE_TRAVEL_F = 0.8, 9000
+# The plaque's top layer goes at PLAQUE_TOP_F (25 mm/s, its fill and perimeters), then is ironed where the ink goes:
+# the nozzle runs over it lines PLAQUE_IRON_SPACING mm apart at PLAQUE_IRON_F, putting down PLAQUE_IRON_FLOW of the
+# plastic a layer of that spacing takes (Orca's ironing, a little slower). The first plaque's top was ridged along every
+# fill line (2026-11-25), which made the groove's edges hard to read.
+PLAQUE_TOP_F = 1500
+PLAQUE_IRON_SPACING, PLAQUE_IRON_FLOW, PLAQUE_IRON_F = 0.15, 0.10, 1080
 # POLYDYE_TEST_PAGE: on paper, whether the head prints the way a colour print needs it to. Drawn here like the
 # calibration prints (test_page_drawings()) and printed as a colour print's passes are: the heater cap, split by fire
 # line where two inks need it (drawing_parts()), positions TEST_POSITIONS (polydye_post.py's default) and the ink
@@ -824,6 +835,14 @@ FONT = {
     'D': ("11100", "10010", "10001", "10001", "10001", "10010", "11100"),
     'X': ("10001", "10001", "01010", "00100", "01010", "10001", "10001"),
     'Y': ("10001", "10001", "01010", "00100", "00100", "00100", "00100"),
+    'F': ("11111", "10000", "10000", "11110", "10000", "10000", "10000"),
+    'N': ("10001", "11001", "10101", "10011", "10001", "10001", "10001"),
+    'O': ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
+    'R': ("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
+    'T': ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
+    '+': ("00000", "00100", "00100", "11111", "00100", "00100", "00000"),
+    '>': ("00000", "00100", "00010", "11111", "00010", "00100", "00000"),  # an arrow along the text
+    '^': ("00100", "01110", "10101", "00100", "00100", "00100", "00100"),  # an arrow towards the text's top
 }
 
 
@@ -986,11 +1005,12 @@ def offset_y_tick(columns_per_mm):
 def offset_drawings(columns_per_mm):
     """POLYDYE_OFFSET_PRINT's two passes (pass_axis y, DIR=1), the X scale then the Y scale, as drawings whose column 0
     is the groove's centre line along Y; `columns_per_mm` is dpi / 25.4. Each starts with a priming block on the plaque
-    below the groove's centre."""
+    below the groove's centre. The Y scale's pass also prints the labels (OFFSET_Y_LABEL)."""
     mm = lambda v: int(round(v * columns_per_mm))
     # A nozzle firing one column on its own doesn't eject (the P-box walls, 2026-11-25): the numbers' font pixels are
     # at least 2 columns long, like everything else drawn.
     row = max(2, int(round(OFFSET_TEXT_ROW_MM * columns_per_mm)))
+    numbers = mm(OFFSET_SLOT_END[1] + 0.3) + 7 * row - 1  # the X scale's numbers' top row, past the groove's end
     x = PassDrawing()
     x.prime(mm(-11.))
     t0 = mm(3.)
@@ -1000,7 +1020,7 @@ def offset_drawings(columns_per_mm):
         if k % 8 == 0:
             # Above the ticks, past the groove's end, reading along +X like the Y scale's.
             s = "%d" % (k,)
-            x.text(s, MAGENTA, mm(OFFSET_SLOT_END[1] + 0.3) + 7 * row - 1, p + text_size(s)[0], row, 2, rotated=True)
+            x.text(s, MAGENTA, numbers, p + text_size(s)[0], row, 2, rotated=True)
     y = PassDrawing()
     y.prime(mm(-14.))
     for k in range(-OFFSET_Y_TICKS, OFFSET_Y_TICKS + 1):
@@ -1010,6 +1030,15 @@ def offset_drawings(columns_per_mm):
         if k % 8 == 0:
             s = "%d" % (k,)
             y.text(s, MAGENTA, i + 7 * row // 2, 35, row, 2, rotated=True)
+    # The labels, all reading along +X with their tops towards +Y: "+X" and an arrow in line with the X scale's
+    # numbers, to their right; "+Y" over the Y scale's numbers (left-aligned with them) under an up arrow; FRONT under
+    # the Y scale. Their positions stay within the stock's 14-85, like the rest.
+    left = JOB_NOZZLES[1]
+    y.text("+X>", MAGENTA, numbers, left, row, 2, rotated=True)
+    label = mm(OFFSET_Y_LABEL) + 7 * row - 1
+    y.text("+Y", MAGENTA, label, 35, row, 2, rotated=True)
+    y.text("^", MAGENTA, label + 9 * row, 35 - 2 * 6, row, 2, rotated=True)  # over the Y, two rows up
+    y.text("FRONT", MAGENTA, mm(OFFSET_FRONT), left, row, 2, rotated=True)
     return x, y
 
 
@@ -1043,12 +1072,23 @@ def plaque_rects(x, y, slot=OFFSET_SLOT, size=OFFSET_PLAQUE, end=OFFSET_SLOT_END
             [(x + end[0], y - size[2], x + size[1], y + end[1]), (x - size[0], y + end[1], x + size[1], y + size[3])])
 
 
-def plaque_gcode(layers, height, width, filament_area, first_width=None):
+def bead_spacing(width, height):
+    """How far apart lines `width` wide and `height` high go so they touch without piling up: a slicer's bead, flat on
+    top and bottom with round sides, is (width - height) height + pi height^2 / 4 in section, which is this spacing
+    times the height."""
+    return width - height * (1. - math.pi / 4.)
+
+
+def plaque_gcode(layers, height, width, filament_area, first_width=None, flow=1., iron=()):
     """G-code (absolute XYZ, relative E) for a PLA plaque: `layers` lists each layer's rectangles ((x0, y0, x1, y1) in
     G-code coordinates), layers `height` mm. In each layer and rectangle a perimeter, then a zigzag fill, along Y in
-    even layers and along X in odd ones, slightly overlapping the perimeter. The first layer is `first_width` wide
-    (default `width`) and slower; the part fan comes on from the second layer. Starts with a prime line 3 mm left of
-    the plaque at the first layer's height; ends retracted with the fan off."""
+    even layers and along X in odd ones, laid like a slicer's (bead_spacing()): the fill's lines a bead spacing apart
+    and as far from the perimeter, each line's plastic its spacing times the height, so the layer comes out level (the
+    first plaques' rectangular beads 0.95 of a width apart put down 5-10 % too much, which piled up into ridges along
+    every fill line). Every extrusion times `flow`. The first layer is `first_width` wide (default `width`) and slower;
+    the top layer goes at PLAQUE_TOP_F; the part fan comes on from the second layer. Then `iron`'s rectangles (within
+    the top layer's) are ironed, across the top layer's fill, `width` inside their edges. Starts with a prime line 3 mm
+    left of the plaque at the first layer's height; ends retracted with the fan off."""
     first_width = first_width or width
     out = []
     pos = [None, None]
@@ -1059,10 +1099,30 @@ def plaque_gcode(layers, height, width, filament_area, first_width=None):
                     "G1 E%.2f F2700" % (PLAQUE_RETRACT,)])
         pos[:] = [x, y]
 
-    def line(x, y, w, h, f):
+    def line(x, y, area, f):
+        """To x, y putting down `area` mm2 of plastic per mm (times `flow`)."""
         d = math.hypot(x - pos[0], y - pos[1])
-        out.append("G1 X%.3f Y%.3f E%.5f F%d" % (x, y, d * w * h / filament_area, f))
+        out.append("G1 X%.3f Y%.3f E%.5f F%d" % (x, y, d * area * flow / filament_area, f))
         pos[:] = [x, y]
+
+    def zigzag(x0, y0, x1, y1, along_y, inset, spacing, area, f):
+        """Lines along Y (`along_y`) or X across x0..x1 by y0..y1, `inset` from its ends, at most `spacing` apart and
+        evenly spread so the first and last are `spacing` from its sides; each puts down `area` per mm per mm of the
+        spacing it got."""
+        a0, a1, b0, b1 = (x0, x1, y0, y1) if along_y else (y0, y1, x0, x1)
+        n = int(math.ceil((a1 - a0) / spacing - 1e-9)) - 1  # lines; n + 1 gaps, none wider than `spacing`
+        if n < 1 or b1 - b0 < 2 * inset:
+            return
+        step = (a1 - a0) / (n + 1.)
+        for m in range(n):
+            a = a0 + step * (m + 1)
+            ba, bb = (b0 + inset, b1 - inset) if m % 2 == 0 else (b1 - inset, b0 + inset)
+            xy = (lambda b: (a, b)) if along_y else (lambda b: (b, a))
+            if m == 0:
+                travel(*xy(ba), z=z)
+            else:
+                line(*xy(ba), area=area * step, f=f)
+            line(*xy(bb), area=area * step, f=f)
 
     every = [r for rects in layers for r in rects]
     x_lo = min(r[0] for r in every)
@@ -1070,40 +1130,27 @@ def plaque_gcode(layers, height, width, filament_area, first_width=None):
     out.extend(["G1 Z%.3f F600" % (height + 0.4,), "G1 X%.3f Y%.3f F%d" % (x_lo - 3., y_lo, PLAQUE_TRAVEL_F),
                 "G1 Z%.3f F600" % (height,), "G1 E3 F300"])
     pos[:] = [x_lo - 3., y_lo]
-    line(x_lo - 3., y_hi, 0.6, height, 1200)
+    line(x_lo - 3., y_hi, 0.6 * height, 1200)
+    z = height
     for n, rects in enumerate(layers):
         z = height * (n + 1)
         w = first_width if n == 0 else width
-        f_per, f_fill = (1200, 1500) if n == 0 else (2400, 3000)
+        s = bead_spacing(w, height)
+        f_per, f_fill = ((1200, 1500) if n == 0 else (PLAQUE_TOP_F, PLAQUE_TOP_F) if n == len(layers) - 1
+                         else (2400, 3000))
         if n == 1:
             out.append("M106 S255")
         for x0, y0, x1, y1 in rects:
             i = w / 2.
             travel(x0 + i, y0 + i, z)
             for x, y in ((x1 - i, y0 + i), (x1 - i, y1 - i), (x0 + i, y1 - i), (x0 + i, y0 + i)):
-                line(x, y, w, height, f_per)
-            i = 1.5 * w - 0.1
-            step = 0.95 * w
-            if n % 2 == 0:
-                if x1 - x0 < 2 * i:
-                    continue
-                xs = [x0 + i + m * step for m in range(int((x1 - x0 - 2 * i) / step) + 1)]
-                travel(xs[0], y0 + i, z)
-                for m, x in enumerate(xs):
-                    ya, yb = (y0 + i, y1 - i) if m % 2 == 0 else (y1 - i, y0 + i)
-                    if m:
-                        line(x, ya, w, height, f_fill)
-                    line(x, yb, w, height, f_fill)
-            else:
-                if y1 - y0 < 2 * i:
-                    continue
-                ys = [y0 + i + m * step for m in range(int((y1 - y0 - 2 * i) / step) + 1)]
-                travel(x0 + i, ys[0], z)
-                for m, y in enumerate(ys):
-                    xa, xb = (x0 + i, x1 - i) if m % 2 == 0 else (x1 - i, x0 + i)
-                    if m:
-                        line(xa, y, w, height, f_fill)
-                    line(xb, y, w, height, f_fill)
+                line(x, y, s * height, f_per)
+            # Between the perimeter's centre lines; the fill's ends a bead spacing from them too.
+            zigzag(x0 + i, y0 + i, x1 - i, y1 - i, n % 2 == 0, s, s, height, f_fill)
+    top_along_y = (len(layers) - 1) % 2 == 0
+    for x0, y0, x1, y1 in iron:
+        zigzag(x0 + width, y0 + width, x1 - width, y1 - width, not top_along_y, 0., PLAQUE_IRON_SPACING,
+               PLAQUE_IRON_FLOW * height / flow, PLAQUE_IRON_F)
     out.extend(["G1 E-2 F2700", "M106 S0"])
     return out
 
@@ -3401,9 +3448,10 @@ class PolyDye:
             "the head coolest." % (cartridge_text(self._fresh_status()), "; ".join(names)))
 
     cmd_POLYDYE_OFFSET_PRINT_help = ("PLA and LIVE INK: a PLA plaque with a cross-shaped groove centred on X, Y "
-                                     "(LAYERS of LAYER_HEIGHT, the groove in the top 3; heats to EXTRUDER_TEMP and "
-                                     "BED_TEMP if given, else needs the hotend's target set; the hotend is off "
-                                     "afterwards), then ink scales across the groove from GAP mm above the plaque; "
+                                     "(LAYERS of LAYER_HEIGHT, the groove in the top 3, extrusion times FLOW, its top "
+                                     "ironed unless IRON=0; heats to EXTRUDER_TEMP and BED_TEMP if given, else needs "
+                                     "the hotend's target set; the hotend is off afterwards), then labelled ink scales "
+                                     "across the groove from GAP mm above the plaque; "
                                      "enter the tick in the groove on each scale with POLYDYE_OFFSET X_TICK= Y_TICK=. "
                                      "PLAQUE=0: only the ink, onto a plaque printed before (at its top plus GAP, or Z)")
 
@@ -3420,6 +3468,10 @@ class PolyDye:
             raise gcmd.error("%s: Z goes with PLAQUE=0; with the plaque, GAP sets the height above it" % (cmd,))
         # PLAQUE=0 inks a plaque printed before (or paper, with Z): by default its top plus GAP, like with the plaque.
         z = gcmd.get_float('Z', layers * height + gap, minval=0.2)
+        flow = gcmd.get_float('FLOW', 1., minval=0.5, maxval=1.5)
+        iron = gcmd.get_int('IRON', 1, minval=0, maxval=1)
+        if not plaque and (gcmd.get('FLOW', None) is not None or gcmd.get('IRON', None) is not None):
+            raise gcmd.error("%s: FLOW and IRON go with the plaque (PLAQUE=1)" % (cmd,))
         # Every drop on the plaque, OFFSET_MARGIN mm inside its edges, at this dpi and nozzle_dpi.
         ink = offset_ink_extent(self.dpi, self.nozzle_dpi)
         size = OFFSET_PLAQUE
@@ -3438,7 +3490,8 @@ class PolyDye:
         y = gcmd.get_float('Y', self._ink_centre(1) + (OFFSET_PLAQUE[2] - OFFSET_PLAQUE[3]) / 2.)
         setup = None
         if plaque:
-            setup = self._plaque_setup(gcmd, cmd, x, y, layers, height, e_temp, b_temp, z)
+            setup = self._plaque_setup(gcmd, cmd, x, y, layers, height, e_temp, b_temp, z, flow,
+                                       ink if iron else None)
         st = self._cal_start(gcmd, cmd, 'xyz')
         pitch = 25.4 / self.dpi
         built = [pass_data(d, 1, self.registration, self._skew()) for d in offset_drawings(self.dpi / 25.4)]
@@ -3456,11 +3509,12 @@ class PolyDye:
             "Then\n  POLYDYE_OFFSET X_TICK=<X scale> Y_TICK=<Y scale>\nmoves the ink there and stores offset_x and "
             "offset_y; print again to check that both read 0." % (self._x_tick_mm(), self._y_tick_mm()))
 
-    def _plaque_setup(self, gcmd, cmd, x, y, layers, height, e_temp, b_temp, z):
+    def _plaque_setup(self, gcmd, cmd, x, y, layers, height, e_temp, b_temp, z, flow=1., ink=None):
         """The G-code for POLYDYE_OFFSET_PRINT's plaque around the groove centred on x, y: heating (to e_temp and
         b_temp if given, else to the hotend's current target, which must be enough to extrude), the plaque
-        (plaque_gcode(): solid layers, then OFFSET_GROOVE_LAYERS with the groove) and then up to `z` with the hotend
-        off, so it doesn't ooze onto the plaque while the ink goes on."""
+        (plaque_gcode(): solid layers, then OFFSET_GROOVE_LAYERS with the groove; extrusion times `flow`), its top
+        ironed within 1 mm of where the ink goes (`ink`: offset_ink_extent() around the centre; None: not ironed) and
+        then up to `z` with the hotend off, so it doesn't ooze onto the plaque while the ink goes on."""
         eventtime = self.printer.get_reactor().monotonic()
         extruder = self.printer.lookup_object('extruder', None)
         settings = self.printer.lookup_object('configfile').get_status(eventtime)['settings'].get('extruder')
@@ -3492,7 +3546,12 @@ class PolyDye:
         # The plaque's extrusion and speeds assume 100 %: an earlier M221/M220 would thin it out or leave no plaque
         # under the ink. RESTORE_GCODE_STATE puts the factors back afterwards.
         lines += ["M109 S%.0f" % (temp,), "G90", "M83", "M220 S100", "M221 S100"]
-        lines += plaque_gcode(plaque, height, nozzle * 1.125, filament_area, nozzle * 1.25)
+        iron = []
+        if ink is not None:
+            wx0, wy0, wx1, wy1 = x + ink[0] - 1., y + ink[1] - 1., x + ink[2] + 1., y + ink[3] + 1.
+            iron = [(max(x0, wx0), max(y0, wy0), min(x1, wx1), min(y1, wy1)) for x0, y0, x1, y1 in plaque[-1]
+                    if max(x0, wx0) < min(x1, wx1) and max(y0, wy0) < min(y1, wy1)]
+        lines += plaque_gcode(plaque, height, nozzle * 1.125, filament_area, nozzle * 1.25, flow, iron)
         lines += ["G1 Z%.3f F600" % (z,), "M104 S0"]
         return "\n".join(lines)
 

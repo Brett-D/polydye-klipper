@@ -2217,13 +2217,86 @@ class CalibrationDrawing(unittest.TestCase):
         for l in moves[1:]:
             x, y = float(l.split()[1][1:]), float(l.split()[2][1:])
             self.assertTrue(10. <= x <= 15. and 20. <= y <= 30., l)
-        # The first perimeter edge: 4.5 mm at 0.5 x 0.2 mm of a 2.405 mm2 filament.
+        # The first perimeter edge: 4.5 mm of a 0.5 mm wide, 0.2 mm high bead, (0.5 - 0.2) 0.2 + pi 0.2^2 / 4 mm2 in
+        # section, of a 2.405 mm2 filament.
         first_edge = moves[1].split()
-        self.assertAlmostEqual(float(first_edge[3][1:]), 4.5 * 0.5 * 0.2 / 2.405, 4)
+        self.assertAlmostEqual(float(first_edge[3][1:]), 4.5 * (0.3 * 0.2 + math.pi * 0.04 / 4) / 2.405, 4)
+        self.assertAlmostEqual(polydye.bead_spacing(0.5, 0.2) * 0.2, 0.3 * 0.2 + math.pi * 0.04 / 4, 12)
         fan = lines.index("M106 S255")  # from the second layer (Z 0.4) on
         self.assertFalse(any("Z0.400" in l for l in lines[:fan]))
         self.assertIn("G1 Z0.400 F600", lines[fan:])
         self.assertEqual(lines[-2:], ["G1 E-2 F2700", "M106 S0"])
+
+    @staticmethod
+    def layer_moves(lines, z):
+        """The extruding moves at height z: [(x, y, e, f)]."""
+        out, at = [], None
+        for l in lines:
+            w = l.split()
+            if w[0] == "G1" and w[1].startswith("Z") and len(w) == 3:
+                at = float(w[1][1:])
+            elif w[0] == "G1" and w[1].startswith("X") and " E" in l and at is not None and abs(at - z) < 1e-6:
+                out.append((float(w[1][1:]), float(w[2][1:]), float(w[3][1:]), int(w[4][1:])))
+        return out
+
+    def test_a_plaque_layer_puts_down_what_it_holds(self):
+        # A 20 x 30 mm rectangle at 0.2 mm: 120 mm3 of space. Laid as a slicer lays beads it gets that within 2 %
+        # (just short: the perimeter's rounded outer edge); the rectangular beads 0.95 of a width apart the first
+        # plaques had put down 5.6 % more, which piled up into ridges along the fill.
+        rects = [(0., 0., 20., 30.)]
+        lines = polydye.plaque_gcode([rects] * 3, 0.2, 0.45, 2.405, 0.5)
+        for z in (0.4, 0.6):
+            volume = sum(e for _, _, e, _ in self.layer_moves(lines, z)) * 2.405
+            self.assertTrue(0.98 * 120. < volume <= 120., (z, volume))
+        # FLOW scales all of it; the top layer goes at 25 mm/s, the one below at the usual 40 and 50.
+        more = polydye.plaque_gcode([rects] * 3, 0.2, 0.45, 2.405, 0.5, flow=1.1)
+        self.assertAlmostEqual(sum(e for _, _, e, _ in self.layer_moves(more, 0.6)),
+                               1.1 * sum(e for _, _, e, _ in self.layer_moves(lines, 0.6)), 3)
+        self.assertEqual({f for *_, f in self.layer_moves(lines, 0.6)}, {polydye.PLAQUE_TOP_F})
+        self.assertEqual({f for *_, f in self.layer_moves(lines, 0.4)}, {2400, 3000})
+
+    def test_ironing_stays_inside_its_rectangles_across_the_top_fill(self):
+        # Three layers: the top one (even) is filled along Y, so it's ironed along X, 0.45 mm (a width) inside each
+        # rectangle given, lines at most 0.15 mm apart, with a tenth of the plastic they'd hold.
+        rects = [(0., 0., 20., 30.)]
+        plain = polydye.plaque_gcode([rects] * 3, 0.2, 0.45, 2.405, 0.5)
+        lines = polydye.plaque_gcode([rects] * 3, 0.2, 0.45, 2.405, 0.5, flow=1.2, iron=[(2., 3., 12., 8.)])
+        ironed = self.layer_moves(lines, 0.6)[len(self.layer_moves(plain, 0.6)):]
+        self.assertTrue(ironed)
+        self.assertEqual({f for *_, f in ironed}, {polydye.PLAQUE_IRON_F})
+        for x, y, e, f in ironed:
+            self.assertTrue(2.45 - 1e-9 <= x <= 11.55 + 1e-9 and 2.45 < y < 7.55, (x, y))
+        rows = sorted({y for x, y, e, f in ironed})
+        self.assertLessEqual(max(b - a for a, b in zip(rows, rows[1:])), polydye.PLAQUE_IRON_SPACING + 1e-9)
+        long_ = [e for x, y, e, f in ironed if abs(x - 2.45) < 1e-6 or abs(x - 11.55) < 1e-6][1:]
+        # 9.1 mm across, step 4.1 / 28 mm: a tenth of 9.1 x step x 0.2 mm3, not scaled by FLOW.
+        self.assertAlmostEqual(max(long_), 0.1 * 9.1 * (4.1 / 28) * 0.2 / 2.405, 4)
+
+    def test_labels_say_which_scale_is_which_and_where_the_front_is(self):
+        # Read from the front (+X to the right, +Y away): "+X" and an arrow to the right of the X scale's numbers, in
+        # their row; "+Y" under an up arrow above the Y scale's numbers; FRONT under the Y scale. All on the plaque's
+        # plastic, clear of the grooves.
+        pitch, noz = 25.4 / 847, 25.4 / 300
+        xs, ys = polydye.offset_drawings(847 / 25.4)
+        at = lambda d, dx: [(dx + (polydye.OFFSET_REF_POSITION - p) * noz, i * pitch) for i, c, p in d.dots]
+        x_numbers = [(x, y) for x, y in at(xs, 0.) if y > 9.3]
+        x_label = [(x, y) for x, y in at(ys, polydye.OFFSET_Y_SCALE_X) if y > 9.3]
+        y_label = [(x, y) for x, y in at(ys, polydye.OFFSET_Y_SCALE_X) if 3. < y < 9.3]
+        front = [(x, y) for x, y in at(ys, polydye.OFFSET_Y_SCALE_X) if -4.9 < y < -3.]
+        y_scale = [(x, y) for x, y in at(ys, polydye.OFFSET_Y_SCALE_X) if -3. <= y <= 3.]
+        self.assertTrue(x_numbers and x_label and y_label and front and y_scale)
+        self.assertGreater(min(x for x, y in x_label), max(x for x, y in x_numbers) + 0.5)
+        self.assertEqual((min(y for x, y in x_label), max(y for x, y in x_label)),
+                         (min(y for x, y in x_numbers), max(y for x, y in x_numbers)))
+        numbers_x = min(x for x, y in y_scale if x > 7.2)  # the Y scale's numbers, right of its ticks (to 7.0 mm)
+        self.assertAlmostEqual(min(x for x, y in y_label), numbers_x, 6)
+        self.assertGreater(min(y for x, y in y_label), max(y for x, y in y_scale) + 0.25)
+        self.assertLess(max(y for x, y in front), min(y for x, y in y_scale) - 0.3)
+        size = polydye.OFFSET_PLAQUE
+        for x, y in x_label + y_label + front:
+            self.assertTrue(-size[0] + 0.3 <= x <= size[1] - 0.3 and -size[2] + 0.3 <= y <= size[3] - 0.3, (x, y))
+            self.assertFalse(abs(x) < 0.8 and y < polydye.OFFSET_SLOT_END[1] + 0.3, (x, y))  # the groove along Y
+            self.assertFalse(abs(y) < 0.8 and x < polydye.OFFSET_SLOT_END[0] + 0.3, (x, y))  # the groove along X
 
     def test_cfg_with(self):
         text = "\n".join(["[mcu polydye]", "serial: /dev/x", "[polydye]", "offset_x: 1.5  # measured",
@@ -2842,7 +2915,16 @@ class CalibrationPrints(unittest.TestCase):
         # also comes down for the prime line), then three with the groove (six rectangles).
         zs = [float(l.split()[1][1:]) for prev, l in zip(setup, setup[1:])
               if prev.endswith(" F9000") and l.startswith("G1 Z")]
-        self.assertEqual([sum(abs(z - n * 0.2) < 1e-6 for z in zs) for n in range(1, 6)], [3, 2, 12, 12, 12])
+        # The top layer is then ironed within 1 mm of the ink: six more rectangles there (the top layer's six cut down).
+        self.assertEqual([sum(abs(z - n * 0.2) < 1e-6 for z in zs) for n in range(1, 6)], [3, 2, 12, 12, 18])
+        ironed = [l for l in setup if l.endswith(" F%d" % (polydye.PLAQUE_IRON_F,)) and " E" in l]
+        ink = polydye.offset_ink_extent(847., 300.)
+        for l in ironed:
+            x, y = float(l.split()[1][1:]), float(l.split()[2][1:])
+            # Within 1 mm of the ink, and a width (0.45 mm) from the grooves (along Y to 9.3 mm up, along X to 7.35).
+            self.assertTrue(120. + ink[0] - 1. <= x <= 120. + ink[2] + 1., l)
+            self.assertTrue(100. + ink[1] - 1. <= y <= 100. + ink[3] + 1., l)
+            self.assertFalse(abs(x - 120.) < 0.95 and y < 109.75 or abs(y - 100.) < 0.95 and x < 127.8, l)
         self.assertEqual(script[2:4], ["G90\nG1 Z2.000 F900", "POLYDYE_ENABLE LIVE=1"])
         pitch = 25.4 / 847
         self.assertEqual([s for s in script if s.startswith("POLYDYE_PASS")], [
@@ -2850,6 +2932,25 @@ class CalibrationPrints(unittest.TestCase):
             "POLYDYE_PASS LAYER=65000 PASS=1 X=126.500 Y=%.3f DIR=1 WARM=0" % (100. - 467 * pitch,)])
         self.assertEqual(script[-2:], ["M104 S0\nM106 S0", "RESTORE_GCODE_STATE NAME=polydye_cal"])
         self.assertIn("POLYDYE_OFFSET X_TICK=<X scale> Y_TICK=<Y scale>", self.said[-1])
+
+    def test_offset_print_flow_and_ironing(self):
+        def plaque(**params):
+            pd, board = self.make()
+            pd.cmd_POLYDYE_OFFSET_PRINT(self.gcmd(X=120., Y=100., **params))
+            return [s for s in board.sent if isinstance(s, str)][1].split("\n")
+        plain, more, bare = plaque(), plaque(FLOW=1.1), plaque(IRON=0)
+        iron_f = " F%d" % (polydye.PLAQUE_IRON_F,)
+        self.assertFalse([l for l in bare if l.endswith(iron_f)])
+        self.assertEqual(len(plain) - len(bare), len([l for l in plain if l.endswith(iron_f)]) + 6 * 5)
+        e = lambda setup: sum(float(l.split()[3][1:]) for l in setup if l.startswith("G1 X") and " E" in l
+                              and not l.endswith(iron_f))
+        self.assertAlmostEqual(e(more) / e(plain), 1.1, 4)
+        # FLOW and IRON go with the plaque only.
+        pd, board = self.make()
+        for params in (dict(FLOW=1.1), dict(IRON=0)):
+            with self.assertRaisesRegex(RuntimeError, "FLOW and IRON go with the plaque"):
+                pd.cmd_POLYDYE_OFFSET_PRINT(self.gcmd(X=120., Y=100., PLAQUE=0, Z=1.2, **params))
+        self.assertEqual(board.sent, [])
 
     def test_a_failed_plaque_turns_the_hotend_and_fan_off(self):
         pd, board = self.make()

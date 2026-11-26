@@ -158,6 +158,8 @@ class CalibrationPrints(unittest.TestCase):
         self.assertEqual(run(self.macros, "PD_OFFSET_PRINT", "LAYERS=3 EXTRUDER_TEMP=215 BED_TEMP=60", homed=""),
                          ["G28", "POLYDYE_OFFSET_PRINT LAYERS=3 EXTRUDER_TEMP=215.0 BED_TEMP=60.0"])
         self.assertEqual(run(self.macros, "PD_OFFSET_PRINT", homed="xyz"), ["POLYDYE_OFFSET_PRINT"])
+        self.assertEqual(run(self.macros, "PD_OFFSET_PRINT", "FLOW=0.95 IRON=0", homed="xyz"),
+                         ["POLYDYE_OFFSET_PRINT FLOW=0.95 IRON=0"])
         self.assertEqual(run(self.macros, "PD_TEST_PAGE", "X=120 PRIME=0.5", homed="xy"),
                          ["G28", "POLYDYE_TEST_PAGE Z=1.0 X=120.0 PRIME=0.5"])
         self.assertEqual(run(self.macros, "PD_TEST_PAGE", "Z=1.5", homed="xyz"), ["POLYDYE_TEST_PAGE Z=1.5"])
