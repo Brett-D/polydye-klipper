@@ -412,18 +412,21 @@ ink, one object at a time.
   own 4, so a packet takes 4 + 4 and nothing is split: the gap the board has when the job loads holds for the whole
   job.
 - **Warm-up and prime, never over the glass bed:** the head only ejects when hot, so each ink layer's first pass warms
-  it first (`POLYDYE_PASS WARM=`), standing still with the cartridge over the layer's own plastic, and only as long as
-  the head has cooled: by the print time estimated here (the moves timed as Klipper plans them; within 3 % of Orca's
-  estimate), none if it fired `--prewarm-hot` s (5) or less before the layer's ink, all of `--prewarm` s (6) after
-  `--prewarm-cold` s (30: it's cold in under 30 s), in proportion between (2 s on the owl's 17 s layers). The spot is
-  where every nozzle the warm-up fires (positions 0–111, 9.4 mm across, and 1.5 mm either way along the pass for the
-  colour rows) lies `--edge-margin` plus `--warm-margin` (1 mm, for the offset's error) inside both this layer's
-  plastic and the next layer's, which covers whatever lands; the one nearest the first pass. Where there's no such
-  place (a small or thin layer, the top layer) it warms at the add-on's `warm_position`, the wipe sponge by default. A
-  layer whose head is still hot gets `WARM=0`, so the add-on's automatic warm-up doesn't add one at the sponge either.
-  `POLYDYE_PRIME` comes before the first ink layer's passes, and before any layer using a colour that hasn't ejected
-  for `--prime-idle` s (90) by that estimate (see "Priming"); when it's before the layer's first pass, the warm-up goes
-  with it at the sponge (`POLYDYE_PRIME WARM=`: a cold head doesn't eject). Before, a `POLYDYE_PREWARM` burst ran
+  it first (the job marks it), standing still with the cartridge over the layer's own plastic, and only as long as the
+  head has cooled. The add-on works that out as it prints, from when the head really last fired (so a pause, or the
+  layers of a cancelled object, count): none if it fired `--prewarm-hot` s (5) or less before, all of `--prewarm` s
+  (6) after `--prewarm-cold` s (30: it's cold in under 30 s), in proportion between (2 s on the owl's 17 s layers);
+  the job carries the three. The spot is where every nozzle the warm-up fires (positions 0–111, 9.4 mm across, and
+  1.5 mm either way along the pass for the colour rows) lies `--edge-margin` plus `--warm-margin` (1 mm, for the
+  offset's error) inside both this layer's plastic and the next layer's, so whatever lands is inside the part, and over
+  plastic laid down so far, so a drop through a gap in sparse infill lands on plastic below (a part with no solid
+  bottom gets none); the one nearest the first pass. Where there's no such place (a small or thin layer, the top
+  layer) it warms at the add-on's `warm_position`, the wipe sponge by default. A layer whose head is still hot gets
+  `WARM=0`, so the add-on's automatic warm-up doesn't add one at the sponge either. `POLYDYE_PRIME` comes before the
+  first ink layer's passes, and before any layer using a colour that hasn't ejected for `--prime-idle` s (90) by the
+  print time estimated here (the moves timed as Klipper plans them; within 3 % of Orca's estimate; see "Priming");
+  when it's before the layer's first pass, the warm-up goes with it at the sponge (`POLYDYE_PRIME JOB_WARM=1`: a cold
+  head doesn't eject). Before, a `POLYDYE_PREWARM` burst ran
   during each layer's last 6 s of plastic, with the cartridge wherever it was: on the owl (an ink layer every 17 s, so
   the head never cooled) it left a patch of ink on the glass where the cartridge hangs, about 65 mm right of the part,
   and a streak on the way to the first pass. `POLYDYE_JOB` refuses jobs sliced that way.
@@ -500,9 +503,9 @@ If anything would print a pass wrongly, Klipper stops with a readable reason, fo
 | `POLYDYE_DISABLE` | Waits for queued moves, then turns live output and the boost off |
 | `POLYDYE_PASS LAYER= PASS= X= Y= [DIR=1] [SPEED=] [WARM=] [WARM_PULSE=] [WARM_PERIOD_US=] [WARM_X= WARM_Y=] [PRESPIT=]` | Prints one pass (above), after an automatic head warm-up off the print if live ink is on and the head is cold; `WARM` asks for one (seconds), `WARM=0` for none, `WARM_X`, `WARM_Y` run it with the cartridge over that bed spot (printed plastic; like `X`, where nozzle position 50 is) at the current height, the pass travelling on from there; `PRESPIT` adds a stock-pattern pre-spit after it (see "Automatic head warm-up") |
 | `POLYDYE_PREWARM [SECONDS=6]` | Warms the head in the background while the moves after it run, so it's hot for the next pass (see "Prewarm bursts"): `SECONDS` (default `prewarm_seconds`, 6) of every nozzle at 1 word (0.35 µs) every `warm_period_us`, from where the moves before it end, without stopping them, wherever the cartridge is: on a hot head it can put ink down, so only where the cartridge stays over plastic or the sponge (`polydye_post.py` no longer uses it). Turns live ink on. A pass never waits for it: one that comes first cuts it short, and needs no warm-up of its own. At most 16.6 s at 254 µs. Needs this add-on's bundled board firmware |
-| `POLYDYE_PRIME [SECONDS=0.3] [WARM=0]` | Primes the nozzles over the wipe sponge before an ink layer whose colours have been idle (see "Priming"): waits for the passes before it, turns live ink on, goes up by `POLYDYE_WIPE`'s `z_hop` and over the sponge, warms the head for `WARM` s if given (in the same board run), spits `SECONDS` (default `prime_seconds`, 0.3; up to 5) of the stock pattern in every colour, then comes back. Allowed during a print, no `CONFIRM`. Colour templates only; needs the `POLYDYE_WIPE` macro and this add-on's bundled board firmware |
+| `POLYDYE_PRIME [SECONDS=0.3] [WARM=0] [JOB_WARM=0]` | Primes the nozzles over the wipe sponge before an ink layer whose colours have been idle (see "Priming"): waits for the passes before it, turns live ink on, goes up by `POLYDYE_WIPE`'s `z_hop` and over the sponge, warms the head for `WARM` s if given (in the same board run; `JOB_WARM=1`: as long as the loaded ink job's settings say for how long the head has been idle), spits `SECONDS` (default `prime_seconds`, 0.3; up to 5) of the stock pattern in every colour, then comes back. Allowed during a print, no `CONFIRM`. Colour templates only; needs the `POLYDYE_WIPE` macro and this add-on's bundled board firmware |
 | `POLYDYE_CLEAN [WARM=6] [SECONDS=1.5] [STROKES=3]` | Cleans the nozzles over the wipe sponge (see "Cleaning the head"): waits for the passes before it (refused if they're still running 5 s later), turns live ink on, goes up by `POLYDYE_WIPE`'s `z_hop` and over the sponge, warms the head for `WARM` s (default `prewarm_seconds`; 0: none), spits `SECONDS` (default `clean_seconds`, 1.5; up to 5) of the stock pattern in every colour, wipes with `POLYDYE_WIPE`'s strokes there (`STROKES`, default its `strokes`; 0: none), then comes back. Live ink is afterwards as it was before. Allowed during a print, no `CONFIRM`. Colour templates only; needs the `POLYDYE_WIPE` macro and this add-on's bundled board firmware. Doesn't home (`PD_CLEAN` does) |
-| `POLYDYE_JOB [FILE=]` | At the start of a print sliced with `polydye_post.py` (it puts it there): loads the print's ink job and uploads its passes to the board as the print runs (see "Colour prints from OrcaSlicer"). Refuses, before anything moves, a job sliced for another `dpi` or `nozzle_dpi`, one the colour registration would move off nozzle positions 14–85, ink beyond the axis limits (each pass's run-up at the acceleration the G-code sets for the ink) or above the Z axis (`--gap` over the top layer), warm-ups over the part beyond the axis limits, warm-ups and primes the board or macros can't run, `POLYDYE_PREWARM` bursts (an older `polydye_post.py`'s: they fire wherever the cartridge is, over the glass bed too), or `G10`/`G11` retraction (`--retract firmware`) without `[firmware_retraction]`. While it's loaded the colour registration and `nozzle_skew` can't change. Needs `data_port` |
+| `POLYDYE_JOB [FILE=]` | At the start of a print sliced with `polydye_post.py` (it puts it there): loads the print's ink job and uploads its passes to the board as the print runs (see "Colour prints from OrcaSlicer"). Refuses, before anything moves, a job sliced for another `dpi` or `nozzle_dpi`, one the colour registration would move off nozzle positions 14–85, ink beyond the axis limits (each pass's run-up at the acceleration the G-code sets for the ink) or above the Z axis (`--gap` over the top layer), warm-ups over the part beyond the axis limits, warm-ups and primes the board or macros can't run (its ink layers' warm-ups come as long as the head has really been idle, by the job's `--prewarm` settings), `POLYDYE_PREWARM` bursts (an older `polydye_post.py`'s: they fire wherever the cartridge is, over the glass bed too), or `G10`/`G11` retraction (`--retract firmware`) without `[firmware_retraction]`. While it's loaded the colour registration and `nozzle_skew` can't change. Needs `data_port` |
 | `POLYDYE_JOB_PASS N=` | Prints the job's pass `N` with `POLYDYE_PASS` once it's on the board (waits for it): one board pass, or two over the same ground where it's split by fire line (see "Colour prints from OrcaSlicer"); skipped if its object is excluded |
 | `POLYDYE_INK_MOTION [ACCEL=1000] [SCV=1] [RESTORE=1]` | Gentler moves for an ink block: acceleration and square corner velocity at most `ACCEL`, `SCV` (never raised), until `RESTORE=1` puts back the limits from before; a print that ends inside an ink block gets them back too. `polydye_post.py` puts it around each layer's ink |
 | `POLYDYE_JOB_END` | Stops the job's uploads and says what was printed (also done when the print ends, however it ends) |
@@ -726,8 +729,8 @@ print in full, and the paper under the bursts stay clean.
 A burst warms the head but doesn't eject, and a hot head isn't enough: a nozzle that hasn't ejected for a while misses
 about its first 60 full-energy fires. Cyan printed in full 30, 60 and 120 s after its last ejection, but lost about
 5 mm of a pass after 4.5 min. So an ink layer starts with `POLYDYE_PRIME` when it's the print's first, or when any
-colour it uses hasn't ejected for 90 s or more (`polydye_post.py` gives it the layer's warm-up first, `WARM=`, in the
-same board run: a cold head doesn't eject):
+colour it uses hasn't ejected for 90 s or more (`polydye_post.py` gives it the layer's warm-up first, `JOB_WARM=1`, in
+the same board run: a cold head doesn't eject):
 
 - **Over the wipe sponge only.** It rides on the X gantry, so the cartridge's gap to it stays the same; spits from over
   about 5 mm mist, so never over the base or the bed.

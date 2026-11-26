@@ -179,7 +179,7 @@ class Structure(unittest.TestCase):
             self.assertEqual(out[n], "; PolyDye ink: layer %d (Z %.3f), %d passes\n" % (
                 layer, 0.2 * (layer + 1), len(re.findall(r"POLYDYE_JOB_PASS N=\d+ ; layer %d " % (layer,), text))))
         self.assertEqual(text.count("POLYDYE_PRIME"), 1)
-        self.assertIn("POLYDYE_ENABLE LIVE=1\nPOLYDYE_PRIME WARM=6 ;", text.split("; PolyDye ink: layer 1")[0])
+        self.assertIn("POLYDYE_ENABLE LIVE=1\nPOLYDYE_PRIME JOB_WARM=1 ;", text.split("; PolyDye ink: layer 1")[0])
         block = text.split("; PolyDye ink: layer 2")[1].split(";TYPE:Custom")[0].split("\n")[1:]
         x, y = re.match(r"G1 X([\d.]+) Y([\d.]+) E", out[blocks[-1] - 1]).groups()
         # Gentler moves while the ink prints (POLYDYE_INK_MOTION), the limits put back right after it.
@@ -208,9 +208,10 @@ class Structure(unittest.TestCase):
 
     def test_the_job_says_how_high_and_how_slow_its_ink_goes(self):
         # The ink 1 mm (--gap) above the top inked layer (Z 0.6); the acceleration the G-code sets (none: 0); no
-        # bursts, and the longest warm-up.
+        # bursts, and the warm-ups' settings.
         out, _ = run(block_gcode(layers=3), "--ink-accel", "0")
-        self.assertRegex("".join(out), r" ink_accel=0 ink_z=1.600 prewarm_s=0 warms=\d warm_s=6 ")
+        self.assertIn(" ink_accel=0 ink_z=1.600 prewarm_s=0 warms=3 prewarm=6 prewarm_hot=5 prewarm_cold=30 ",
+                      "".join(out))
         src = block_gcode(layers=3)
         src.insert(src.index("G90\n"), "SET_VELOCITY_LIMIT ACCEL=1500\n")
         out, _ = run(src, "--gap", "2", "--prewarm", "0", "--ink-accel", "0")
@@ -777,67 +778,75 @@ def big_block(layers=5, size=(30., 20.)):
     return part_gcode([walls + [(0, "Sparse infill", fill)] for _ in range(layers)])
 
 
+def sparse_block(layers=5, bottom=0):
+    """part_gcode(): a 30 x 20 mm block from X, Y 90 up like big_block(), but its inside is sparse infill, lines 2 mm
+    apart along X and Y by turns, with `bottom` solid layers (lines 0.4 mm apart) under it."""
+    def loop(k):
+        a = 0.2 + 0.4 * k
+        return [(90. + a, 90. + a), (120. - a, 90. + a), (120. - a, 110. - a), (90. + a, 110. - a), (90. + a, 90. + a)]
+    walls = [(1, "Outer wall" if k == 0 else "Inner wall", [loop(k)]) for k in range(4)]
+    out = []
+    for n in range(layers):
+        if n < bottom:
+            fill = (0, "Bottom surface", xlines(91.8, 118.2, [91.8 + 0.4 * k for k in range(42)]))
+        elif n % 2:
+            fill = (0, "Sparse infill", [[(x, 91.8), (x, 108.2)] for x in (92. + 2. * k for k in range(14))])
+        else:
+            fill = (0, "Sparse infill", xlines(91.8, 118.2, [92. + 2. * k for k in range(9)]))
+        out.append(walls + [fill])
+    return part_gcode(out)
+
+
 @unittest.skipIf(post.np is None, "needs numpy")
 class WarmAndPrime(unittest.TestCase):
     """Each ink layer's warm-up, standing still with the cartridge over the layer (or with its prime at the sponge),
-    for as long as the head has cooled; POLYDYE_PRIME when a colour has been idle."""
+    as long as the add-on finds the head has cooled; POLYDYE_PRIME when a colour has been idle."""
 
     def test_warm_seconds(self):
         opts = post.options(["x.gcode"])
         self.assertEqual((opts.prewarm, opts.prewarm_hot, opts.prewarm_cold, opts.warm_margin), (6., 5., 30., 1.))
         self.assertEqual([post.warm_seconds(idle, opts) for idle in (None, 0., 5., 10., 17.5, 29.9, 30., 300.)],
                          [6., 0., 0., 1.2, 3., 6., 6., 6.])
+        # The add-on's, from the head's real idle time, is the same.
+        self.assertEqual([polydye.job_warm_seconds(idle, 6., 5., 30.) for idle in (None, 0., 10., 17.5, 30.)],
+                         [6., 0., 1.2, 3., 6.])
         for bad in (("--prewarm-hot", "10", "--prewarm-cold", "9"), ("--prewarm-hot", "-1"), ("--warm-margin", "-1")):
             with self.assertRaises(SystemExit, msg=bad), contextlib.redirect_stderr(io.StringIO()):
                 post.options(list(bad) + ["x.gcode"])
 
-    def test_no_burst_during_the_plastic_and_the_warm_up_follows_the_idle_time(self):
+    def test_no_burst_during_the_plastic_the_add_on_warms_each_ink_layer(self):
         # Layers of about 6 s (lines at 40 mm/s), and 5 s to dry: the head idle about 15 s before the next ink.
         # Nothing fires while the nozzle prints plastic (the cartridge then hangs ~65 mm to its side, over the glass
-        # bed: owl #2 left ink there). The first ink layer primes, warming the cold head at the sponge first; the
-        # others warm before their first pass, for the head's idle time: 2 s of 6 (5 s hot, 30 s cold).
+        # bed: owl #2 left ink there). The first ink layer primes, warming the head at the sponge first; the others
+        # warm before their first pass. The add-on finds how long from the head's idle time (2 s of 6 by the estimate
+        # here: 5 s hot, 30 s cold).
         out, summary = run(block_gcode(layers=3, feed=2400))
         text = "".join(out)
         self.assertNotIn("POLYDYE_PREWARM", text)
         firsts, records = block_firsts(out)
         prime = [ln.strip() for ln in out if ln.startswith("POLYDYE_PRIME")]
-        self.assertEqual(prime, ["POLYDYE_PRIME WARM=6 ; colours idle 90 s or more (or the first ink): the head "
-                                 "warmed and primed at the sponge"])
+        self.assertEqual(prime, ["POLYDYE_PRIME JOB_WARM=1 ; colours idle 90 s or more (or the first ink): the head "
+                                 "warmed first as long as it has cooled (about 6 s), and primed at the sponge"])
         self.assertIn("POLYDYE_ENABLE LIVE=1\n%s\nPOLYDYE_JOB_PASS N=0 " % (prime[0],), text)
-        self.assertTrue(firsts[0].endswith(", no warm-up"), firsts[0])
-        warm = []
+        self.assertTrue(firsts[0].endswith(", warmed with its prime"), firsts[0])
         for layer in (1, 2):
-            n = int(re.match(r"POLYDYE_JOB_PASS N=(\d+)", firsts[layer]).group(1))
-            w = float(re.search(r" warm=([\d.]+)$", records[n]).group(1))
-            self.assertEqual(w, 2., records[n])
             # The 10 x 10 mm block has no room for every nozzle 1.5 mm inside it: the add-on's warm_position.
-            self.assertTrue(firsts[layer].endswith(", a %g s warm-up first at warm_position (no room over the part)"
-                                                   % (w,)), firsts[layer])
-            warm.append(w)
-        self.assertEqual(records[0].split(" colours=")[1], "m warm=0")
-        # Only the first pass of each layer has one: the add-on's automatic warm-up stays off for it.
-        self.assertEqual(len([r for r in records.values() if " warm=" in r]), 3)
+            self.assertTrue(firsts[layer].endswith(", a warm-up first as long as the head has cooled (about 2 s), at "
+                                                   "warm_position (no room over the part)"), firsts[layer])
+        # Each layer's first pass is marked: its warm-up replaces the add-on's automatic one.
+        self.assertEqual(sorted(n for n, r in records.items() if r.endswith(" warmup=1")),
+                         sorted(int(re.match(r"POLYDYE_JOB_PASS N=(\d+)", ln).group(1)) for ln in firsts.values()))
+        self.assertEqual(len([r for r in records.values() if "warm" in r]), 3)
         self.assertIn(";PDJ version=4 ", text)
-        self.assertIn(" prewarms=0 primes=1 ink_accel=1000 ink_z=1.600 prewarm_s=0 warms=3 warm_s=6 ", text)
-        self.assertIn("; 3 warm-ups (0 over the part, 1 with a prime, 2 at warm_position; %g s), 1 primes"
-                      % (round(6. + sum(warm), 1),), summary)
+        self.assertIn(" prewarms=0 primes=1 ink_accel=1000 ink_z=1.600 prewarm_s=0 warms=3 prewarm=6 prewarm_hot=5 "
+                      "prewarm_cold=30 ", text)
+        self.assertIn("; 3 warm-ups (0 over the part, 1 with a prime, 2 at warm_position; about 10 s), 1 primes",
+                      summary)
         # Without the change, the job would warm with POLYDYE_PREWARM bursts during the plastic.
         self.assertNotIn("prewarms=3", text)
-
-    def test_a_head_still_hot_gets_no_warm_up(self):
-        # Layers of about 1 s and 5 s of drying: the head fired about 7 s before each layer's ink. With --prewarm-hot
-        # 10 that's hot: WARM=0, so the add-on's automatic warm-up (at the sponge) doesn't add one either.
-        out, summary = run(block_gcode(layers=3), "--prewarm-hot", "10")
-        firsts, records = block_firsts(out)
-        for layer in (1, 2):
-            self.assertTrue(firsts[layer].endswith(", no warm-up"), firsts[layer])
-            n = int(re.match(r"POLYDYE_JOB_PASS N=(\d+)", firsts[layer]).group(1))
-            self.assertTrue(records[n].endswith(" warm=0"), records[n])
-        self.assertIn("; 1 warm-ups (0 over the part, 1 with a prime, 0 at warm_position; 6 s), 1 primes", summary)
-        # By default (hot up to 5 s) a little, in proportion from 5 s idle to 30 s.
-        _, records = block_firsts(run(block_gcode(layers=3))[0])
-        self.assertEqual([re.search(r" warm=([\d.]+)", r).group(1) for n, r in sorted(records.items())
-                          if " warm=" in r and n], ["1.1", "1.1"])
+        # The options go to the add-on.
+        out, _ = run(block_gcode(layers=3, feed=2400), "--prewarm", "4", "--prewarm-hot", "2", "--prewarm-cold", "20")
+        self.assertIn(" warms=3 prewarm=4 prewarm_hot=2 prewarm_cold=20 ", "".join(out))
 
     def test_the_warm_up_stands_over_the_layer_with_every_nozzle_inside_it(self):
         out, summary = run(big_block(), "--edge-margin", "0.5", "--prime-idle", "0")
@@ -847,26 +856,25 @@ class WarmAndPrime(unittest.TestCase):
         spots = {}
         for layer, line in firsts.items():
             n = int(re.match(r"POLYDYE_JOB_PASS N=(\d+)", line).group(1))
-            m = re.search(r" warm=([\d.]+)(?: warm_x=([\d.]+) warm_y=([\d.]+))?$", records[n])
+            m = re.search(r" warmup=1(?: warm_x=([\d.]+) warm_y=([\d.]+))?$", records[n])
             self.assertIsNotNone(m, records[n])
-            if m.group(2):
-                spots[layer] = (float(m.group(1)), float(m.group(2)), float(m.group(3)))
-                self.assertIn(", a %s s warm-up first over X=%.1f Y=%.1f" % (m.group(1), spots[layer][1],
-                                                                            spots[layer][2]), line)
-        # The first ink layer (cold: 6 s) and the next ones: over the part. The last has no layer above it to cover
-        # what lands, so it warms at the add-on's warm_position.
+            if m.group(1):
+                spots[layer] = (float(m.group(1)), float(m.group(2)))
+                self.assertTrue(line.endswith(" s), over X=%.1f Y=%.1f" % spots[layer]), line)
+        # Every ink layer's first pass over the part, but the last: no layer above it covers what lands, so it warms
+        # at the add-on's warm_position.
         self.assertEqual(sorted(spots), [0, 1, 2, 3])
-        self.assertEqual(spots[0][0], 6.)
         self.assertTrue(firsts[4].endswith("at warm_position (no room over the part)"), firsts[4])
         # Every nozzle (positions 0-111: 50 pitches along +X of the spot to 61 along -X, and 1.5 mm either way along
         # Y) at least --edge-margin + --warm-margin (1.5 mm) inside the block's plastic (X 90-120, Y 90-110), to
         # within a cell's snapping.
-        for _, x, y in spots.values():
+        for x, y in spots.values():
             self.assertGreaterEqual(x - 61 * SX - 1.5, 90. - 0.06)
             self.assertLessEqual(x + 50 * SX + 1.5, 120. + 0.06)
             self.assertGreaterEqual(y - 1.5 - 1.5, 90. - 0.06)
             self.assertLessEqual(y + 1.5 + 1.5, 110. + 0.06)
-        self.assertRegex(summary, r"; 5 warm-ups \(4 over the part, 0 with a prime, 1 at warm_position; [\d.]+ s\)")
+        self.assertRegex(summary, r"; 5 warm-ups \(4 over the part, 0 with a prime, 1 at warm_position; about "
+                                  r"[\d.]+ s\)")
         # The add-on reads the spot with the pass.
         with tempfile.NamedTemporaryFile("w", suffix=".gcode", delete=False) as f:
             f.writelines(out)
@@ -875,40 +883,50 @@ class WarmAndPrime(unittest.TestCase):
         finally:
             os.unlink(f.name)
         first = recs[int(re.match(r"POLYDYE_JOB_PASS N=(\d+)", firsts[1]).group(1))]
-        self.assertEqual((first['warm'], first['warm_x'], first['warm_y']), spots[1])
-        self.assertEqual((header['warms'], header['warm_s'], header['prewarms']), (5, 6., 0))
+        self.assertEqual((first['warmup'], first['warm_x'], first['warm_y']), (True,) + spots[1])
+        self.assertEqual((header['warms'], header['prewarm'], header['prewarm_hot'], header['prewarm_cold'],
+                          header['prewarms']), (5, 6., 5., 30., 0))
         # A narrower block (12 mm across X: the nozzles span 9.4 mm, plus 1.5 mm each side) has no room.
         out, summary = run(big_block(size=(12., 20.)), "--edge-margin", "0.5", "--prime-idle", "0")
         self.assertNotIn(" warm_x=", "".join(out))
         self.assertRegex(summary, r"; 5 warm-ups \(0 over the part, 0 with a prime, 5 at warm_position")
 
+    def test_drops_through_sparse_infill_still_land_on_plastic(self):
+        # A part with no solid bottom: its sparse infill, lines 2 mm apart along X and Y by turns, leaves gaps all the
+        # way down to the glass, so no spot over it, although each layer's plastic counts as solid inside its walls.
+        out, summary = run(sparse_block(), "--edge-margin", "0.5", "--prime-idle", "0")
+        self.assertNotIn(" warm_x=", "".join(out))
+        self.assertRegex(summary, r"; 5 warm-ups \(0 over the part, 0 with a prime, 5 at warm_position")
+        # With two solid bottom layers under it, a drop through the gaps lands on them: over the part.
+        out, summary = run(sparse_block(bottom=2), "--edge-margin", "0.5", "--prime-idle", "0")
+        self.assertRegex(summary, r"; 5 warm-ups \(4 over the part, 0 with a prime, 1 at warm_position")
+
     def test_a_colour_idle_too_long_primes_again(self):
         src = block_gcode(layers=3, feed=600)
-        # About 30 s between layers' ink: with --prime-idle 10 every layer primes, each warming the cold head first
-        # (6 s: idle 30 s or more), with 90 only the first.
+        # About 30 s between layers' ink: with --prime-idle 10 every layer primes, each warming the head first, with
+        # 90 only the first.
         out, summary = run(src, "--prime-idle", "10")
-        primes = re.findall(r"POLYDYE_PRIME(?: WARM=([\d.]+))? ;", "".join(out))
-        self.assertEqual(primes, ["6", "6", "6"])
-        self.assertRegex(summary, r"; 3 warm-ups \(0 over the part, 3 with a prime, 0 at warm_position; [\d.]+ s\), "
-                                  r"3 primes")
+        self.assertEqual(len(re.findall(r"POLYDYE_PRIME JOB_WARM=1 ;", "".join(out))), 3)
+        self.assertRegex(summary, r"; 3 warm-ups \(0 over the part, 3 with a prime, 0 at warm_position; about "
+                                  r"[\d.]+ s\), 3 primes")
         # Magenta from layer 6 on, after about 2 min of white: the first ink layer primes, and so would a later one
         # whose colour had been idle that long.
         out, _ = run(block_gcode(layers=8, feed=600, colour_from=6))
         text = "".join(out)
         self.assertEqual(re.findall(r"; PolyDye ink: layer (\d+)", text), ["6", "7"])
-        self.assertEqual(text.split("; PolyDye ink: layer 7")[0].count("POLYDYE_PRIME WARM=6 ;"), 1)
+        self.assertEqual(text.split("; PolyDye ink: layer 7")[0].count("POLYDYE_PRIME JOB_WARM=1 ;"), 1)
         self.assertEqual(text.count("POLYDYE_PRIME"), 1)
         # Accelerations and speeds of 0 in the profile (Orca's "off") fall back to the defaults.
         out, summary = run(block_gcode(layers=3, feed=600, config={'default_acceleration': '0',
                                                                     'machine_max_speed_x': '0,0'}) +
                            ["SET_VELOCITY_LIMIT ACCEL=0\n", "M204 S0\n"])
         self.assertIn("1 primes", summary)
-        # Off: neither, and no warm-up on the passes (the add-on's automatic one, at warm_position).
+        # Off: neither, and no warm-up of the job's on the passes (the add-on's automatic one, at warm_position).
         out, summary = run(src, "--prime-idle", "0", "--prewarm", "0")
         self.assertNotIn("POLYDYE_PRIME", "".join(out))
-        self.assertNotIn(" warm=", "".join(out))
+        self.assertNotIn("warmup", "".join(out))
         self.assertIn(";PDJ version=2 ", "".join(out))
-        self.assertIn("0 warm-ups (0 over the part, 0 with a prime, 0 at warm_position; 0 s), 0 primes", summary)
+        self.assertIn("0 warm-ups (0 over the part, 0 with a prime, 0 at warm_position; about 0 s), 0 primes", summary)
 
 
 @unittest.skipIf(post.np is None, "needs numpy")
