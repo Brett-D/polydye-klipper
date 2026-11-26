@@ -1308,8 +1308,11 @@ def cfg_with(text, values):
 # JOB_AHEAD_BYTES / JOB_AHEAD_PASSES on the board unprinted), each stored to be deleted once printed
 # (PASSSTORE_FLAG_ONCE); after each layer POLYDYE_JOB_PASS N=n prints pass n with POLYDYE_PASS. The passes are drawn
 # without colour registration: it's applied here, from polydye.cfg, so a recalibration needs no re-slice.
-JOB_VERSION = 3
-JOB_VERSIONS = (1, 2, 3)  # 2: POLYDYE_INK_MOTION in its ink blocks; 3: G10 and G11 there (retract=firmware)
+JOB_VERSION = 4
+# 2: POLYDYE_INK_MOTION in its ink blocks; 3: G10 and G11 there (retract=firmware); 4: warm-ups on its passes (warm=,
+# warm_x=, warm_y=) and primes (POLYDYE_PRIME WARM=) instead of POLYDYE_PREWARM bursts, which POLYDYE_JOB refuses: they
+# fire wherever the cartridge is, and on a head that never cooled (owl #2, 2026-11-26) put ink on the glass bed.
+JOB_VERSIONS = (1, 2, 3, 4)
 JOB_BEGIN, JOB_END = b"; POLYDYE_JOB_BEGIN", b"; POLYDYE_JOB_END"
 JOB_NOZZLES = (STOCK_RANDOM['first'], STOCK_RANDOM['last'])  # the positions the stock firmware fires, 14-85
 JOB_AHEAD_BYTES, JOB_AHEAD_PASSES = 3 * 1024 * 1024, 256
@@ -1364,10 +1367,11 @@ def job_load(path):
     """Reads a job's index: (header, records). header has version, dpi, nozzle_dpi, pass_axis, positions (lo, hi),
     passes, layers, how many POLYDYE_PREWARM and POLYDYE_PRIME its G-code has (prewarms, primes), the lowest
     acceleration its G-code sets for an ink block (ink_accel, 0: none), the highest Z an ink block goes to (ink_z),
-    its bursts' SECONDS (prewarm_s, 0: none given) and whether its ink blocks retract with G10 and G11
-    (firmware_retract);
-    each record n, layer, pass, coat, object, dir, x, y, columns, colours, size (nozzle data bytes, at most) and
-    where its data lines are (start, end)."""
+    its bursts' SECONDS (prewarm_s, 0: none given), whether its ink blocks retract with G10 and G11
+    (firmware_retract), and its warm-ups (passes' and primes') and the longest's seconds (warms, warm_s);
+    each record n, layer, pass, coat, object, dir, x, y, columns, colours, its warm-up's seconds before it (warm: None
+    for the automatic one, 0 for none) and bed spot (warm_x, warm_y: None for warm_position), size (nozzle data
+    bytes, at most) and where its data lines are (start, end)."""
     with open(path, 'rb') as f:
         start, end = job_find(f)
         f.seek(start)
@@ -1399,15 +1403,20 @@ def job_load(path):
                   'layers': int(header.get('layers', 0)), 'prewarms': int(header.get('prewarms', 0)),
                   'primes': int(header.get('primes', 0)), 'ink_accel': float(header.get('ink_accel', 0)),
                   'ink_z': float(header.get('ink_z', 0)), 'prewarm_s': float(header.get('prewarm_s', 0)),
-                  'firmware_retract': header.get('retract') == 'firmware'}
+                  'firmware_retract': header.get('retract') == 'firmware', 'warms': int(header.get('warms', 0)),
+                  'warm_s': float(header.get('warm_s', 0))}
         for n, rec in enumerate(records):
             for key in ('n', 'layer', 'pass', 'coat', 'dir', 'columns'):
                 rec[key] = int(rec[key])
             rec['x'], rec['y'] = float(rec['x']), float(rec['y'])
+            for key in ('warm', 'warm_x', 'warm_y'):
+                rec[key] = float(rec[key]) if key in rec else None
             if rec['n'] != n or rec['dir'] not in (1, -1) or not 0 < rec['columns'] <= 65535 or \
                     not 0 <= rec['pass'] < SPLIT_PASS or \
                     not rec['layer'] < CAL_LAYER or not rec['colours'] or set(rec['colours']) - set('cmy') or \
-                    rec['end'] == rec['start']:
+                    rec['end'] == rec['start'] or (rec['warm'] is not None and not 0 <= rec['warm'] <= WARM_MAX_S) or \
+                    (rec['warm_x'] is None) != (rec['warm_y'] is None) or \
+                    (rec['warm_x'] is not None and not rec['warm']):
                 raise JobError("pass %d is malformed" % (n,))
             rec['object'] = rec.get('object', '-')
     except (KeyError, ValueError) as e:
@@ -2277,7 +2286,9 @@ class PolyDye:
 
     cmd_POLYDYE_PASS_help = ("Print one ink pass along pass_axis (the pass data must already be uploaded); with live "
                              "ink a cold head is warmed first, off the print (WARM seconds, WARM_PULSE, WARM_PERIOD_US "
-                             "ask for a warm-up, WARM=0 for none; PRESPIT seconds of stock-pattern spit after it)")
+                             "ask for a warm-up, WARM=0 for none; WARM_X, WARM_Y: with the cartridge over that bed "
+                             "spot of printed plastic at the current height; PRESPIT seconds of stock-pattern spit "
+                             "after it)")
 
     def cmd_POLYDYE_PASS(self, gcmd):
         layer = gcmd.get_int('LAYER', minval=0, maxval=65535)
@@ -2315,6 +2326,14 @@ class PolyDye:
                                     "bundled firmware)" % (WARM_MAX_S,) if self.warm_duty_ppm is None else ""))
             self._warm_plan(gcmd, "POLYDYE_PASS", warm,
                             *pass_warm_settings(warm_words, warm_period, self.warm_pulse, self.warm_period_us))
+        # Where the warm-up runs, if not warm_position: the cartridge over this bed spot (where nozzle position 50 is,
+        # like X), standing at the current height, and the pass travels on from there.
+        spot_x, spot_y = gcmd.get_float('WARM_X', None), gcmd.get_float('WARM_Y', None)
+        spot = None
+        if spot_x is not None or spot_y is not None:
+            if spot_x is None or spot_y is None or not warm:
+                raise gcmd.error("POLYDYE_PASS: WARM_X and WARM_Y go together, with WARM: where its warm-up runs")
+            spot = ('part', spot_x, spot_y)
 
         speed = gcmd.get_float('SPEED', self.pass_speed, above=0.)
         # With a fire gap the column is longer: a faster pass than pass_speed may not fit it (the board would shut
@@ -2339,13 +2358,21 @@ class PolyDye:
                              % (speed, th_status['max_velocity']))
         pitch = 25.4 / self.dpi
         run_up = self._run_up(speed, th_status, columns)
+        if spot is not None:
+            low, high = th_status['axis_minimum'], th_status['axis_maximum']
+            base = gcode_move.base_position
+            tx, ty = spot_x - self.offset_x + base[0], spot_y - self.offset_y + base[1]
+            # Axes without a range (kinematics: none, for testing) have no limits to keep to.
+            if not ((high.x <= low.x or low.x <= tx <= high.x) and (high.y <= low.y or low.y <= ty <= high.y)):
+                raise gcmd.error("POLYDYE_PASS: the warm-up over X=%.1f Y=%.1f would take the toolhead to X=%.1f "
+                                 "Y=%.1f, beyond the axis limits" % (spot_x, spot_y, tx, ty))
 
         # Bed coordinates of the ink -> toolhead coordinates of the hotend.
         start, first, end = pass_geometry(self.pass_axis, bed_x, bed_y, direction, columns, pitch, run_up,
                                           (self.offset_x, self.offset_y), gcode_move.base_position,
                                           self.direction_trim)
         axis = 0 if self.pass_axis == 'x' else 1
-        live = self._auto_warm(gcmd, "POLYDYE_PASS", start, direction, warm, warm_words, warm_period, prespit)
+        live = self._auto_warm(gcmd, "POLYDYE_PASS", start, direction, warm, warm_words, warm_period, prespit, spot)
         if live:
             self._wait_for_boost()  # a POLYDYE_PREWARM may have turned the boost on just before
 
@@ -2396,13 +2423,13 @@ class PolyDye:
         min_distance = speed * speed / (accel * (1. - mcr))
         return max(run_up, (min_distance - length) / 2. + 0.001)
 
-    def _auto_warm(self, gcmd, cmd, start, direction, warm=None, words=None, period=None, prespit=None):
+    def _auto_warm(self, gcmd, cmd, start, direction, warm=None, words=None, period=None, prespit=None, spot=None):
         """Before a pass whose run-up starts at toolhead `start` (going `direction` along pass_axis): warms the head
-        (_warm_head()) for `warm` seconds if given (0: not at all), else automatically if the automatic warm-up is on
-        and the head will be cold when the pass starts (head_cold() at the end of the moves already queued, the
-        earliest the pass can fire). A warm-up is followed by `prespit` seconds of pre-spit (None: warm_prespit).
-        Returns whether live ink is on, whatever the warm-up: a live pass keeps the head warm, a dry-run pass fires
-        nothing."""
+        (_warm_head()) for `warm` seconds if given (0: not at all; at `spot` if given, else warm_position), else
+        automatically if the automatic warm-up is on and the head will be cold when the pass starts (head_cold() at the
+        end of the moves already queued, the earliest the pass can fire). A warm-up is followed by `prespit` seconds of
+        pre-spit (None: warm_prespit). Returns whether live ink is on, whatever the warm-up: a live pass keeps the head
+        warm, a dry-run pass fires nothing."""
         prespit = self.warm_prespit if prespit is None else prespit
         st = self._fresh_status()
         if not st['live']:
@@ -2413,7 +2440,7 @@ class PolyDye:
             if warm:
                 words, period = pass_warm_settings(words, period, self.warm_pulse, self.warm_period_us)
                 self._warm_head(gcmd, cmd, "a %g s head warm-up was asked for" % (warm,), warm, words, period, start,
-                                direction, prespit)
+                                direction, prespit, spot)
             return True
         if not self.warm_seconds or self.spit_run_cmd is None or self.warm_duty_ppm is None:
             return True
@@ -2499,11 +2526,11 @@ class PolyDye:
         logging.info("polydye: prewarm burst at print_time %.3f: %d columns every %d us (%.1f s)", print_time,
                      columns, period, columns * period / 1e6)
 
-    def _warm_head(self, gcmd, cmd, why, seconds, words, period, start, direction, prespit=0.):
+    def _warm_head(self, gcmd, cmd, why, seconds, words, period, start, direction, prespit=0., spot=None):
         """A warm-up right before a pass: once the moves and passes before it are done, `seconds` of every nozzle at
         `words` every `period` us (None: the warm-up defaults, _warm_plan()), then `prespit` seconds of the stock
-        pattern (if any), standing still at the warm spot (_go_to_warm_spot()), in one board run with live ink left
-        on. Raises, and the pass doesn't run, if the board can't be seen idle afterwards."""
+        pattern (if any), standing still at the warm spot (_go_to_warm_spot(): `spot` if given), in one board run with
+        live ink left on. Raises, and the pass doesn't run, if the board can't be seen idle afterwards."""
         st = self._board_idle(gcmd, cmd, "the head can't be warmed")
         spit = int(round(prespit * 1e6 / STOCK_PERIOD_US)) if prespit else 0
         if spit and 'stock' not in self.spit_patterns:
@@ -2514,7 +2541,7 @@ class PolyDye:
             raise gcmd.error("%s: the pre-spit is the stock pattern, for a colour cartridge template, not %s"
                              % (cmd, st['cartridge_template']))
         words, period, columns = self._warm_plan(gcmd, cmd, seconds, words, period)
-        self._fire_at_spot(gcmd, cmd, "warm-up", (columns, words, period), spit, start, direction, None,
+        self._fire_at_spot(gcmd, cmd, "warm-up", (columns, words, period), spit, start, direction, spot,
                            lambda where: "PolyDye: %s, so a head %s%s comes first, %s" % (
                                why, warm_text(columns, words, period),
                                ", then a %g s pre-spit (%d stock-pattern columns every %d us)"
@@ -2581,16 +2608,20 @@ class PolyDye:
         self.last_fire = self.mcu.estimated_print_time(reactor.monotonic())
 
     cmd_POLYDYE_PRIME_help = ("Prime the nozzles over the wipe sponge, for a layer's ink after its colours have been "
-                              "idle: SECONDS (prime_seconds, 0.3) of the stock pattern (positions 14-85 of every "
-                              "colour), then back; turns live ink on. Allowed during a print, no CONFIRM; waits for the "
-                              "passes before it")
+                              "idle: a WARM s warm-up if given (a cold head doesn't eject), then SECONDS "
+                              "(prime_seconds, 0.3) of the stock pattern (positions 14-85 of every colour), then back; "
+                              "turns live ink on. Allowed during a print, no CONFIRM; waits for the passes before it")
 
     def cmd_POLYDYE_PRIME(self, gcmd):
         cmd = "POLYDYE_PRIME"
         seconds = gcmd.get_float('SECONDS', self.prime_seconds, above=0., maxval=PRESPIT_MAX_S)
+        warm = gcmd.get_float('WARM', 0., minval=0., maxval=WARM_MAX_S)
         if self.spit_run_cmd is None or 'stock' not in self.spit_patterns:
             raise gcmd.error("%s: needs newer PolyDye board firmware (the stock pattern); update it from the PolyDye "
                              "page (Board firmware: Update to bundled firmware)" % (cmd,))
+        if warm > self.warm_max_s + 1e-9:
+            raise gcmd.error("%s: a %g s warm-up is longer than the board takes (%g s)" % (cmd, warm, self.warm_max_s))
+        plan = self._warm_plan(gcmd, cmd, warm, self.warm_pulse, self.warm_period_us) if warm else None
         macro = self.printer.lookup_object('gcode_macro POLYDYE_WIPE', None)
         if 'x' not in getattr(macro, 'variables', {}):
             raise gcmd.error("%s: primes over the wipe sponge, but there's no POLYDYE_WIPE macro to say where it is: "
@@ -2609,9 +2640,11 @@ class PolyDye:
         # Live ink on; if the boost was off, the moves to the sponge wait for it to settle.
         self._enable(gcmd, cmd, True)
         spit = max(1, int(round(seconds * 1e6 / STOCK_PERIOD_US)))
-        self._fire_at_spot(gcmd, cmd, "prime", None, spit, None, 1, 'sponge',
-                           lambda where: "PolyDye: priming, %g s of the stock pattern (%d columns every %d us) %s"
-                           % (seconds, spit, STOCK_PERIOD_US, where))
+        self._fire_at_spot(gcmd, cmd, "warm-up and prime" if plan else "prime",
+                           None if plan is None else (plan[2], plan[0], plan[1]), spit, None, 1, 'sponge',
+                           lambda where: "PolyDye: priming, %s%g s of the stock pattern (%d columns every %d us) %s"
+                           % ("a head %s, then " % (warm_text(plan[2], plan[0], plan[1]),) if plan else "", seconds,
+                              spit, STOCK_PERIOD_US, where))
 
     cmd_POLYDYE_CLEAN_help = ("Clean the nozzles over the wipe sponge: a WARM s (prewarm_seconds) warm-up, SECONDS "
                               "(clean_seconds, 1.5) of the stock pattern, then POLYDYE_WIPE's strokes (STROKES), then "
@@ -2688,6 +2721,8 @@ class PolyDye:
           the pass travels on from there (a short way, so the head stays hot).
         - `sponge` or a bed spot: up by POLYDYE_WIPE's z_hop (within the Z axis), then over the wipe sponge
           (POLYDYE_WIPE's X) or the spot; _back_from_warm_spot() brings it back.
+        - ('part', X, Y) (POLYDYE_PASS WARM_X, WARM_Y): over that bed spot of printed plastic at the current height
+          (an ink block's, --gap over the layer), and the pass travels on from there.
         `position` overrides warm_position. Returns (where to come back to for _back_from_warm_spot(), None for `pass`;
         a description for messages). If the move fails, the G-code state is put back and the error raised: nothing has
         fired."""
@@ -2696,6 +2731,15 @@ class PolyDye:
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
         th = toolhead.get_status(eventtime)
+        if isinstance(position, tuple) and position[:1] == ('part',):
+            gcode_move = self.printer.lookup_object('gcode_move')
+            base = gcode_move.base_position
+            pos = list(gcode_move.last_position)
+            pos[0], pos[1] = position[1] - self.offset_x + base[0], position[2] - self.offset_y + base[1]
+            gcode_move.move_with_transform(pos, self.travel_speed)
+            gcode_move.reset_last_position()
+            toolhead.wait_moves()
+            return None, "with the cartridge over the part at X=%.1f Y=%.1f" % position[1:]
         if position == 'pass':
             a = 0 if self.pass_axis == 'x' else 1
             lo, hi = (th['axis_minimum'].x, th['axis_maximum'].x) if a == 0 else (th['axis_minimum'].y,
@@ -3592,16 +3636,20 @@ class PolyDye:
         # A test's settings not put back yet: now, if the board is idle with live ink off. The job's heater cap follows
         # the fire gap.
         self._finish_restore(gcmd, cmd)
-        # The G-code's bursts and primes: refused now rather than in the middle of the print.
-        if header['prewarms'] and self.prewarm_cmd is None:
-            raise gcmd.error("%s: the job's prewarm bursts (POLYDYE_PREWARM) need newer PolyDye board firmware; update "
-                             "it from the PolyDye page (Board firmware: Update to bundled firmware)" % (cmd,))
+        # The G-code's bursts, warm-ups and primes: refused now rather than in the middle of the print.
         if header['prewarms']:
-            seconds, period = header['prewarm_s'] or self.prewarm_seconds, self.warm_period_us
+            raise gcmd.error("%s: the job's G-code has prewarm bursts (POLYDYE_PREWARM, from an older "
+                             "polydye_post.py), which fire wherever the cartridge is, over the glass bed too: slice it "
+                             "again with this add-on's polydye_post.py, whose warm-ups run over the part" % (cmd,))
+        if header['warms']:
+            if self.spit_run_cmd is None:
+                raise gcmd.error("%s: the job's warm-ups need newer PolyDye board firmware; update it from the PolyDye "
+                                 "page (Board firmware: Update to bundled firmware)" % (cmd,))
+            seconds, period = header['warm_s'], self.warm_period_us
             longest = min(self.warm_max_s, WARM_MAX_COLUMNS * period / 1e6)
-            if seconds > self.warm_max_s or warm_columns(seconds, period, self.warm_max_s) > WARM_MAX_COLUMNS:
-                raise gcmd.error("%s: the job's prewarm bursts are %g s, longer than the board takes at "
-                                 "warm_period_us %d (%.1f s): slice again with --prewarm %g or less"
+            if seconds > self.warm_max_s + 1e-9 or warm_columns(seconds, period, self.warm_max_s) > WARM_MAX_COLUMNS:
+                raise gcmd.error("%s: the job's warm-ups are up to %g s, longer than the board takes at warm_period_us "
+                                 "%d (%.1f s): slice again with --prewarm %g or less"
                                  % (cmd, seconds, period, longest, math.floor(longest * 10) / 10))
         if header['firmware_retract'] and self.printer.lookup_object('firmware_retraction', None) is None:
             raise gcmd.error("%s: the job's ink blocks retract with G10 and G11 (--retract firmware), but there's no "
@@ -3638,7 +3686,7 @@ class PolyDye:
                                                                 stopping),
                                ahead, JOB_AHEAD_PASSES, self._skew(), stopping, heater_slot(gap))
         self.job = {'streamer': streamer, 'header': header, 'records': records, 'from_print': from_print,
-                    'path': path, 'since_wait': 0}
+                    'path': path, 'since_wait': 0, 'warm_carry': None}
         streamer.start()
         size = sum(rec['size'] for rec in records)
         logging.info("polydye: ink job %s: %d passes on %d layers, up to %d kB; %d kB ahead; fire gap %d words", path,
@@ -3649,7 +3697,8 @@ class PolyDye:
     def _check_job(self, gcmd, cmd, header, records):
         """Refuses, before anything moves, a job sliced for other settings, one the colour registration would move off
         the nozzles, or one that would take the toolhead beyond the axis limits (each pass's run-up at the acceleration
-        the G-code sets for the ink, or JOB_REACH_ACCEL if it sets none; the ink blocks' height). Notes each pass's
+        the G-code sets for the ink, or JOB_REACH_ACCEL if it sets none; its warm-ups' spots; the ink blocks'
+        height). Notes each pass's
         size on the board (at most: its colours spread by the registration and skew) as its 'size'."""
         if header['pass_axis'] != 'y':
             raise gcmd.error("%s: the job is drawn for pass_axis %s" % (cmd, header['pass_axis']))
@@ -3702,6 +3751,12 @@ class PolyDye:
                                      "beyond the axis limits: move the model on the plate and slice again (the "
                                      "cartridge inks offset_x %.1f, offset_y %.1f mm from the nozzle)"
                                      % (cmd, rec['layer'], rec['x'], first, px, py, self.offset_x, self.offset_y))
+            if rec['warm_x'] is not None:
+                px, py = rec['warm_x'] - self.offset_x + base[0], rec['warm_y'] - self.offset_y + base[1]
+                if not ((high.x <= low.x or low.x <= px <= high.x) and (high.y <= low.y or low.y <= py <= high.y)):
+                    raise gcmd.error("%s: layer %d's warm-up over X=%.1f Y=%.1f would take the toolhead to X=%.1f "
+                                     "Y=%.1f, beyond the axis limits: move the model on the plate and slice again"
+                                     % (cmd, rec['layer'], rec['warm_x'], rec['warm_y'], px, py))
 
     cmd_POLYDYE_JOB_PASS_help = ("Print pass N of the PolyDye ink job (POLYDYE_JOB) with POLYDYE_PASS, once it's on "
                                  "the board")
@@ -3714,18 +3769,33 @@ class PolyDye:
         records, streamer = job['records'], job['streamer']
         n = gcmd.get_int('N', minval=0, maxval=len(records) - 1)
         rec = records[n]
+        # An ink layer's first pass has its warm-up (polydye_post.py's: its seconds, 0 if the head is still hot, and
+        # where): it replaces the automatic one, so a head the job counts as hot isn't warmed at the sponge again.
+        warm, spot = rec['warm'], None
         if rec['object'] != '-' and rec['object'].upper() in self._excluded_objects():
+            if warm is not None:
+                # The layer's next pass warms instead, at warm_position: this pass's spot is the excluded object's.
+                job['warm_carry'] = (rec['layer'], warm)
             streamer.consume(n, skipped=True)
             gcmd.respond_info("PolyDye: pass %d skipped: object %s is excluded" % (n, rec['object']))
             return
-        # One board pass, or two where its fire lines are printed apart (job_pass_parts()), over the same ground.
-        for number, columns, first in self._wait_job_pass(gcmd, cmd, streamer, n):
+        carry, job['warm_carry'] = job['warm_carry'], None
+        if warm is None and carry is not None and carry[0] == rec['layer']:
+            warm = carry[1]
+        elif warm and rec['warm_x'] is not None:
+            spot = (rec['warm_x'], rec['warm_y'])
+        # One board pass, or two where its fire lines are printed apart (job_pass_parts()), over the same ground; the
+        # warm-up before the first.
+        for k, (number, columns, first) in enumerate(self._wait_job_pass(gcmd, cmd, streamer, n)):
             if job['since_wait'] >= JOB_WAIT_EVERY:
                 self.printer.lookup_object('toolhead').wait_moves()  # the board queues at most 8 passes
                 job['since_wait'] = 0
+            extra = ""
+            if k == 0 and warm is not None:
+                extra = " WARM=%g%s" % (warm, " WARM_X=%.4f WARM_Y=%.4f" % spot if spot else "")
             self.printer.lookup_object('gcode').run_script_from_command(
-                "POLYDYE_PASS LAYER=%d PASS=%d X=%.4f Y=%.5f DIR=%d" % (rec['layer'], number, rec['x'],
-                                                                       rec['y'] + first * 25.4 / self.dpi, rec['dir']))
+                "POLYDYE_PASS LAYER=%d PASS=%d X=%.4f Y=%.5f DIR=%d%s" % (
+                    rec['layer'], number, rec['x'], rec['y'] + first * 25.4 / self.dpi, rec['dir'], extra))
             job['since_wait'] += 1
         # On the board until it has printed: it still counts against the room for the passes ahead.
         streamer.consume(n, until=self.printer.lookup_object('toolhead').get_last_move_time())
