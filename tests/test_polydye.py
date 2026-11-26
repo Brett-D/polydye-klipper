@@ -1719,6 +1719,11 @@ class Prime(unittest.TestCase):
         pd.last_heat = None
         pd.cmd_POLYDYE_PRIME(self.gcmd(WARM=1.))
         self.assertEqual(pd.last_heat, 100.)
+        # A layer's warm-up handed on by its excluded first pass (POLYDYE_JOB_PASS) comes first in a prime before the
+        # next pass, as JOB_WARM=1 would: a prime on a cold head doesn't eject. The pass after it then has none.
+        pd.job['warm_carry'], pd.last_fire, pd.last_heat = 3, 90., 90.
+        pd.cmd_POLYDYE_PRIME(self.gcmd())
+        self.assertEqual((runs[-1][5], pd.job['warm_carry']), (polydye.warm_columns(.8, 254, 10.), None))
 
     def test_refused_before_anything_moves_or_fires(self):
         pd, board, runs, moves = self.prime()

@@ -427,10 +427,11 @@ ink, one object at a time.
   passes, and before any layer using a colour that hasn't ejected for `--prime-idle` s (90) by the print time
   estimated here (the moves timed as Klipper plans them; within 3 % of Orca's estimate; see "Priming"); when it's
   before the layer's first pass, the warm-up goes with it at the sponge (`POLYDYE_PRIME JOB_WARM=1`: a cold head
-  doesn't eject). Before, a `POLYDYE_PREWARM` burst ran during each layer's last 6 s of plastic, with the cartridge
-  wherever it was: on the owl (an ink layer every 17 s, so the head never cooled) it left a patch of ink on the glass
-  where the cartridge hangs, about 65 mm right of the part, and a streak on the way to the first pass. `POLYDYE_JOB`
-  refuses jobs sliced that way.
+  doesn't eject), and so does a prime that comes after the layer's first pass was skipped (its object cancelled).
+  Before, a `POLYDYE_PREWARM` burst ran during each layer's last 6 s of plastic, with the cartridge wherever it was:
+  on the owl (an ink layer every 17 s, so the head never cooled) it left a patch of ink on the glass where the
+  cartridge hangs, about 65 mm right of the part, and a streak on the way to the first pass. `POLYDYE_JOB` refuses
+  jobs sliced that way.
 - **The job:** the passes' nozzle data goes into the G-code too, compressed, after the print and before the slicer's
   config block. `POLYDYE_JOB` at the start of the print has the add-on read it from the print's own file and upload
   the passes to the board as the print runs, a few MB ahead, each deleted once printed; `POLYDYE_JOB_PASS N=` prints

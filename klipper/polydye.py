@@ -2662,6 +2662,10 @@ class PolyDye:
         if job_warm and (self.job is None or not self.job['header']['warms']):
             raise gcmd.error("%s: JOB_WARM=1 warms as an ink job says, but none with warm-ups is loaded (POLYDYE_JOB)"
                              % (cmd,))
+        # An ink layer's warm-up still to come (its first pass was an excluded object's: POLYDYE_JOB_PASS hands it on)
+        # comes first, here: a prime on a cold head doesn't eject.
+        if self.job is not None and self.job.get('warm_carry') is not None:
+            job_warm, self.job['warm_carry'] = 1, None
         if warm > self.warm_max_s + 1e-9:
             raise gcmd.error("%s: a %g s warm-up is longer than the board takes (%g s)" % (cmd, warm, self.warm_max_s))
         if warm:
