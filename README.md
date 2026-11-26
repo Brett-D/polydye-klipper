@@ -413,24 +413,24 @@ ink, one object at a time.
   job.
 - **Warm-up and prime, never over the glass bed:** the head only ejects when hot, so each ink layer's first pass warms
   it first (the job marks it), standing still with the cartridge over the layer's own plastic, and only as long as the
-  head has cooled. The add-on works that out as it prints, from when the head really last fired (so a pause, or the
-  layers of a cancelled object, count): none if it fired `--prewarm-hot` s (5) or less before, all of `--prewarm` s
-  (6) after `--prewarm-cold` s (30: it's cold in under 30 s), in proportion between (2 s on the owl's 17 s layers);
-  the job carries the three. The spot is where every nozzle the warm-up fires (positions 0–111, 9.4 mm across, and
-  2.2 mm either way along the pass: the colour rows, and the cartridge's yaw as far as `nozzle_skew` goes) lies
-  `--edge-margin` plus `--warm-margin` (1 mm, for the
-  offset's error) inside both this layer's plastic and the next layer's, so whatever lands is inside the part, and over
-  plastic laid down so far, so a drop through a gap in sparse infill lands on plastic below (a part with no solid
-  bottom gets none); the one nearest the first pass. Where there's no such place (a small or thin layer, the top
-  layer) it warms at the add-on's `warm_position`, the wipe sponge by default. A layer whose head is still hot gets
-  `WARM=0`, so the add-on's automatic warm-up doesn't add one at the sponge either. `POLYDYE_PRIME` comes before the
-  first ink layer's passes, and before any layer using a colour that hasn't ejected for `--prime-idle` s (90) by the
-  print time estimated here (the moves timed as Klipper plans them; within 3 % of Orca's estimate; see "Priming");
-  when it's before the layer's first pass, the warm-up goes with it at the sponge (`POLYDYE_PRIME JOB_WARM=1`: a cold
-  head doesn't eject). Before, a `POLYDYE_PREWARM` burst ran
-  during each layer's last 6 s of plastic, with the cartridge wherever it was: on the owl (an ink layer every 17 s, so
-  the head never cooled) it left a patch of ink on the glass where the cartridge hangs, about 65 mm right of the part,
-  and a streak on the way to the first pass. `POLYDYE_JOB` refuses jobs sliced that way.
+  head has cooled. The add-on works that out as it prints, from when a pass or a warm-up last heated the head (a
+  prime's short spit alone hardly does; a pause, or the layers of a cancelled object, count): none if it fired
+  `--prewarm-hot` s (5) or less before, all of `--prewarm` s (6) after `--prewarm-cold` s (30: it's cold in under 30
+  s), in proportion between (2 s on the owl's 17 s layers); the job carries the three. The spot is where every nozzle
+  the warm-up fires (positions 0–111, 9.4 mm across, and 2.2 mm either way along the pass: the colour rows, and the
+  cartridge's yaw as far as `nozzle_skew` goes) lies `--edge-margin` plus `--warm-margin` (1 mm, for the offset's
+  error) inside both this layer's plastic and the next layer's, so whatever lands is inside the part, and over plastic
+  laid down so far, so a drop through a gap in sparse infill lands on plastic below (a part with no solid bottom gets
+  none); the one nearest the first pass. Where there's no such place (a small or thin layer, the top layer) it warms
+  at the add-on's `warm_position`, the wipe sponge by default. A layer whose head is still hot gets `WARM=0`, so the
+  add-on's automatic warm-up doesn't add one at the sponge either. `POLYDYE_PRIME` comes before the first ink layer's
+  passes, and before any layer using a colour that hasn't ejected for `--prime-idle` s (90) by the print time
+  estimated here (the moves timed as Klipper plans them; within 3 % of Orca's estimate; see "Priming"); when it's
+  before the layer's first pass, the warm-up goes with it at the sponge (`POLYDYE_PRIME JOB_WARM=1`: a cold head
+  doesn't eject). Before, a `POLYDYE_PREWARM` burst ran during each layer's last 6 s of plastic, with the cartridge
+  wherever it was: on the owl (an ink layer every 17 s, so the head never cooled) it left a patch of ink on the glass
+  where the cartridge hangs, about 65 mm right of the part, and a streak on the way to the first pass. `POLYDYE_JOB`
+  refuses jobs sliced that way.
 - **The job:** the passes' nozzle data goes into the G-code too, compressed, after the print and before the slicer's
   config block. `POLYDYE_JOB` at the start of the print has the add-on read it from the print's own file and upload
   the passes to the board as the print runs, a few MB ahead, each deleted once printed; `POLYDYE_JOB_PASS N=` prints

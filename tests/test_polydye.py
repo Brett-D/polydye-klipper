@@ -32,7 +32,7 @@ def bare_polydye():
     pd.prewarm_seconds, pd.prewarm_gen, pd.prime_seconds = polydye.AUTO_PREWARM_S, 0, polydye.PRIME_S
     pd.clean_seconds = polydye.CLEAN_S
     pd.set_fire_gap_cmd = pd.query_fire_gap_cmd = pd.fire_gap_max = pd.restore_pending = None
-    pd.last_status = {}
+    pd.last_status, pd.last_heat = {}, None
     return pd
 
 
@@ -1704,10 +1704,15 @@ class Prime(unittest.TestCase):
         pd.job = {'header': {'warms': 2, 'prewarm': 4., 'prewarm_hot': 5., 'prewarm_cold': 30.}}
         for last, columns in ((None, polydye.warm_columns(4., 254, 10.)), (90., polydye.warm_columns(.8, 254, 10.)),
                               (97., 0)):
-            pd.last_fire = last
+            pd.last_fire = pd.last_heat = last
             pd.cmd_POLYDYE_PRIME(self.gcmd(JOB_WARM=1))
             self.assertEqual(runs[-1][5], columns)
         self.assertEqual(len(runs), 4)
+        # A prime with a warm-up heats the head; one without only fires it.
+        self.assertEqual((pd.last_fire, pd.last_heat), (100., 97.))
+        pd.last_heat = None
+        pd.cmd_POLYDYE_PRIME(self.gcmd(WARM=1.))
+        self.assertEqual(pd.last_heat, 100.)
 
     def test_refused_before_anything_moves_or_fires(self):
         pd, board, runs, moves = self.prime()
@@ -3542,10 +3547,11 @@ class InkJobs(unittest.TestCase):
         pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
         self.wait_for(lambda: len(self.puts()) == 6)
 
-        def run(idle):  # the job's passes 0-5; the head last fired `idle` s before each layer (None: not yet)
+        def run(idle, fired=None):  # the job's passes 0-5; the head last heated `idle` s before each (None: not yet)
             del board.sent[:]
             for n in range(6):
-                pd.last_fire = None if idle is None else 100. - idle
+                pd.last_heat = None if idle is None else 100. - idle
+                pd.last_fire = pd.last_heat if fired is None else 100. - fired
                 pd.cmd_POLYDYE_JOB_PASS(self.gcmd(N=n))
             return [(s.split(" X=")[0], re.sub(r"^-?1", "", s.split(" DIR=")[1]))
                     for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_PASS")]
@@ -3563,6 +3569,9 @@ class InkJobs(unittest.TestCase):
         self.assertEqual(run(17.5), [("POLYDYE_PASS LAYER=0 PASS=0", " WARM=3 WARM_X=118.0000 WARM_Y=99.0000"),
                                      ("POLYDYE_PASS LAYER=0 PASS=1", ""), ("POLYDYE_PASS LAYER=1 PASS=1", " WARM=3"),
                                      ("POLYDYE_PASS LAYER=1 PASS=2", "")])
+        # A prime just before (a spit alone, 1 s ago: the layer's warm-up was the excluded pass's) doesn't count as
+        # heating the head: still 3 s.
+        self.assertEqual(run(17.5, fired=1.)[2], ("POLYDYE_PASS LAYER=1 PASS=1", " WARM=3"))
         pd._stop_job(None)
         # A pass split by fire line: the warm-up before its first half only.
         two = bar(0, 120, 28, 82) + bar(2, 120, 28, 82)

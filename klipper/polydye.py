@@ -1892,6 +1892,9 @@ class PolyDye:
                                    "of the cartridge over printed plastic, off the print) or pass, not %r"
                                    % (position,))
         self.last_fire = None  # print time the head last fired (a live pass, spit test or warm-up); None: not yet
+        # ... last heated: a live pass or a warm-up, not a prime's spit on its own (0.3 s of the stock pattern heats it
+        # a fraction as much as a warm-up), for an ink job's warm-ups (_job_warm())
+        self.last_heat = None
         self.prewarm_cmd = self.query_prewarm_cmd = None  # board firmware with prewarm bursts (POLYDYE_PREWARM)
         self.prewarm_sent = None  # the last burst sent: {'start', 'end'} print times, 'seconds'; None: none yet
         self.prewarm_state = None  # the board's account of it, as last asked (_query_prewarm())
@@ -2235,7 +2238,7 @@ class PolyDye:
         self.mode_cmd.send([self.oid, 0 if self.boost_idle_s is None else 1, 0])
         # Done only once both went out: if one fails, the next poll tries again.
         self.print_live = self.live_off_pending = False
-        self.last_fire = None  # the dropped passes never fired
+        self.last_fire = self.last_heat = None  # the dropped passes never fired
         msg = "PolyDye: the print %s, so its queued passes were dropped and live ink is off" % (
             {'cancelled': "was cancelled", 'error': "stopped with an error",
              'complete': "finished with live ink still on"}.get(state, "ended"),) if ended else (
@@ -2423,7 +2426,7 @@ class PolyDye:
         self.last_pass = {'layer': layer, 'pass': pass_num, 'columns': columns, 'axis': self.pass_axis,
                           'print_time': t_first, 'clock': clock_first, 'period_ticks': period_ticks + frac / 65536.}
         if live:
-            self.last_fire = t_first + spans * period
+            self.last_fire = self.last_heat = t_first + spans * period
         logging.info("polydye: layer %d pass %d: %d columns along %s, first at print_time %.6f (clock %d), "
                      "period %.4f ticks, t0 %.6f, run-up %.4f mm, toolhead first column %.3f,%.3f", layer, pass_num,
                      columns, self.pass_axis, t_first, clock_first, period_ticks + frac / 65536., t0, run_up,
@@ -2479,10 +2482,11 @@ class PolyDye:
             self._query_prewarm()
         return self._warmed_cached(now)
 
-    def _warmed_cached(self, now):
-        """_warmed_until() from the board's last answer, without asking it again (for get_status())."""
+    def _warmed_cached(self, now, last=Ellipsis):
+        """_warmed_until() from the board's last answer, without asking it again (for get_status()); `last` instead of
+        last_fire if given."""
         st = self.prewarm_state
-        last = self.last_fire
+        last = self.last_fire if last is Ellipsis else last
         if st is None or st['state'] not in ('queued', 'firing', 'done', 'made way'):
             return last
         if st['state'] in ('done', 'made way') and not st['columns']:
@@ -2492,10 +2496,15 @@ class PolyDye:
 
     def _job_warm(self, header):
         """The loaded ink job's warm-up (s) for an ink layer (job_warm_seconds()), from how long the head will have
-        been idle when the moves queued so far are done (the earliest the warm-up can start)."""
+        been idle when the moves queued so far are done (the earliest the warm-up can start): since a live pass or a
+        warm-up last heated it (last_heat), or a burst ended. A prime's spit on its own doesn't count: after an
+        excluded object's pass, a prime (no warm-up of its own: the layer's warm-up was on that pass) can come before
+        the pass that warms instead."""
         now = max(self.printer.lookup_object('toolhead').get_last_move_time(),
                   self.mcu.estimated_print_time(self.printer.get_reactor().monotonic()))
-        warmed = self._warmed_until(now)
+        if self.prewarm_sent is not None and self.query_prewarm_cmd is not None:
+            self._query_prewarm()
+        warmed = self._warmed_cached(now, self.last_heat)
         return job_warm_seconds(None if warmed is None else now - warmed, header['prewarm'], header['prewarm_hot'],
                                 header['prewarm_cold'])
 
@@ -2632,6 +2641,8 @@ class PolyDye:
                              % (cmd, what, "warm-up spot and the pass doesn't run" if warm
                                 else "sponge and the passes after it don't run"))
         self.last_fire = self.mcu.estimated_print_time(reactor.monotonic())
+        if columns:
+            self.last_heat = self.last_fire
 
     cmd_POLYDYE_PRIME_help = ("Prime the nozzles over the wipe sponge, for a layer's ink after its colours have been "
                               "idle: a WARM s warm-up if given (a cold head doesn't eject; JOB_WARM=1: as long as the "
@@ -2926,7 +2937,7 @@ class PolyDye:
         self.prewarm_gen += 1  # a POLYDYE_PREWARM whose moves aren't planned yet is cancelled too
         self.cancel_cmd.send([self.oid])
         # The passes dropped never fired, but last_fire counted them: forget it, so the next live pass warms the head.
-        self.last_fire = None
+        self.last_fire = self.last_heat = None
 
     cmd_POLYDYE_STATUS_help = "Report PolyDye board status"
 
