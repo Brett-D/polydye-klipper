@@ -1177,7 +1177,8 @@ def warm_seconds(idle, opts):
         return opts.prewarm
     if idle <= opts.prewarm_hot:
         return 0.
-    return round(opts.prewarm * (idle - opts.prewarm_hot) / (opts.prewarm_cold - opts.prewarm_hot), 1)
+    return min(opts.prewarm, round(opts.prewarm * (idle - opts.prewarm_hot) / (opts.prewarm_cold - opts.prewarm_hot),
+                                   1))
 
 
 def warm_and_prime(lines, layers, plan, config, timing, opts):

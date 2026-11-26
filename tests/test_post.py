@@ -810,6 +810,9 @@ class WarmAndPrime(unittest.TestCase):
         # The add-on's, from the head's real idle time, is the same.
         self.assertEqual([polydye.job_warm_seconds(idle, 6., 5., 30.) for idle in (None, 0., 10., 17.5, 30.)],
                          [6., 0., 1.2, 3., 6.])
+        # Rounded to 0.1 s, but never past --prewarm: the length POLYDYE_JOB checks against the board.
+        self.assertEqual(polydye.job_warm_seconds(29.99, 16.56, 5., 30.), 16.56)
+        self.assertEqual(post.warm_seconds(29.99, post.options(["--prewarm", "15.96", "x.gcode"])), 15.96)
         for bad in (("--prewarm-hot", "10", "--prewarm-cold", "9"), ("--prewarm-hot", "-1"), ("--warm-margin", "-1")):
             with self.assertRaises(SystemExit, msg=bad), contextlib.redirect_stderr(io.StringIO()):
                 post.options(list(bad) + ["x.gcode"])

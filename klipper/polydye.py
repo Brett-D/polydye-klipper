@@ -1340,13 +1340,14 @@ class JobStopped(Exception):
 
 def job_warm_seconds(idle, prewarm, hot, cold):
     """An ink job's warm-up (s) for an ink layer whose head last fired `idle` s before (None: not since Klipper
-    started): none up to `hot`, all of `prewarm` from `cold`, in proportion between, to 0.1 s (polydye_post.py's
-    warm_seconds(), there from the print time it estimates)."""
+    started): none up to `hot`, all of `prewarm` from `cold`, in proportion between, to 0.1 s but never more than
+    `prewarm` (what POLYDYE_JOB checked) (polydye_post.py's warm_seconds(), there from the print time it
+    estimates)."""
     if idle is None or idle >= cold:
         return prewarm
     if idle <= hot:
         return 0.
-    return round(prewarm * (idle - hot) / (cold - hot), 1)
+    return min(prewarm, round(prewarm * (idle - hot) / (cold - hot), 1))
 
 
 def job_find(f):
