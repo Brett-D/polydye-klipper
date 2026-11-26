@@ -32,7 +32,7 @@ def bare_polydye():
     pd.prewarm_seconds, pd.prewarm_gen, pd.prime_seconds = polydye.AUTO_PREWARM_S, 0, polydye.PRIME_S
     pd.clean_seconds = polydye.CLEAN_S
     pd.set_fire_gap_cmd = pd.query_fire_gap_cmd = pd.fire_gap_max = pd.restore_pending = None
-    pd.last_status = {}
+    pd.last_status, pd.last_heat = {}, None
     return pd
 
 
@@ -848,10 +848,16 @@ class TestCleanup(unittest.TestCase):
         self.assertEqual(sent, [('run', 1000, 0, 0, 1000, 2000, 1, 500)])
 
     def test_warm_up_on_its_own(self):
-        board, replies, sent = self.spit(command='cmd_POLYDYE_WARM', SECONDS=5.)
+        pd, board = self.make(fail_on="NOTHING")
+        board, replies, sent = self.spit(pd, board, command='cmd_POLYDYE_WARM', SECONDS=5.)
         self.assertEqual(sent, [('run', 0, 0, 0, 1000, 26042, 2, 192)])
         self.assertIn("warm-up 5.0 s: 26042 all-nozzle columns every 192 us", replies[0])
         self.assertEqual(replies[-1], "PolyDye warm-up done (faults=0)")
+        # It heats the head (an ink job's warm-ups count from it); a spit alone only fires it.
+        self.assertEqual((pd.last_fire, pd.last_heat), (100., 100.))
+        pd.last_heat = None
+        self.spit(pd, board, SECONDS=1., PATTERN='all')
+        self.assertEqual((pd.last_fire, pd.last_heat), (100., None))
         self.assertFalse([s for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_CARTRIDGE")])
         pd, board = self.make(fail_on="NOTHING")
         pd.spit_cmd = types.SimpleNamespace(send=lambda args: board.sent.append('spit'))
@@ -1329,6 +1335,35 @@ class AutoWarm(unittest.TestCase):
             self.warm(pd)
         self.assertEqual((len(runs), pd.last_fire), (1, None))
 
+    def test_a_warm_up_over_the_part(self):
+        # POLYDYE_PASS WARM_X, WARM_Y (polydye_post.py's): the cartridge over that bed spot of the layer's plastic,
+        # straight there at the current height (no hop, no G-code state of its own), warm, and the pass travels on
+        # from there: never over the glass.
+        pd, board, runs, moves = self.make()
+        board.live, pd.last_fire, board.print_time = True, 100., 101.
+        self.warm(pd, warm=1.5, spot=('part', 120., 100.))
+        self.assertEqual(runs, [[0, 0, 0, 0, polydye.SPIT_PERIOD_US, polydye.warm_columns(1.5, 254, 30.), 1, 254]])
+        self.assertEqual((self.travel, moves), ([[120. - 58.6, 100. + 8.7]], []))
+        self.assertIn("a 1.5 s head warm-up was asked for, so a head warm-up", self.said[0])
+        self.assertIn("with the cartridge over the part at X=120.0 Y=100.0", self.said[0])
+        # The pass's WARM_X and WARM_Y go together, with WARM; checked before anything moves.
+        pd.query_pass_cmd = types.SimpleNamespace(send=lambda args: {'present': 1, 'columns': 600, 'cart': 0})
+        pd.spit_run_cmd = types.SimpleNamespace(send=runs.append)
+        for params in (dict(WARM_X=120., WARM_Y=100.), dict(WARM=1., WARM_X=120.), dict(WARM=0., WARM_X=120.,
+                                                                                         WARM_Y=100.)):
+            with self.assertRaisesRegex(RuntimeError, "WARM_X and WARM_Y go together, with WARM"):
+                pd.cmd_POLYDYE_PASS(TestCleanup.gcmd(self, LAYER=0, PASS=0, X=100., Y=40., **params))
+        # A spot beyond the axes (the toolhead 58.6 mm left of the cartridge) is refused before anything moves.
+        th = dict(self.objects['toolhead'].get_status(0.), max_accel=3000., max_velocity=300.,
+                  minimum_cruise_ratio=0.)
+        self.objects['toolhead'].get_status = lambda eventtime: th
+        pd.dpi, pd.pass_speed, pd.extra_run_up, pd.settle_time = 847., 59.5, 1., 0.03
+        with self.assertRaisesRegex(RuntimeError, r"the warm-up over X=40.0 Y=100.0 would take the toolhead to "
+                                                  r"X=-18.6 Y=108.7, beyond the axis limits"):
+            pd.cmd_POLYDYE_PASS(TestCleanup.gcmd(self, LAYER=0, PASS=0, X=100., Y=40., WARM=1., WARM_X=40.,
+                                                 WARM_Y=100.))
+        self.assertEqual((len(runs), len(self.travel), moves), (1, 1, []))
+
     def test_the_sponge_and_a_bed_spot(self):
         pd, board, runs, moves = self.make()
         board.live = True
@@ -1617,7 +1652,8 @@ class Prime(unittest.TestCase):
     def gcmd(self, **params):
         def get(name, default=None, **kw):
             return params.get(name, default)
-        return types.SimpleNamespace(get=get, get_float=get, respond_info=self.said.append, error=RuntimeError)
+        return types.SimpleNamespace(get=get, get_float=get, get_int=get, respond_info=self.said.append,
+                                     error=RuntimeError)
 
     def prime(self, **params):
         pd, board, runs, moves = self.make()
@@ -1649,6 +1685,45 @@ class Prime(unittest.TestCase):
         # SECONDS sets its length; with live ink already on, nothing waits for the boost.
         pd.cmd_POLYDYE_PRIME(self.gcmd(SECONDS=0.1))
         self.assertEqual((runs[-1][1], self.dwells), (197, [0.15]))
+
+    def test_a_cold_layers_prime_warms_the_head_first(self):
+        # POLYDYE_PRIME WARM= (polydye_post.py's, when an ink layer's first pass primes): a cold head doesn't eject, so
+        # the warm-up, then the spit, in one board run over the sponge.
+        pd, board, runs, moves = self.prime()
+        pd.cmd_POLYDYE_PRIME(self.gcmd(WARM=2.))
+        self.assertEqual(runs, [[0, 591, polydye.SPIT_PATTERNS['stock'], 0, 508, polydye.warm_columns(2., 254, 30.), 1,
+                                 254]])
+        self.assertIn("priming, a head warm-up", self.said[0])
+        self.assertIn("then 0.3 s of the stock pattern (591 columns every 508 us) over the wipe sponge", self.said[0])
+        self.assertEqual(moves[3], "G90\nG1 Z1.300 F900\nG1 X245.000 F9000")
+        # Longer than the board takes: refused before anything moves.
+        pd.warm_max_s = 10.
+        with self.assertRaisesRegex(RuntimeError, "POLYDYE_PRIME: a 12 s warm-up is longer than the board takes"):
+            pd.cmd_POLYDYE_PRIME(self.gcmd(WARM=12.))
+        self.assertEqual(len(runs), 1)
+        # JOB_WARM=1 (an ink job's prime): as long as the job's settings say for how long the head has really been
+        # idle once the moves and passes before it are done (print time 100): cold, all 4 s; idle 10 s, 0.8 s; idle
+        # 3 s, none.
+        with self.assertRaisesRegex(RuntimeError, "JOB_WARM=1 warms as an ink job says, but none with warm-ups is "
+                                                  "loaded"):
+            pd.cmd_POLYDYE_PRIME(self.gcmd(JOB_WARM=1))
+        pd.job = {'header': {'warms': 2, 'prewarm': 4., 'prewarm_hot': 5., 'prewarm_cold': 30.}}
+        for last, columns in ((None, polydye.warm_columns(4., 254, 10.)), (90., polydye.warm_columns(.8, 254, 10.)),
+                              (97., 0)):
+            pd.last_fire = pd.last_heat = last
+            pd.cmd_POLYDYE_PRIME(self.gcmd(JOB_WARM=1))
+            self.assertEqual(runs[-1][5], columns)
+        self.assertEqual(len(runs), 4)
+        # A prime with a warm-up heats the head; one without only fires it.
+        self.assertEqual((pd.last_fire, pd.last_heat), (100., 97.))
+        pd.last_heat = None
+        pd.cmd_POLYDYE_PRIME(self.gcmd(WARM=1.))
+        self.assertEqual(pd.last_heat, 100.)
+        # A layer's warm-up handed on by its excluded first pass (POLYDYE_JOB_PASS) comes first in a prime before the
+        # next pass, as JOB_WARM=1 would: a prime on a cold head doesn't eject. The pass after it then has none.
+        pd.job['warm_carry'], pd.last_fire, pd.last_heat = 3, 90., 90.
+        pd.cmd_POLYDYE_PRIME(self.gcmd())
+        self.assertEqual((runs[-1][5], pd.job['warm_carry']), (polydye.warm_columns(.8, 254, 10.), None))
 
     def test_refused_before_anything_moves_or_fires(self):
         pd, board, runs, moves = self.prime()
@@ -3043,19 +3118,24 @@ def job_planes(dots, columns):
 
 
 def write_job(path, passes, dpi=847., nozzle_dpi=300., positions=(16, 83), layers=2, prewarms=0, primes=0,
-              ink_accel=0., ink_z=0., prewarm_s=0., firmware_retract=False):
-    """A G-code file with polydye_post.py's job of `passes`: (layer, pass, object, x, y, dir, columns, dots)."""
+              ink_accel=0., ink_z=0., prewarm_s=0., firmware_retract=False, warms=0, policy=(6., 5., 30.),
+              warm=None):
+    """A G-code file with polydye_post.py's job of `passes`: (layer, pass, object, x, y, dir, columns, dots); `warm`
+    marks the passes their ink layer's warm-up comes first on: {pass index: its spot, bed (x, y), or None}; `policy`
+    how long (prewarm, prewarm_hot, prewarm_cold)."""
     ink = []
     for n, (layer, number, obj, x, y, direction, columns, dots) in enumerate(passes):
         colours, data = job_planes(dots, columns)
         p = polydye_post.InkPass(layer, 1, obj, x, y, columns, colours, zlib.compress(data))
         p.n, p.number, p.dir = n, number, direction
+        if warm and n in warm:
+            p.warmup, p.warm_spot = True, warm[n]
         ink.append(p)
     opts = types.SimpleNamespace(dpi=dpi, nozzle_dpi=nozzle_dpi, positions=positions, firmware_retract=firmware_retract)
     with open(path, "w") as f:
         f.write("; generated by OrcaSlicer\nPOLYDYE_JOB\nG1 X10 Y10\n; EXECUTABLE_BLOCK_END\n\n")
         f.writelines(line + "\n" for line in polydye_post.job_block(ink, opts, layers, prewarms, primes, ink_accel,
-                                                                    ink_z, prewarm_s))
+                                                                    ink_z, prewarm_s, warms, policy))
         f.write("\n; CONFIG_BLOCK_START\n; filament_colour = #FFFFFF;#FF00FF\n; CONFIG_BLOCK_END\n")
 
 
@@ -3308,8 +3388,26 @@ class InkJobData(unittest.TestCase):
                                                      'colours')},
                          {'n': 0, 'layer': 0, 'pass': 0, 'object': '-', 'dir': 1, 'x': 100., 'y': 100., 'columns': 4,
                           'colours': 'm'})
+        # An ink layer's warm-up on its first pass: where, and the settings for how long.
+        write_job(path, [(0, 0, '-', 100., 100., 1, 4, bar(1, 4, 40, 41))], warms=1, policy=(4., 2., 20.),
+                  warm={0: (110., 99.)})
+        header, records = polydye.job_load(path)
+        self.assertEqual((header['version'], header['warms'], header['prewarm'], header['prewarm_hot'],
+                          header['prewarm_cold']), (4, 1, 4., 2., 20.))
+        self.assertEqual((records[0]['warmup'], records[0]['warm_x'], records[0]['warm_y']), (True, 110., 99.))
         text = open(path).read()
-        for broken, error in ((text.replace("version=2", "version=4"), "version 4, this add-on reads version 3 or "
+        for broken, error in ((text.replace(" warmup=1", ""), "pass 0 is malformed"),
+                              (text.replace(" warm_y=99.000", ""), "pass 0 is malformed"),
+                              (text.replace(" prewarm_hot=2 ", " prewarm_hot=25 "), "warm-up settings are malformed")):
+            with open(path, "w") as f:
+                f.write(broken)
+            with self.assertRaisesRegex(polydye.JobError, error):
+                polydye.job_load(path)
+        write_job(path, [(0, 0, '-', 100., 100., 1, 4, bar(1, 4, 40, 41))])
+        header, records = polydye.job_load(path)
+        self.assertEqual((records[0]['warmup'], records[0]['warm_x'], header['warms']), (False, None, 0))
+        text = open(path).read()
+        for broken, error in ((text.replace("version=2", "version=5"), "version 5, this add-on reads version 4 or "
                                                                        "older"),
                               (text.replace("passes=1", "passes=2"), "says 2 passes but has 1"),
                               (text.replace("positions=16-83", "positions=10-83"), "beyond the 14-85"),
@@ -3449,6 +3547,52 @@ class InkJobs(unittest.TestCase):
                          [(0, 2), (1, 0)])
         pd.cmd_POLYDYE_JOB_END(self.gcmd())
         self.assertEqual(self.said[-1], "PolyDye ink job done: 4 of 6 passes printed, 2 skipped (objects excluded)")
+
+    def test_an_ink_layers_warm_up_goes_with_its_first_pass(self):
+        # polydye_post.py marks each ink layer's first pass (with a spot over the part if it found one): its warm-up
+        # comes first, on its first board pass only, as long as the job's settings (6 s, hot up to 5 s, cold from 30 s)
+        # say for how long the head has really been idle when the pass can start (the moves queued done at print time
+        # 100 here); it replaces the automatic warm-up. The other passes get the automatic one.
+        pd, board = self.make(warms=2, warm={0: (118., 99.), 3: (140., 101.)})
+        pd.spit_run_cmd = object()
+        pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
+        self.wait_for(lambda: len(self.puts()) == 6)
+
+        def run(idle, fired=None):  # the job's passes 0-5; the head last heated `idle` s before each (None: not yet)
+            del board.sent[:]
+            for n in range(6):
+                pd.last_heat = None if idle is None else 100. - idle
+                pd.last_fire = pd.last_heat if fired is None else 100. - fired
+                pd.cmd_POLYDYE_JOB_PASS(self.gcmd(N=n))
+            return [(s.split(" X=")[0], re.sub(r"^-?1", "", s.split(" DIR=")[1]))
+                    for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_PASS")]
+        layer0 = ("POLYDYE_PASS LAYER=0 PASS=0", " WARM=6 WARM_X=118.0000 WARM_Y=99.0000")
+        self.assertEqual(run(None), [layer0, ("POLYDYE_PASS LAYER=0 PASS=1", ""), ("POLYDYE_PASS LAYER=0 PASS=2", ""),
+                                     ("POLYDYE_PASS LAYER=1 PASS=0", " WARM=6 WARM_X=140.0000 WARM_Y=101.0000"),
+                                     ("POLYDYE_PASS LAYER=1 PASS=1", ""), ("POLYDYE_PASS LAYER=1 PASS=2", "")])
+        # Idle 17.5 s: 3 s. Idle 3 s, still hot: WARM=0, so not the automatic warm-up at the sponge either. A pause,
+        # or the layers of an excluded object, make the real idle time longer than the job reckoned: it warms for it.
+        self.assertEqual(run(17.5)[3], ("POLYDYE_PASS LAYER=1 PASS=0", " WARM=3 WARM_X=140.0000 WARM_Y=101.0000"))
+        self.assertEqual(run(3.)[3], ("POLYDYE_PASS LAYER=1 PASS=0", " WARM=0"))
+        # Layer 1's first pass is the excluded object B's: the layer's next pass warms instead, at warm_position (B's
+        # plastic isn't printed). Layer 0's object A prints on.
+        self.excluded = ['B']
+        self.assertEqual(run(17.5), [("POLYDYE_PASS LAYER=0 PASS=0", " WARM=3 WARM_X=118.0000 WARM_Y=99.0000"),
+                                     ("POLYDYE_PASS LAYER=0 PASS=1", ""), ("POLYDYE_PASS LAYER=1 PASS=1", " WARM=3"),
+                                     ("POLYDYE_PASS LAYER=1 PASS=2", "")])
+        # A prime just before (a spit alone, 1 s ago: the layer's warm-up was the excluded pass's) doesn't count as
+        # heating the head: still 3 s.
+        self.assertEqual(run(17.5, fired=1.)[2], ("POLYDYE_PASS LAYER=1 PASS=1", " WARM=3"))
+        pd._stop_job(None)
+        # A pass split by fire line: the warm-up before its first half only.
+        two = bar(0, 120, 28, 82) + bar(2, 120, 28, 82)
+        pd, board = self.make([(0, 0, 'A', 125., 100., 1, 120, two)], warms=1, warm={0: None})
+        pd.spit_run_cmd = object()
+        pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
+        self.wait_for(lambda: len(self.puts()) == 2)
+        pd.cmd_POLYDYE_JOB_PASS(self.gcmd(N=0))
+        script = [s for s in board.sent if isinstance(s, str) and s.startswith("POLYDYE_PASS")]
+        self.assertEqual([re.sub(r"^-?1", "", s.split(" DIR=")[1]) for s in script], [" WARM=6", ""])
 
     def test_a_split_pass_prints_as_two_and_is_deleted_as_two(self):
         # Pass 1 (cyan and yellow, positions 28-55 and 56-82) goes to the board as passes 1 and 1 | SPLIT_PASS, and
@@ -3668,10 +3812,10 @@ class InkJobs(unittest.TestCase):
         pd.cmd_POLYDYE_JOB_PASS(self.gcmd(N=0))
         self.assertIn("PolyDye: pass 0 skipped: object pièce_id_0_copy_0 is excluded", self.said)
         pd._stop_job(None)
-        # Bursts longer than the board takes at warm_period_us 200 (65535 columns: 13.1 s) are refused at the start.
-        pd, board = self.make(prewarms=3, prewarm_s=16.)
-        pd.prewarm_cmd, pd.warm_period_us, pd.warm_max_s = object(), 200, 30.
-        with self.assertRaisesRegex(RuntimeError, r"the job's prewarm bursts are 16 s, longer than the board takes at "
+        # Warm-ups longer than the board takes at warm_period_us 200 (65535 columns: 13.1 s) are refused at the start.
+        pd, board = self.make(warms=3, policy=(16., 5., 30.))
+        pd.spit_run_cmd, pd.warm_period_us, pd.warm_max_s = object(), 200, 30.
+        with self.assertRaisesRegex(RuntimeError, r"the job's warm-ups are up to 16 s, longer than the board takes at "
                                                   r"warm_period_us 200 \(13.1 s\): slice again with --prewarm 13.1"):
             pd.cmd_POLYDYE_JOB(self.gcmd(FILE=self.path))
         self.assertEqual(self.frames, [])
@@ -3700,7 +3844,31 @@ class InkJobs(unittest.TestCase):
                 (None, dict(ink_accel=10.), None, r"layer 0's ink at X=120.0 .* beyond the axis limits"),
                 (None, dict(ink_z=250.5), None, r"the ink goes up to Z=250.50 \(the job's --gap above the layer\), "
                                                r"beyond the Z axis maximum"),
-                (None, dict(prewarms=3), None, r"prewarm bursts \(POLYDYE_PREWARM\) need newer PolyDye board"),
+                # An older polydye_post.py's bursts fire wherever the cartridge is: over the glass bed too.
+                (None, dict(prewarms=3, prewarm_s=6.), lambda pd: setattr(pd, 'prewarm_cmd', object()),
+                 r"the job's G-code has prewarm bursts \(POLYDYE_PREWARM, from an older polydye_post.py\), which fire "
+                 r"wherever the cartridge is, over the glass bed too: slice it again"),
+                (None, dict(warms=1), None, "the job's warm-ups need newer PolyDye board firmware"),
+                # Checked as they'll run: polydye.cfg's pulse on this (older) board firmware, and warm_position (the
+                # sponge, needed even with the automatic warm-up off, or a bed spot within reach).
+                (None, dict(warms=1), lambda pd: (setattr(pd, 'spit_run_cmd', object()), setattr(pd, 'warm_pulse', 8),
+                                                  setattr(pd, 'warm_period_us', 508)),
+                 r"the job's warm-ups \(polydye.cfg's warm_pulse and warm_period_us\): WARM_PULSE=8 \(2.80 us\) needs "
+                 r"newer PolyDye board firmware"),
+                (None, dict(warms=1), lambda pd: (setattr(pd, 'spit_run_cmd', object()),
+                                                  setattr(pd, 'warm_seconds', 0.),
+                                                  setattr(pd, 'warm_position', 'sponge'),
+                                                  self.objects.pop('gcode_macro POLYDYE_WIPE')),
+                 "the job's warm-ups without room over the part run over the wipe sponge, but there's no POLYDYE_WIPE "
+                 "macro"),
+                (None, dict(warms=1), lambda pd: (setattr(pd, 'spit_run_cmd', object()),
+                                                  setattr(pd, 'warm_position', (300., 100.))),
+                 r"warm_position X=300.0 Y=100.0, where the job's warm-ups without room over the part run, would take "
+                 r"the toolhead to X=300.0 Y=100.0, beyond the axis limits"),
+                (None, dict(warms=1, warm={0: (300., 100.)}),
+                 lambda pd: setattr(pd, 'spit_run_cmd', object()),
+                 r"layer 0's warm-up over X=300.0 Y=100.0 would take the toolhead to X=300.0 Y=100.0, beyond the "
+                 r"axis limits"),
                 (None, dict(firmware_retract=True), None, r"the job's ink blocks retract with G10 and G11 \(--retract "
                                                           r"firmware\), but there's no \[firmware_retraction\]"),
                 (None, dict(primes=1), lambda pd: setattr(pd, 'spit_patterns', ('all',)),

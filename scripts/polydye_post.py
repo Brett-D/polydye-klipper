@@ -20,10 +20,12 @@ post-processing script, this then rewrites the G-code:
   ink in, in --wall-coats and --top-coats coats (1), the part fan as the G-code has it (or at --ink-fan, the G-code's
   back for the --dry pause); the trip retracts --retract mm (1.5; firmware: G10 and G11), and can wipe (--wipe) and
   push back more (--refill);
-- the head is hot and its nozzles primed when the ink comes: POLYDYE_PREWARM about --prewarm s (6) of moves before each
-  ink layer's end warms it during the plastic, and POLYDYE_PRIME spits at the wipe sponge before the first ink pass and
-  any pass using a colour that hasn't ejected for --prime-idle s (90), by the print time estimated here (Klipper's
-  planning of the moves);
+- the head is hot and its nozzles primed when the ink comes: each ink layer's first pass warms it first, standing
+  still with the cartridge over the layer's own plastic (never the glass bed), for as long as the head has cooled,
+  which the add-on measures as it prints: none if it fired --prewarm-hot s (5) before, --prewarm s (6) after
+  --prewarm-cold s (30), in proportion between; POLYDYE_PRIME spits at the wipe sponge (warming the head there first
+  when the layer's first pass primes) before the first ink pass and any pass using a colour that hasn't ejected for
+  --prime-idle s (90), by the print time estimated here (Klipper's planning of the moves);
 - the passes' nozzle data goes into the G-code too, as comments after the print; POLYDYE_JOB at the start has the
   PolyDye Klipper add-on stream it to the board while the print runs.
 
@@ -61,8 +63,13 @@ except ImportError:  # reported by main(), so the module still imports for its t
 #   ;PDJ version=1 dpi=847 nozzle_dpi=300 pass_axis=y positions=16-83 passes=N layers=M prewarms=B primes=P
 #        ink_accel=A ink_z=Z prewarm_s=S ...   (the lowest acceleration in force at an ink block, 0 if the G-code
 #        sets none, the highest Z an ink block goes to, and each burst's SECONDS, so POLYDYE_JOB can check them;
-#        retract=firmware, in version 3, when the ink blocks retract with G10 and G11)
+#        retract=firmware, in version 3, when the ink blocks retract with G10 and G11; in version 4 warms=W
+#        prewarm=S prewarm_hot=H prewarm_cold=C: the ink layers that warm first (on their first pass or with its
+#        prime: POLYDYE_PRIME JOB_WARM=1) and how long, as the add-on finds the head's idle time (warm_seconds()); and
+#        prewarms=0: no bursts)
 #   ;PDP n=0 layer=3 pass=0 coat=1 object=NAME dir=1 x=112.3456 y=95.12345 columns=812 colours=cm
+#        [warmup=1 [warm_x=X warm_y=Y]]   (version 4, an ink layer's first pass: the warm-up comes first, over bed
+#        X, Y where nozzle position 50 is, like the pass's x; without X, Y at the add-on's warm_position)
 #   ;PDD <base64>   (one or more: the pass's data, zlib-compressed)
 #   ...
 #   ; POLYDYE_JOB_END
@@ -72,6 +79,7 @@ except ImportError:  # reported by main(), so the module still imports for its t
 # dpi before colour registration. object is the EXCLUDE_OBJECT name the ink belongs to ("-": none).
 JOB_VERSION = 2  # 2: POLYDYE_INK_MOTION in the ink blocks (an older add-on refuses the job before the print starts)
 JOB_VERSION_FIRMWARE_RETRACT = 3  # G10 and G11 in the ink blocks: an older add-on can't check for [firmware_retraction]
+JOB_VERSION_WARM = 4  # warm-ups on the passes and primes (their length the add-on's); no POLYDYE_PREWARM bursts
 COLOR_BYTES = 14
 # The nozzle positions the stock firmware fires (its random pattern's, 14-85); the job draws on DEFAULT_POSITIONS,
 # leaving 2 positions each way for the colour registration across the pass.
@@ -112,7 +120,19 @@ BAYER = bayer(8)
 CHANNEL_SHIFT = ((0, 0), (1, 0), (0, 1))  # (rows, positions) per colour
 # Estimates for the ink between layers (s): its moves up and back, the trip to the sponge and back for a prime, the
 # time from a layer's last extrusion to its first pass's first column (when no prime comes first), and a pass's run-ups.
-INK_MOVES_S, PRIME_TRIP_S, PREWARM_LEAD_S, RUN_UP_MM = 1., 3., 1., 3.
+INK_MOVES_S, PRIME_TRIP_S, RUN_UP_MM = 1., 3., 3.
+# Warm-ups (owl #2, 2026-11-26): a POLYDYE_PREWARM burst during the plastic fires wherever the cartridge is, and on a
+# head that never cooled (an ink layer every ~17 s) its 1-word pulses put ink on the glass bed, where the cartridge
+# hangs ~65 mm right of the part while the nozzle prints, and a streak on the way to the first pass. So an ink layer's
+# warm-up runs standing still, the cartridge over the layer's own plastic, right before its first pass (with its prime
+# at the sponge if that pass primes), as long as the head needs (warm_seconds()). It fires every nozzle: Sprite_tm's
+# colour positions HEAD_POSITIONS (position p lands REF_POSITION - p nozzle pitches along +X from a pass's x), the
+# colour rows within HEAD_ROWS_MM of it along the pass (the cartridge's: Brett's has cyan 1.0 mm, yellow 0.8 mm from
+# magenta), and each position up to SKEW_MAX x |p - REF_POSITION| nozzle pitches further along it, the most
+# nozzle_skew the add-on takes (the cartridge's yaw: 0.03 measured). WARM_STOP_S: a warm-up's stop besides its seconds
+# (the board run starting, the add-on seeing it end). At most PREWARM_MAX_S: 65535 columns at warm_period_us 254.
+HEAD_POSITIONS, HEAD_ROWS_MM, SKEW_MAX = (0, 111), 1.2, 0.2
+WARM_STOP_S = 0.5
 PREWARM_MAX_S = 16.
 # The ink and surface defaults. DEPTH (--depth, mm): on the test tile (2026-11-26) ink 0.3, 0.6 and 1.2 mm deep read
 # the same at 35 %. Still to be set from it: INK_LIMIT (% of each ink a fully coloured filament fires), CYAN_BOOST
@@ -492,6 +512,9 @@ class InkPass:
         self.layer, self.coat, self.obj, self.x, self.y = layer, coat, obj, x, y
         self.columns, self.colours, self.data = columns, colours, data
         self.n = self.number = self.dir = None
+        # An ink layer's first pass: whether its warm-up comes first (warmup), as long as estimated here (warm, s), and
+        # where (warm_spot: bed X, Y; None: the add-on's warm_position).
+        self.warmup, self.warm, self.warm_spot = False, None, None
 
 
 class Support:
@@ -588,6 +611,66 @@ def row_distance(body, sx, cap):
     right = np.minimum.accumulate(np.where(body, np.int32(10 ** 7), col)[:, ::-1], axis=1)[:, ::-1]
     k = np.minimum(col - left, right - col)
     return np.minimum(np.maximum(k - .5, 0.) * sx, cap).astype(np.float32)
+
+
+def erode_span(a, lo, hi, axis):
+    """Cells of `a` with every cell from `lo` before to `hi` after them along `axis` also set (outside `a` counts as
+    unset)."""
+    n = a.shape[axis]
+    pad = [(0, 0), (0, 0)]
+    pad[axis] = (lo + 1, hi)
+    count = np.cumsum(np.pad(~a, pad, constant_values=True).astype(np.int32), axis=axis)
+    hits = np.take(count, np.arange(lo + hi + 1, lo + hi + 1 + n), axis=axis) - np.take(count, np.arange(0, n),
+                                                                                         axis=axis)
+    return hits == 0
+
+
+def layer_body(layer, k, grid, window):
+    """Object k's plastic in `layer` as a solid (fill_body(): its lines, the gaps in its infill filled in) over
+    `window` (rows r0.., columns g0.. of the grid, its shape)."""
+    r0, g0, shape = window
+    mine = [s for s in layer.segs if s[2] == k and s[1] != OTHER]
+    lines, infill = np.zeros(shape, bool), np.zeros(shape, bool)
+    if mine:
+        segs = np.array([s[3:] for s in mine], float)
+        kinds = np.array([s[1] for s in mine])
+        stamp(lines, r0, g0, grid, segs)
+        stamp(infill, r0, g0, grid, segs[np.isin(kinds, (TOP, INFILL))])
+    return fill_body(close(lines), dilate(infill, 1, 1), HOLE_MIN_MM2 / (grid.sx * grid.sy))
+
+
+def warm_spot(layers, layer, k, grid, window, opts, near, cache, below):
+    """Where `layer`'s warm-up can run: the bed X, Y (a pass's x: where nozzle position REF_POSITION is) nearest `near`
+    with every nozzle it fires (HEAD_POSITIONS; along the pass the colour rows, HEAD_ROWS_MM, and the most yaw the
+    add-on takes, SKEW_MAX) at least --edge-margin plus
+    --warm-margin inside object k's plastic in this layer and in the object's next layer, so whatever lands is inside
+    the part, and over `below` (over `window`: plastic laid down so far, this layer's and the ones under it), so a
+    drop through a gap in sparse infill still lands on plastic, never the glass; None if there's no such place (it
+    then runs at the add-on's warm_position, the wipe sponge by default). `cache` keeps the layers' bodies
+    (layer_body() over `window`)."""
+    later = (other for other in layers[layer.index + 1:] if any(s[2] == k and s[1] != OTHER for s in other.segs))
+    above = next(later, None)
+    if above is None:
+        return None
+    for key in [key for key in cache if key[1] < layer.index]:
+        del cache[key]
+    room = below.copy()
+    for one in (layer, above):
+        if (k, one.index) not in cache:
+            cache[(k, one.index)] = layer_body(one, k, grid, window)
+        room &= cache[(k, one.index)]
+    m = opts.edge_margin + opts.warm_margin + math.hypot(grid.sx, grid.sy) / 2.  # snapped to cells: half a diagonal
+    half_y = HEAD_ROWS_MM + SKEW_MAX * max(REF_POSITION - HEAD_POSITIONS[0], HEAD_POSITIONS[1] - REF_POSITION) * grid.sx
+    mx, my = int(math.ceil(m / grid.sx)), int(math.ceil((half_y + m) / grid.sy))
+    # Positions go towards -X: HEAD_POSITIONS[1] is furthest along -X, [0] along +X.
+    room = erode_span(room, HEAD_POSITIONS[1] - REF_POSITION + mx, REF_POSITION - HEAD_POSITIONS[0] + mx, 1)
+    room = erode_span(room, my, my, 0)
+    rr, gg = np.nonzero(room)
+    if not len(rr):
+        return None
+    xs, ys = grid.x0 + (window[1] + gg) * grid.sx, grid.y0 + (window[0] + rr) * grid.sy
+    i = int(np.argmin((xs - near[0]) ** 2 + (ys - near[1]) ** 2))
+    return float(xs[i]), float(ys[i])
 
 
 class Shell:
@@ -867,12 +950,14 @@ def ink_fan(opts):
     return None if opts.ink_fan is None else int(round(opts.ink_fan * 2.55))
 
 
-def ink_block(layer, passes, opts, inside, primes=()):
+def ink_block(layer, passes, opts, inside, primes=(), prime_warm=None):
     """G-code that inks `passes` after `layer`'s last extrusion and comes back: retracted (--retract mm, or G10 with
     --retract firmware; wiping back along its last line, with --wipe), out of the object it's in (`inside`), up by
     --gap, the part fan at --ink-fan if set, the passes with live ink (a prime at the sponge before each pass whose
-    index is in `primes`), the fan back as the G-code had it, a pause for the ink to dry, back and down, the filament
-    pushed back (the retraction, or G11, plus --refill)."""
+    index is in `primes`, the first warming the head there first if `prime_warm` (the estimated seconds) isn't None,
+    as long as the add-on finds it has cooled; the passes' own warm-ups are in the job), the fan back as the G-code
+    had it, a pause for the ink to dry, back and down, the filament pushed back (the retraction, or G11, plus
+    --refill)."""
     x, y, z = layer.end
     g = ["; PolyDye ink: layer %d (Z %.3f), %d pass%s" % (layer.index, z, len(passes), "" if len(passes) == 1 else
                                                          "es"),
@@ -905,10 +990,21 @@ def ink_block(layer, passes, opts, inside, primes=()):
     g.append("POLYDYE_ENABLE LIVE=%d" % (0 if opts.dry_run else 1))
     for k, p in enumerate(passes):
         if k in primes:
-            g.append("POLYDYE_PRIME ; colours idle %g s or more (or the first ink): primed at the sponge"
-                     % (opts.prime_idle,))
-        g.append("POLYDYE_JOB_PASS N=%d ; layer %d pass %d, coat %d, %s, X=%.3f Y=%.3f DIR=%d" % (
-            p.n, p.layer, p.number, p.coat, p.colours, p.x, p.y, p.dir))
+            warm = prime_warm is not None and k == 0
+            g.append("POLYDYE_PRIME%s ; colours idle %g s or more (or the first ink): %sprimed at the sponge"
+                     % (" JOB_WARM=1" if warm else "", opts.prime_idle,
+                        "the head warmed first as long as it has cooled (about %g s), and " % (prime_warm,)
+                        if warm else ""))
+        if not p.warmup:
+            warm = ""
+        elif k in primes:
+            warm = ", warmed with its prime"
+        else:
+            warm = ", a warm-up first as long as the head has cooled (about %g s), %s" % (
+                p.warm, "over X=%.1f Y=%.1f" % p.warm_spot if p.warm_spot else
+                "at warm_position (no room over the part)")
+        g.append("POLYDYE_JOB_PASS N=%d ; layer %d pass %d, coat %d, %s, X=%.3f Y=%.3f DIR=%d%s" % (
+            p.n, p.layer, p.number, p.coat, p.colours, p.x, p.y, p.dir, warm))
     g += ["M400", "POLYDYE_ENABLE LIVE=0"]
     if fan is not None and fan != was:
         g.append("M106 S%g" % (was,) if was else "M107")  # back for the drying and the print
@@ -927,21 +1023,28 @@ def ink_block(layer, passes, opts, inside, primes=()):
     return g
 
 
-def job_block(passes, opts, layers, prewarms=0, primes=0, ink_accel=0., ink_z=0., prewarm_s=0.):
-    """The job's lines: its index and the passes' data. `prewarms`, `primes` count the G-code's POLYDYE_PREWARM and
-    POLYDYE_PRIME, so POLYDYE_JOB can refuse a board that can't run them before the print starts (`prewarm_s`: each
-    burst's SECONDS); `ink_accel` (0: none set) and `ink_z` let it check the passes' run-ups and the ink blocks' height
-    against the axes."""
+def job_block(passes, opts, layers, prewarms=0, primes=0, ink_accel=0., ink_z=0., prewarm_s=0., warms=0,
+              policy=(0., 0., 0.)):
+    """The job's lines: its index and the passes' data. `prewarms`, `primes` count the G-code's POLYDYE_PREWARM (an
+    older polydye_post.py's) and POLYDYE_PRIME, so POLYDYE_JOB can refuse a board that can't run them before the print
+    starts (`prewarm_s`: each burst's SECONDS), and `warms` the ink layers that warm first, for as long as `policy`
+    (--prewarm, --prewarm-hot, --prewarm-cold) says for the head's idle time; `ink_accel` (0: none set) and `ink_z`
+    let it check the passes' run-ups and the ink blocks' height against the axes. Warm-ups (p.warmup, p.warm_spot)
+    make it version JOB_VERSION_WARM."""
+    warm = any(p.warmup for p in passes) or warms
+    version = (JOB_VERSION_WARM if warm else JOB_VERSION_FIRMWARE_RETRACT if opts.firmware_retract else JOB_VERSION)
     out = ["; POLYDYE_JOB_BEGIN",
            ";PDJ version=%d dpi=%g nozzle_dpi=%g pass_axis=y positions=%d-%d passes=%d layers=%d prewarms=%d primes=%d "
-           "ink_accel=%g ink_z=%.3f prewarm_s=%g%s generator=%s" % (
-               JOB_VERSION_FIRMWARE_RETRACT if opts.firmware_retract else JOB_VERSION, opts.dpi,
-               opts.nozzle_dpi, opts.positions[0], opts.positions[1], len(passes), layers,
-               prewarms, primes, ink_accel, ink_z, prewarm_s, " retract=firmware" if opts.firmware_retract else "",
-               os.path.basename(__file__))]
+           "ink_accel=%g ink_z=%.3f prewarm_s=%g%s%s generator=%s" % (
+               version, opts.dpi, opts.nozzle_dpi, opts.positions[0], opts.positions[1], len(passes), layers,
+               prewarms, primes, ink_accel, ink_z, prewarm_s,
+               " warms=%d prewarm=%g prewarm_hot=%g prewarm_cold=%g" % ((warms,) + tuple(policy)) if warm else "",
+               " retract=firmware" if opts.firmware_retract else "", os.path.basename(__file__))]
     for p in passes:
-        out.append(";PDP n=%d layer=%d pass=%d coat=%d object=%s dir=%d x=%.4f y=%.5f columns=%d colours=%s" % (
-            p.n, p.layer, p.number, p.coat, p.obj or '-', p.dir, p.x, p.y, p.columns, p.colours))
+        out.append(";PDP n=%d layer=%d pass=%d coat=%d object=%s dir=%d x=%.4f y=%.5f columns=%d colours=%s%s%s" % (
+            p.n, p.layer, p.number, p.coat, p.obj or '-', p.dir, p.x, p.y, p.columns, p.colours,
+            " warmup=1" if p.warmup else "",
+            " warm_x=%.3f warm_y=%.3f" % p.warm_spot if p.warmup and p.warm_spot else ""))
         text = base64.b64encode(p.data).decode()
         out += [";PDD " + text[i:i + DATA_LINE] for i in range(0, len(text), DATA_LINE)]
     out.append("; POLYDYE_JOB_END")
@@ -971,12 +1074,21 @@ def process(lines, opts):
     shell = Shell(grid, layers, support, opts.depth) if opts.depth else None
     plan = []  # (layer, passes)
     stats = {}
+    spots, bodies = {}, {}  # each ink layer's warm-up spot for its first pass (warm_spot(); None: no room)
     for layer in layers:
         if not layer.segs:
             continue
         passes = layer_passes(layer, grid, support, tools, objects, opts, pitch, shell, stats)
         if passes:
             plan.append((layer, passes))
+            if opts.prewarm > 0 and not opts.dry_run:
+                # Over plastic laid down so far: the support now has this layer and the ones under it.
+                first = passes[0]
+                k = objects.index(first.obj)
+                r0, g0, cells = support.windows[k]
+                near = (first.x, first.y + (0 if first.dir > 0 else (first.columns - 1) * pitch))
+                spots[layer.index] = warm_spot(layers, layer, k, grid, (r0, g0, cells.shape), opts, near, bodies,
+                                               close(cells))
     passes = [p for _, ps in plan for p in ps]
     lost = stats.get('lost', 0) / float(stats['coloured']) if stats.get('coloured') else 0.
     # The brim that leaves the surface all its ink: the margin's box reaches furthest across a wall at a slant (its
@@ -991,26 +1103,45 @@ def process(lines, opts):
             opts.edge_margin, ". " + warning if warning else "")
     for n, p in enumerate(passes):
         p.n = n
-    before, primes = warm_and_prime(lines, layers, plan, config, timing, opts)
+    warms, primes = warm_and_prime(lines, layers, plan, config, timing, opts)
+    # Each ink layer's warm-up, as long as the add-on finds the head has cooled when the layer's ink comes (estimated
+    # here, warms): with its prime at the sponge if its first pass primes (a cold head doesn't eject), else on that
+    # pass, over a spot of plastic near where it starts (spots), or at the add-on's warm_position where there's no room.
+    # Its pass is marked, so the add-on's automatic warm-up doesn't add another.
+    prime_warm, where = {}, {'part': 0, 'prime': 0, 'elsewhere': 0}
+    for layer, ps in plan:
+        if layer.index not in warms:
+            continue
+        first = ps[0]
+        first.warmup, first.warm = True, warms[layer.index]
+        if 0 in primes.get(layer.index, ()):
+            prime_warm[layer.index] = warms[layer.index]
+            where['prime'] += 1
+        else:
+            first.warm_spot = spots.get(layer.index)
+            where['part' if first.warm_spot else 'elsewhere'] += 1
+    warm_count = sum(where.values())
     # The lowest acceleration an ink block can run at: the G-code's, or POLYDYE_INK_MOTION's if lower (0: unknown).
     ink_accel = min([layer.accel for layer, _ in plan if layer.accel] + ([opts.ink_accel] if opts.ink_accel else [])
                     or [0.])
     ink_z = max(layer.end[2] + opts.gap for layer, _ in plan)
     count = sum(len(v) for v in primes.values())
-    job = job_block(passes, opts, len(plan), len(before), count, ink_accel, ink_z,
-                    opts.prewarm if before else 0.)
+    job = job_block(passes, opts, len(plan), 0, count, ink_accel, ink_z, 0., warm_count,
+                    (opts.prewarm, opts.prewarm_hot, opts.prewarm_cold))
     size = sum(len(p.data) for p in passes)
     summary = ("PolyDye ink job: %d passes on %d layers, %.2f MB; dpi %g, nozzle_dpi %g, ink limit C %g %% M %g %% "
-               "Y %g %%%s%s; %d prewarm bursts, %d primes"
-               % (len(passes), len(plan), size / 1e6, opts.dpi, opts.nozzle_dpi,
+               "Y %g %%%s%s; %d warm-ups (%d over the part, %d with a prime, %d at warm_position; about %g s), %d "
+               "primes"               % (len(passes), len(plan), size / 1e6, opts.dpi, opts.nozzle_dpi,
                   *(round(v * 100, 2) for v in opts.ink_limits), ", stock tone" if opts.tone == 'stock' else "",
-                  ", depth %g mm" % (opts.depth,) if opts.depth else "", len(before), count))
+                  ", depth %g mm" % (opts.depth,) if opts.depth else "", warm_count, where['part'], where['prime'],
+                  where['elsewhere'], round(sum(warms.values()), 1), count))
     if warning:
         summary += ". " + warning
     insert = {}
     for layer, ps in plan:
         insert.setdefault(layer.last_line, []).extend(ink_block(layer, ps, opts, layer.end_object,
-                                                                primes.get(layer.index, ())))
+                                                                primes.get(layer.index, ()),
+                                                                prime_warm.get(layer.index)))
     insert[plan[-1][0].last_line].append("POLYDYE_JOB_END")
     drop = set(tool_lines)
     out = []
@@ -1026,8 +1157,6 @@ def process(lines, opts):
             out += [ln + "\n" for ln in job] + ["\n"]
         if n == job_cmd_at:
             out += ["; %s (polydye_post.py)\n" % (summary,), "POLYDYE_JOB\n"]
-        if n in before:
-            out.append(before[n] + "\n")
         if n not in drop:
             out.append(line)
         if n in insert:
@@ -1039,18 +1168,31 @@ def process(lines, opts):
     return out, summary
 
 
+def warm_seconds(idle, opts):
+    """An ink layer's warm-up (s) when the head last fired `idle` s before (None: not yet in the print): none up to
+    --prewarm-hot, all of --prewarm from --prewarm-cold (the head is cold in under 30 s), in proportion between, to
+    0.1 s. The add-on works it out the same way (job_warm_seconds()) from the head's real idle time as it prints;
+    here it's estimated, for the print's timing."""
+    if idle is None or idle >= opts.prewarm_cold:
+        return opts.prewarm
+    if idle <= opts.prewarm_hot:
+        return 0.
+    return min(opts.prewarm, round(opts.prewarm * (idle - opts.prewarm_hot) / (opts.prewarm_cold - opts.prewarm_hot),
+                                   1))
+
+
 def warm_and_prime(lines, layers, plan, config, timing, opts):
-    """Where the ink layers' prewarm bursts go and where the primes go, by the print time estimated (line_times()):
-    ({line: the POLYDYE_PREWARM line to put before it}, {layer index: indices of its passes that prime first}).
+    """Each ink layer's warm-up and where the primes go, by the print time estimated (line_times()): ({layer index:
+    seconds of warm-up before its first pass, 0 if the head is still hot; none with --prewarm 0 or --dry-run},
+    {layer index: indices of its passes that prime first}).
+    - The warm-up (warm_seconds()) is for how long the head has been idle when the layer's ink starts, since the end of
+      the last pass before it.
     - A pass primes first (POLYDYE_PRIME, at the sponge) if it's the print's first ink pass or uses a colour that
       hasn't ejected for --prime-idle s, counting the passes before it in a long ink block; a prime ejects every
-      colour.
-    - Its burst (--prewarm s) starts where the moves before it end, so it goes before the line from which the layer's
-      moves take that long to its end, less the lead to the first pass (the prime trip instead: the spit would cut a
-      burst still firing); no earlier than the previous ink (or the first layer), so a short layer warms through."""
-    before, primes = {}, {}
+      colour."""
+    warms, primes = {}, {}
     if opts.dry_run:
-        return before, primes
+        return warms, primes
     # The profile's limits (0 there: off), else Klipper-like defaults.
     accel = opts.accel or first_value(config.get('default_acceleration'), 0.) or 3000.
     vmax = opts.max_velocity or first_value(config.get('machine_max_speed_x'), 0.) or 500.
@@ -1058,13 +1200,16 @@ def warm_and_prime(lines, layers, plan, config, timing, opts):
     at = np.concatenate([[0.], np.cumsum(durations)])  # at[n]: when line n starts
     pitch = 25.4 / opts.dpi
     last_eject, ink_time = {}, 0.  # colour: when it last ejected; the ink so far (not in the lines)
-    bound = layers[0].start_line
+    last_fire = None  # when the last pass ended
     for k, (layer, passes) in enumerate(plan):
         e = layer.last_line
-        ink_start = at[e + 1] + ink_time
-        # The passes in order after the ink's moves up and over: each primes first if one of its colours has been
-        # idle too long by then (the print's first pass always); each colour ejects last at the end of its last pass.
-        now = ink_start + INK_MOVES_S / 2.
+        # After the ink's moves up and over: the warm-up, then the passes in order, each priming first if one of its
+        # colours has been idle too long by then (the print's first pass always); each colour ejects last at the end
+        # of its last pass.
+        now = at[e + 1] + ink_time + INK_MOVES_S / 2.
+        if opts.prewarm > 0:
+            warms[layer.index] = warm_seconds(None if last_fire is None else now - last_fire, opts)
+            now += warms[layer.index] + (WARM_STOP_S if warms[layer.index] else 0.)
         for j, p in enumerate(passes):
             if opts.prime_idle > 0 and ((k == 0 and j == 0) or any(
                     c not in last_eject or now - last_eject[c] >= opts.prime_idle for c in p.colours)):
@@ -1075,17 +1220,10 @@ def warm_and_prime(lines, layers, plan, config, timing, opts):
             sweeps = 2 if len(p.colours) > 1 else 1
             now += sweeps * ((p.columns * pitch + 2 * RUN_UP_MM) / opts.pass_speed + 60. / opts.travel)
             last_eject.update(dict.fromkeys(p.colours, now))
-        prime = 0 in primes.get(layer.index, ())
-        if opts.prewarm > 0:
-            target = at[e + 1] + (0. if prime else PREWARM_LEAD_S) - opts.prewarm
-            n = int(np.searchsorted(at, target, side='right')) - 1
-            n = min(e, max(bound, n))
-            before[n] = ("POLYDYE_PREWARM SECONDS=%g ; warms the head for layer %d's ink: %.1f s of moves to go"
-                         % (opts.prewarm, layer.index, at[e + 1] - at[n]))
-        bound = e + 1
+        last_fire = now
         # The ink dries after its last pass, then the moves back.
         ink_time = now + opts.dry + INK_MOVES_S / 2. - at[e + 1]
-    return before, primes
+    return warms, primes
 
 
 def first_value(text, default):
@@ -1196,9 +1334,17 @@ def options(argv=None):
     ap.add_argument("--one-direction", dest="bidirectional", action="store_false",
                     help="every pass along +Y (default: alternate directions)")
     ap.add_argument("--dry-run", action="store_true", help="the passes run with live ink off: the moves, no ink, and "
-                    "no prewarm bursts or primes")
-    ap.add_argument("--prewarm", type=float, default=6., help="seconds of each ink layer's prewarm burst "
-                    "(POLYDYE_PREWARM), timed to end as its ink starts; 0: none (default 6)")
+                    "no warm-ups or primes")
+    ap.add_argument("--prewarm", type=float, default=6., help="seconds of an ink layer's warm-up after the head has "
+                    "been idle --prewarm-cold s or more, standing still before its first pass with the cartridge over "
+                    "the layer's own plastic (or with its prime at the sponge); 0: none (the add-on's automatic "
+                    "warm-up at its warm_position) (default 6)")
+    ap.add_argument("--prewarm-hot", type=float, default=5., help="no warm-up when the head last fired this many "
+                    "seconds before the layer's ink or less (default 5)")
+    ap.add_argument("--prewarm-cold", type=float, default=30., help="all of --prewarm when the head has been idle this "
+                    "many seconds or more (it's cold in under 30 s); in proportion from --prewarm-hot (default 30)")
+    ap.add_argument("--warm-margin", type=float, default=1., help="mm the warm-up keeps every nozzle inside the "
+                    "layer's plastic beyond --edge-margin, for the cartridge offset's error (default 1)")
     ap.add_argument("--prime-idle", type=float, default=90., help="prime at the sponge (POLYDYE_PRIME) before the "
                     "first ink layer and any using a colour that hasn't ejected for this many seconds; 0: never "
                     "(default 90)")
@@ -1213,7 +1359,8 @@ def options(argv=None):
     opts = ap.parse_args(argv)
     for name, lo in (('dpi', 1.), ('nozzle_dpi', 1.), ('gap', 0.), ('dry', 0.),
                      ('travel', 1.), ('edge_margin', 0.), ('inset', 0.), ('depth', 0.), ('prewarm', 0.),
-                     ('prime_idle', 0.), ('wipe', 0.), ('refill', 0.), ('cyan_boost', 0.),
+                     ('prime_idle', 0.), ('wipe', 0.), ('refill', 0.), ('cyan_boost', 0.), ('prewarm_hot', 0.),
+                     ('warm_margin', 0.),
                      ('pass_speed', 1.), ('accel', 0.), ('scv', 0.), ('max_velocity', 0.), ('ink_accel', 0.),
                      ('ink_scv', 0.)):
         if getattr(opts, name) < lo:
@@ -1225,8 +1372,10 @@ def options(argv=None):
     if not 0 <= opts.feather <= (opts.positions[1] - opts.positions[0] + 1) // 2:
         ap.error("--feather must be 0 to half a sweep's width")
     if opts.prewarm > PREWARM_MAX_S:
-        ap.error("--prewarm is at most %g s (a burst is at most 65535 columns: 16.6 s at warm_period_us 254)"
+        ap.error("--prewarm is at most %g s (a warm-up is at most 65535 columns: 16.6 s at warm_period_us 254)"
                  % (PREWARM_MAX_S,))
+    if opts.prewarm_cold < opts.prewarm_hot:
+        ap.error("--prewarm-cold must be at least --prewarm-hot")
     if opts.wall_coats < 0 or opts.top_coats < 0:
         ap.error("coats can't be negative")
     opts.firmware_retract = opts.retract == 'firmware'
